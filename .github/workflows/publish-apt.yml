@@ -128,14 +128,14 @@ jobs:
 
       # Optional: Sign with GPG if GPG_PRIVATE_KEY secret is set
       - name: Import GPG key
-        if: secrets.GPG_PRIVATE_KEY != ''
+        if: ${{ secrets.GPG_PRIVATE_KEY != '' }}
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --import
           GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format=long | grep sec | awk '{print $2}' | cut -d'/' -f2)
           echo "GPG_KEY_ID=${GPG_KEY_ID}" >> $GITHUB_ENV
 
       - name: Sign Release
-        if: secrets.GPG_PRIVATE_KEY != ''
+        if: ${{ secrets.GPG_PRIVATE_KEY != '' }}
         run: |
           cd apt-repo/dists/stable
           gpg --default-key ${{ env.GPG_KEY_ID }} -abs -o Release.gpg Release
