@@ -16,36 +16,54 @@
   opacity: 0.3;
 }
 
-.circuit-line {
+.flame {
   position: absolute;
-  background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
-  height: 2px;
-  width: 100%;
-  animation: circuit-flow 3s linear infinite;
+  width: 100px;
+  height: 150px;
+  background: radial-gradient(ellipse at bottom, var(--accent-fire) 0%, var(--accent-ember) 30%, transparent 70%);
+  filter: blur(20px);
+  animation: flame-flicker 2s ease-in-out infinite;
+  opacity: 0.6;
 }
 
-.circuit-1 {
-  top: 20%;
+.flame-1 {
+  left: 20%;
+  bottom: 0;
   animation-delay: 0s;
 }
 
-.circuit-2 {
+.flame-2 {
+  right: 20%;
+  bottom: 0;
+  animation-delay: 0.7s;
+}
+
+.flame-3 {
+  left: 50%;
+  bottom: 0;
+  animation-delay: 1.4s;
+}
+
+.portal-glow {
+  position: absolute;
+  width: 400px;
+  height: 400px;
+  left: 50%;
   top: 50%;
-  animation-delay: 1s;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(circle, var(--accent-green) 0%, transparent 70%);
+  opacity: 0.2;
+  animation: portal-pulse 3s ease-in-out infinite;
 }
 
-.circuit-3 {
-  top: 80%;
-  animation-delay: 2s;
+@keyframes flame-flicker {
+  0%, 100% { transform: scaleY(1) scaleX(1); opacity: 0.6; }
+  50% { transform: scaleY(1.2) scaleX(0.9); opacity: 0.8; }
 }
 
-@keyframes circuit-flow {
-  0% {
-    transform: translateX(-100%);
-  }
-  100% {
-    transform: translateX(100%);
-  }
+@keyframes portal-pulse {
+  0%, 100% { opacity: 0.2; transform: translate(-50%, -50%) scale(1); }
+  50% { opacity: 0.4; transform: translate(-50%, -50%) scale(1.1); }
 }
 
 .hero-content {
@@ -56,6 +74,36 @@
 .hero-logo {
   margin-bottom: 2rem;
   animation: fade-in-down 1s ease-out;
+}
+
+.floo-fireplace {
+  font-family: 'Monaco', 'Courier New', monospace;
+  font-size: 2rem;
+  color: var(--accent-fire);
+  text-shadow: 0 0 20px var(--accent-ember);
+  animation: fireplace-glow 2s ease-in-out infinite;
+}
+
+.fireplace-arch, .fireplace-base {
+  color: var(--accent-gold);
+  font-size: 1.5rem;
+  opacity: 0.8;
+}
+
+.fireplace-fire {
+  font-size: 2.5rem;
+  margin: 0.5rem 0;
+  animation: fire-flicker 1.5s ease-in-out infinite;
+}
+
+@keyframes fireplace-glow {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.3); }
+}
+
+@keyframes fire-flicker {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.85; }
 }
 
 @keyframes fade-in-down {

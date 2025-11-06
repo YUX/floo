@@ -5,15 +5,15 @@
 }
 
 :root {
-  /* Dark cyberpunk color palette */
-  --bg-primary: #0a0a0f;
-  --bg-secondary: #13131a;
-  --bg-tertiary: #1a1a24;
+  /* Floo Network fireplace theme */
+  --bg-primary: #1a0f0a;
+  --bg-secondary: #2d1810;
+  --bg-tertiary: #3d2418;
 
-  --accent-cyan: #00f3ff;
-  --accent-pink: #ff006e;
-  --accent-purple: #8b5cf6;
-  --accent-yellow: #ffd60a;
+  --accent-fire: #ff6b35;      /* Orange fire */
+  --accent-ember: #f7931e;     /* Ember glow */
+  --accent-green: #50c878;     /* Floo powder green */
+  --accent-gold: #ffd700;      /* Golden flames */
 
   --text-primary: #ffffff;
   --text-secondary: #a0a0b0;
