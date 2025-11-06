@@ -474,8 +474,17 @@ const TunnelConnection = struct {
         std.debug.print("[HEARTBEAT] Thread started (interval: {}ms)\n", .{self.heartbeat_interval_ms});
 
         while (self.running.load(.acquire)) {
-            // Sleep for heartbeat interval (cast to u64 to avoid overflow)
-            std.Thread.sleep(@as(u64, self.heartbeat_interval_ms) * std.time.ns_per_ms);
+            // Sleep in 100ms increments to allow quick shutdown
+            const total_sleep_ms = self.heartbeat_interval_ms;
+            const sleep_increment_ms = 100;
+            var slept_ms: u32 = 0;
+
+            while (slept_ms < total_sleep_ms and self.running.load(.acquire)) {
+                const remaining_ms = total_sleep_ms - slept_ms;
+                const this_sleep_ms = @min(sleep_increment_ms, remaining_ms);
+                std.Thread.sleep(@as(u64, this_sleep_ms) * std.time.ns_per_ms);
+                slept_ms += this_sleep_ms;
+            }
 
             // Check if still running (may have been stopped during sleep)
             if (!self.running.load(.acquire)) break;

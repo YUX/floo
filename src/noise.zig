@@ -630,9 +630,13 @@ pub fn noiseXXHandshake(
 
         const handshake_hash: []const u8 = h[0..];
         const local_tag = computeAuthTag(psk, handshake_hash, 'I');
+        debugPrint("[NOISE] Initiator: sending PSK auth tag ({} bytes)\n", .{local_tag.len});
         try sendAll(fd, local_tag[0..]);
+        debugPrint("[NOISE] Initiator: PSK auth tag sent\n", .{});
         var peer_tag_buf: [HASH_LEN]u8 = undefined;
+        debugPrint("[NOISE] Initiator: waiting for server PSK auth tag ({} bytes)\n", .{peer_tag_buf.len});
         try recvAll(fd, peer_tag_buf[0..]);
+        debugPrint("[NOISE] Initiator: received server PSK auth tag\n", .{});
         const expected_peer = computeAuthTag(psk, handshake_hash, 'R');
         if (!std.mem.eql(u8, peer_tag_buf[0..], expected_peer[0..])) return error.AuthenticationFailed;
 
@@ -767,12 +771,16 @@ pub fn noiseXXHandshake(
 
         const handshake_hash: []const u8 = h[0..];
         var peer_tag_buf: [HASH_LEN]u8 = undefined;
+        debugPrint("[NOISE] Responder: waiting for client PSK auth tag ({} bytes)\n", .{peer_tag_buf.len});
         try recvAll(fd, peer_tag_buf[0..]);
+        debugPrint("[NOISE] Responder: received client PSK auth tag\n", .{});
         const expected_peer = computeAuthTag(psk, handshake_hash, 'I');
         if (!std.mem.eql(u8, peer_tag_buf[0..], expected_peer[0..])) return error.AuthenticationFailed;
 
         const local_tag = computeAuthTag(psk, handshake_hash, 'R');
+        debugPrint("[NOISE] Responder: sending PSK auth tag ({} bytes)\n", .{local_tag.len});
         try sendAll(fd, local_tag[0..]);
+        debugPrint("[NOISE] Responder: PSK auth tag sent\n", .{});
 
         return result;
     }
