@@ -20,3 +20,10 @@ Thumbs.db
 
 # Test and log files
 *.log
+
+# User-specific configs (keep out of repo)
+*-emby.toml
+*-minimal.toml
+EMBY_*.md
+EMBY_*.txt
+QUICKSTART_EMBY.md
