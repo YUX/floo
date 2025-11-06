@@ -21,86 +21,91 @@
 
 ### 1. Choose Your Use Case
 
-| I want to... | Example | Mode |
+| I want to... | Example | Time |
 |--------------|---------|------|
-| **Expose my home media server (Emby/Plex)** | [`expose-home-server/`](examples/expose-home-server/) | Reverse |
-| **Access my cloud database securely** | [`access-cloud-database/`](examples/access-cloud-database/) | Forward |
-| **Expose multiple services (Emby + SSH)** | [`expose-multiple-services/`](examples/expose-multiple-services/) | Reverse |
-| **Connect through corporate proxy** | [`through-corporate-proxy/`](examples/through-corporate-proxy/) | Forward |
+| **Expose my home Emby/Plex** | [`expose-home-server/`](examples/expose-home-server/) | 5 min |
+| **Access cloud database** | [`access-cloud-database/`](examples/access-cloud-database/) | 5 min |
+| **Expose Emby + SSH** | [`expose-multiple-services/`](examples/expose-multiple-services/) | 10 min |
+| **Through corporate proxy** | [`through-corporate-proxy/`](examples/through-corporate-proxy/) | 5 min |
 
-### 2. Get Floo
+### 2. Download Binaries
 
-**Download pre-built binaries:**
-- **Latest (nightly):** https://github.com/YUX/floo/releases/tag/nightly
-- Pick your platform: `floo-aarch64-macos-m1.tar.gz`, `floo-aarch64-linux-rpi.tar.gz`, etc.
+[**Nightly builds**](https://github.com/YUX/floo/releases/tag/nightly) (updated automatically):
+- `floo-aarch64-macos-m1.tar.gz` - Apple Silicon
+- `floo-aarch64-linux-rpi.tar.gz` - Raspberry Pi
+- `floo-x86_64-linux-haswell.tar.gz` - Modern Linux
 
-**Or build from source:**
-```bash
-git clone https://github.com/YUX/floo
-cd floo
-zig build -Doptimize=ReleaseFast
-# Binaries in zig-out/bin/
-```
+Or build: `zig build -Doptimize=ReleaseFast`
 
 ### 3. Follow the Example
 
-Each example folder contains:
-- `README.md` - Complete setup guide with troubleshooting
-- `floos.toml` - Server config (copy and edit)
-- `flooc.toml` - Client config (copy and edit)
-
-**Most users get running in under 5 minutes!**
+Each example has complete setup guide + configs. Just copy, edit, run!
 
 ---
 
-## What is Floo?
+## Feature Comparison
 
-**Reverse Tunneling (most common):**
-Expose local services through a public server
+| Feature | Floo | Rathole | FRP |
+|---------|------|---------|-----|
+| **Language** | Zig | Rust | Go |
+| **Dependencies** | **0** ⭐ | 27+ crates | 34+ packages |
+| **Max Throughput (M1)** | **29.4 Gbps** ⭐ | 18.1 Gbps | 10.0 Gbps |
+| **vs Rathole** | **+62%** faster | baseline | -45% slower |
+| **vs FRP** | **+194%** faster | +81% faster | baseline |
+| **Reverse Tunneling** | ✅ | ✅ | ✅ |
+| **Forward Tunneling** | ✅ | ✅ | ✅ |
+| **Proxy Client** | ✅ SOCKS5, HTTP | ✅ SOCKS5, HTTP | ✅ HTTP, SOCKS5 |
+| **Multi-Service** | ✅ | ✅ | ✅ |
+| **Parallel Tunnels** | ✅ Explicit (1-16) | 🔶 | ✅ Connection pool |
+| **Built-in Diagnostics** | ✅ `--doctor`, `--ping` | 🔶 Logging | ✅ Dashboard |
+| **Binary Size** | **394 KB + 277 KB** ⭐ | ~1-2 MB each | ~12-13 MB |
+| **Hot Reload** | ✅ SIGHUP | ✅ | ✅ Admin API |
+
+**Visual Comparison:**
+
 ```
-Home (Emby) → flooc → Tunnel → floos (Public IP) ← Users access here
+Dependencies:  Floo      ∅ (zero)          ⭐
+               Rathole   ████████████████████████████ (27+ crates)
+               FRP       █████████████████████████████████ (34+ packages)
+
+Binary Size:   Floo      ▌ 671 KB          ⭐
+               Rathole   ████ ~2-4 MB
+               FRP       ████████████████████████████████ ~24+ MB
+
+Throughput:    Floo      ██████████████████████████████ 29.4 Gbps ⭐
+               Rathole   ██████████████████ 18.1 Gbps
+               FRP       ██████████ 10.0 Gbps
 ```
 
-**Forward Tunneling (traditional):**
-Access remote services through encrypted tunnel
-```
-Your laptop → flooc → Tunnel → floos → Cloud database
-```
-
-Both modes support:
-- ✅ End-to-end encryption (29 Gbps on M1)
-- ✅ Multi-service multiplexing
-- ✅ Automatic reconnection
-- ✅ Zero dependencies
-
----
-
-## Key Features
-
-- **🔐 Secure:** Noise XX + PSK with AEGIS/AES-GCM ciphers
-- **⚡ Fast:** 29.4 Gbps encrypted (62% faster than Rathole, 194% faster than FRP)
-- **📦 Tiny:** 671 KB total binaries (vs 2-24 MB alternatives)
-- **🎯 Flexible:** Forward and reverse tunneling modes
-- **🔄 Reliable:** Hot config reload, auto-reconnect, heartbeat supervision
-- **🌐 Corporate-friendly:** SOCKS5 and HTTP CONNECT proxy support
-- **🔧 Developer-friendly:** Built-in `--doctor` and `--ping` diagnostics
+**When to use alternatives:**
+- **Rathole:** Windows support, WebSocket transport
+- **FRP:** HTTP virtual hosting, compression, P2P mode
 
 ---
 
 ## Performance
 
-**Benchmarks** (Apple M1 MacBook Air, iperf3):
+**Benchmark** (Apple M1 MacBook Air):
 
-| Tool | Throughput | vs Floo |
-|------|-----------|---------|
-| **Floo (AEGIS-128L)** | **29.4 Gbps** | baseline |
-| Rathole | 18.1 Gbps | -38% |
-| FRP | 10.0 Gbps | -66% |
+| Configuration | Throughput |
+|--------------|-----------|
+| Floo (AEGIS-128L) | **29.4 Gbps** ⭐ |
+| Floo (AEGIS-256) | 24.5 Gbps |
+| Rathole | 18.1 Gbps |
+| Floo (AES-128-GCM) | 17.9 Gbps |
+| Floo (AES-256-GCM) | 15.8 Gbps |
+| FRP | 10.0 Gbps |
+| Floo (ChaCha20) | 3.53 Gbps |
 
+**Visual:**
 ```
 Floo (AEGIS-128L)   ██████████████▊ ⭐                                   29.4 Gbps
+Floo (AEGIS-256)    ████████████▎                                        24.5 Gbps
 Rathole             █████████▏                                           18.1 Gbps
+Floo (AES-128-GCM)  █████████                                            17.9 Gbps
+Floo (AES-256-GCM)  ████████                                             15.8 Gbps
 FRP                 █████                                                10.0 Gbps
+Floo (ChaCha20)     █▊                                                    3.53 Gbps
                     └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┴────►
                     0     5    10    15    20    25    30 Gbps
 ```
@@ -109,28 +114,21 @@ FRP                 █████                                             
 
 ## Installation
 
-### Pre-built Binaries
+### Option 1: Pre-built Binaries (Recommended)
 
-**Nightly builds:** https://github.com/YUX/floo/releases/tag/nightly
-
-| Platform | File |
-|----------|------|
-| Apple Silicon (M1/M2/M3) | `floo-aarch64-macos-m1.tar.gz` |
-| Intel Mac | `floo-x86_64-macos.tar.gz` |
-| Raspberry Pi / ARM64 Linux | `floo-aarch64-linux-rpi.tar.gz` |
-| Modern x86_64 Linux | `floo-x86_64-linux-haswell.tar.gz` |
-| Generic x86_64 Linux | `floo-x86_64-linux.tar.gz` |
+[**Download from releases**](https://github.com/YUX/floo/releases/tag/nightly):
 
 ```bash
+wget https://github.com/YUX/floo/releases/download/nightly/floo-aarch64-macos-m1.tar.gz
 tar xzf floo-*.tar.gz
 cd floo-*/
-./floos --version
 ./flooc --version
+./floos --version
 ```
 
-### Build from Source
+### Option 2: Build from Source
 
-**Requirements:** [Zig 0.15.x](https://ziglang.org/download/)
+**Requirements:** Zig 0.15.x
 
 ```bash
 git clone https://github.com/YUX/floo
@@ -141,122 +139,137 @@ zig build -Doptimize=ReleaseFast
 
 ---
 
+## Key Features
+
+- **🔐 Noise XX + PSK** - Mutual authentication with 5 AEAD ciphers
+- **🔄 Reverse tunneling** - Expose local services through public server (like ngrok)
+- **⚡ Forward tunneling** - Access remote services securely (like SSH -L)
+- **🌐 Proxy support** - SOCKS5 and HTTP CONNECT for corporate networks
+- **📊 Built-in diagnostics** - `--doctor` and `--ping` commands
+- **🔧 Hot config reload** - Update settings without restart (SIGHUP)
+- **💓 Auto-reconnect** - Exponential backoff, heartbeat supervision
+
+---
+
+## CLI Reference
+
+### Server (`floos`)
+
+```bash
+floos floos.toml                    # Start server
+floos --doctor floos.toml          # Validate config
+floos --ping floos.toml            # Test service reachability
+floos -p 9000 floos.toml           # Override port
+```
+
+### Client (`flooc`)
+
+```bash
+flooc flooc.toml                   # Start client
+flooc --doctor flooc.toml          # Validate config and connectivity
+flooc --ping flooc.toml            # Measure tunnel latency
+flooc -r server.com:8443 --ping    # Quick test
+flooc -x socks5://proxy:1080       # Through proxy
+```
+
+**See [`examples/`](examples/) for complete usage guides.**
+
+---
+
+## Common Issues
+
+### Connection Refused
+```bash
+./flooc --ping flooc.toml  # Test connectivity
+# Check: firewall, correct IP, server running
+```
+
+### Authentication Failed  
+```bash
+# Verify PSK and cipher match EXACTLY in both configs
+grep "psk\|cipher" floos.toml flooc.toml
+```
+
+### Heartbeat Timeout
+```bash
+# Server heartbeat_interval (30s) < Client timeout (40s)
+grep "heartbeat" floos.toml flooc.toml
+```
+
+**Full troubleshooting:** See example READMEs
+
+---
+
 ## Configuration
 
-See [`examples/`](examples/) for complete examples.
-
-**Minimal reverse tunnel (expose Emby):**
-
-Server (public):
+**Reverse mode** (expose home service):
 ```toml
-port = 8443
-psk = "YOUR-SECRET-PSK"
-default_token = "YOUR-TOKEN"
-
+# Server (public)
 [server.services.emby]
-id = 1
 mode = "reverse"
-local_port = 8096
-target_port = 8096
+local_port = 8096  # Users connect here
+
+# Client (home)
+remote_host = "server.ip"
 ```
 
-Client (home):
+**Forward mode** (access remote service):
 ```toml
-remote_host = "YOUR_SERVER_IP"
-remote_port = 8443
-psk = "YOUR-SECRET-PSK"
-default_token = "YOUR-TOKEN"
+# Server (remote)
+[server.services.db]
+target_port = 5432  # Server connects here
+
+# Client (local)
+local_port = 5432  # You connect here
 ```
 
-**Generate secrets:**
-```bash
-openssl rand -base64 32  # Use for PSK and token
-```
-
----
-
-## Diagnostics
-
-Validate your setup before starting:
-
-```bash
-./floos --doctor floos.toml  # Check server config
-./flooc --doctor flooc.toml  # Check client config and connectivity
-./flooc --ping flooc.toml    # Measure tunnel latency
-```
-
----
-
-## Why Floo?
-
-**vs Rathole:**
-- ✅ 62% faster (29.4 vs 18.1 Gbps)
-- ✅ Smaller binaries (671 KB vs 2-4 MB)
-- ✅ Zero dependencies (vs 27+ crates)
-- ✅ CLI diagnostics (vs logging only)
-
-**vs FRP:**
-- ✅ 194% faster (29.4 vs 10.0 Gbps)  
-- ✅ 36x smaller binaries (671 KB vs 24 MB)
-- ✅ Zero dependencies (vs 34+ packages)
-- ✅ Simpler (CLI vs web dashboard)
-
-**When to use alternatives:**
-- **Rathole:** Need Windows support or WebSocket transport
-- **FRP:** Need HTTP virtual hosting, compression, P2P mode
-
----
-
-## Documentation
-
-- **Examples:** [`examples/`](examples/) - Real-world use cases
-- **CLI Reference:** Run `--help` or see [Command-Line Interface](#command-line-interface)
-- **Troubleshooting:** See example READMEs
-- **Advanced:** See `flooc.toml.example` and `floos.toml.example`
+**See [`examples/`](examples/) for complete configurations.**
 
 ---
 
 ## Development
 
 ```bash
-zig build test          # Run tests
-zig fmt src/*.zig       # Format code
-zig build release-all   # Cross-compile all platforms
+zig build test                      # Run tests
+zig fmt src/*.zig                   # Format code
+zig build release-all               # Cross-compile
+./run_benchmarks.sh                 # Benchmark suite
 ```
 
 ---
 
 ## Roadmap
 
-- [ ] io_uring backend (Linux performance)
-- [ ] Compression support
 - [ ] Windows support
+- [ ] Compression
+- [ ] io_uring backend (Linux)
 - [ ] QUIC/DTLS for UDP
-- [ ] Observability (Prometheus)
+- [ ] Prometheus metrics
 
 ---
 
 ## Contributing
 
-Pull requests welcome! Please:
-1. Run `zig fmt` before committing
-2. Add tests for new features
-3. Update documentation
+Pull requests welcome!
+
+1. Format: `zig fmt src/*.zig`
+2. Test: `zig build test`
+3. Document changes
 4. Ensure benchmarks don't regress
 
 ---
 
 ## License
 
-MIT License - See LICENSE file
+MIT - See LICENSE file
 
 ---
 
-## Support
+## Links
 
-- **Issues:** https://github.com/YUX/floo/issues
 - **Examples:** [`examples/`](examples/)
-- **Discussions:** https://github.com/YUX/floo/discussions
+- **Issues:** https://github.com/YUX/floo/issues
+- **Releases:** https://github.com/YUX/floo/releases
 
 ---
 
