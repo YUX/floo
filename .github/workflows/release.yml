@@ -82,12 +82,27 @@ jobs:
           # Restore baseline build
           mv zig-out/release-baseline/aarch64-macos zig-out/release/
 
+      - name: Build Raspberry Pi variant (Cortex-A76)
+        run: |
+          # Save baseline aarch64-linux-gnu first
+          mkdir -p zig-out/release-baseline
+          cp -r zig-out/release/aarch64-linux-gnu zig-out/release-baseline/
+
+          # Build Cortex-A76 optimized (Raspberry Pi 5)
+          zig build release-all -Drelease_cpu=cortex_a76
+
+          # Rename Raspberry Pi build
+          mv zig-out/release/aarch64-linux-gnu zig-out/release/aarch64-linux-gnu-rpi
+
+          # Restore baseline build
+          mv zig-out/release-baseline/aarch64-linux-gnu zig-out/release/
+
       - name: Package artifacts
         run: |
           mkdir -p artifacts
 
           # Package each target (baseline + optimized variants)
-          for target in x86_64-linux-gnu x86_64-linux-gnu-haswell aarch64-linux-gnu x86_64-macos x86_64-macos-haswell aarch64-macos aarch64-macos-m1; do
+          for target in x86_64-linux-gnu x86_64-linux-gnu-haswell aarch64-linux-gnu aarch64-linux-gnu-rpi x86_64-macos x86_64-macos-haswell aarch64-macos aarch64-macos-m1; do
             if [ -d "zig-out/release/$target" ]; then
               mkdir -p "artifacts/$target"
               cp zig-out/release/$target/flooc "artifacts/$target/"
@@ -118,6 +133,13 @@ jobs:
         with:
           name: floo-linux-aarch64
           path: artifacts/floo-aarch64-linux-gnu.tar.gz
+
+      - name: Upload Linux aarch64 (Raspberry Pi)
+        uses: actions/upload-artifact@v4
+        with:
+          name: floo-linux-aarch64-rpi
+          path: artifacts/floo-aarch64-linux-gnu-rpi.tar.gz
+        if: hashFiles('artifacts/floo-aarch64-linux-gnu-rpi.tar.gz') != ''
 
       - name: Upload macOS x86_64
         uses: actions/upload-artifact@v4
@@ -230,12 +252,15 @@ jobs:
             | **Linux x86_64** | `floo-x86_64-linux-gnu.tar.gz` | Baseline (compatible with all CPUs) |
             | **Linux x86_64 (Haswell+)** ⚡ | `floo-x86_64-linux-gnu-haswell.tar.gz` | Optimized for Intel Haswell+ (2013+) with AES-NI |
             | **Linux aarch64** | `floo-aarch64-linux-gnu.tar.gz` | ARM64 servers (baseline) |
+            | **Linux aarch64 (Raspberry Pi)** 🥧 | `floo-aarch64-linux-gnu-rpi.tar.gz` | Raspberry Pi 4/5 (Cortex-A76) |
             | **macOS Intel** | `floo-x86_64-macos.tar.gz` | Intel Macs (baseline) |
             | **macOS Intel (Haswell+)** ⚡ | `floo-x86_64-macos-haswell.tar.gz` | Intel Macs (2013+) with AES-NI |
             | **macOS Apple Silicon** | `floo-aarch64-macos.tar.gz` | M1/M2/M3/M4 (baseline) |
             | **macOS Apple Silicon (M1+)** ⚡ | `floo-aarch64-macos-m1.tar.gz` | M1/M2/M3/M4 with ARM crypto extensions |
 
             ⚡ **Recommended:** Optimized builds provide significantly better crypto performance (3-5x faster encryption).
+
+            🥧 **Raspberry Pi users:** Use the `aarch64-linux-gnu-rpi` variant to avoid illegal instruction errors on Pi 4/5.
 
             **Extract and use:**
             ```bash
