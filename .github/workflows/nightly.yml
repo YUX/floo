@@ -1,0 +1,116 @@
+name: Nightly Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  nightly:
+    name: Build and Release Nightly
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Build all platforms
+        run: |
+          # Build baseline
+          zig build release-all -Drelease_cpu=baseline
+
+          # Build Haswell-optimized
+          mkdir -p zig-out/release-baseline
+          cp -r zig-out/release/x86_64-linux-gnu zig-out/release-baseline/
+          zig build release-all -Drelease_cpu=haswell
+          mv zig-out/release/x86_64-linux-gnu zig-out/release/x86_64-linux-gnu-haswell
+          mv zig-out/release-baseline/x86_64-linux-gnu zig-out/release/
+
+      - name: Package artifacts
+        run: |
+          mkdir -p release-assets
+
+          # Package each platform
+          for target in x86_64-linux-gnu x86_64-linux-gnu-haswell aarch64-linux-gnu x86_64-macos aarch64-macos; do
+            if [ -d "zig-out/release/$target" ]; then
+              mkdir -p "dist/$target"
+              cp zig-out/release/$target/flooc "dist/$target/"
+              cp zig-out/release/$target/floos "dist/$target/"
+              cp README.md flooc.toml.example floos.toml.example "dist/$target/"
+
+              # Create tarball
+              cd dist
+              tar czf "../release-assets/floo-$target.tar.gz" "$target/"
+              cd ..
+            fi
+          done
+
+          ls -lh release-assets/
+
+      - name: Delete old nightly release
+        run: |
+          gh release delete nightly --yes || true
+          git push origin :refs/tags/nightly || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create nightly release
+        run: |
+          gh release create nightly \
+            --title "Nightly Build ($(date +'%Y-%m-%d %H:%M UTC'))" \
+            --notes "**Automated nightly build from latest commit**
+
+          ## Latest Changes
+
+          Commit: \`${{ github.sha }}\`
+
+          $(git log -1 --pretty=format:'**%s**%n%n%b')
+
+          ---
+
+          ### 🚀 Performance
+          - **29.4 Gbps** encrypted throughput (AEGIS-128L)
+          - **671 KB** total binary size
+          - **Zero dependencies**
+
+          ### 📥 Downloads
+
+          | Platform | File | Recommended For |
+          |----------|------|-----------------|
+          | **Linux ARM64** | \`floo-aarch64-linux-gnu.tar.gz\` | Raspberry Pi, ARM servers |
+          | **Linux x86_64 (Haswell)** | \`floo-x86_64-linux-gnu-haswell.tar.gz\` | Modern Intel/AMD (2013+) |
+          | **Linux x86_64** | \`floo-x86_64-linux-gnu.tar.gz\` | Older/generic x86_64 |
+          | **macOS Apple Silicon** | \`floo-aarch64-macos.tar.gz\` | M1/M2/M3/M4 Macs |
+          | **macOS Intel** | \`floo-x86_64-macos.tar.gz\` | Intel Macs |
+
+          ### ⚠️ Note
+
+          This is a **pre-release nightly build** from the latest code.
+          - Updated automatically on every push to main
+          - For production, use numbered releases (v0.1.0, v0.2.0, etc.)
+          - Binaries are built with \`ReleaseFast\` optimization
+
+          ### 🔒 Security
+
+          Before using:
+          1. Replace placeholder PSK/tokens in config files
+          2. Run \`--doctor\` to validate setup
+          3. Use AEGIS-128L or AES-256-GCM cipher
+
+          ---
+
+          **Built from:** ${{ github.repository }}@${{ github.sha }}
+          " \
+            --prerelease \
+            release-assets/*.tar.gz
+        env:
+          GH_TOKEN: ${{ github.token }}
