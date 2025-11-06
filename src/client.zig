@@ -590,6 +590,9 @@ const TunnelClient = struct {
     // Authentication
     default_token: []const u8, // Default token for authentication (empty = no auth)
 
+    // Config reference for TCP tuning (needed for reverse mode)
+    cfg: *const config.ClientConfig,
+
     fn create(allocator: std.mem.Allocator, tunnel_fd: posix.fd_t, service_id: tunnel.ServiceId, target_host: []const u8, target_port: u16, cfg: *const config.ClientConfig, static_keypair: std.crypto.dh.X25519.KeyPair) !*TunnelClient {
         setSockOpts(tunnel_fd, cfg);
         errdefer posix.close(tunnel_fd);
@@ -644,6 +647,7 @@ const TunnelClient = struct {
             .heartbeat_timeout_ms = cfg.heartbeat_timeout_seconds * 1000, // Convert to milliseconds
             .last_heartbeat_time = std.atomic.Value(i64).init(std.time.milliTimestamp()), // Initialize to current time
             .default_token = cfg.default_token,
+            .cfg = cfg,
         };
         decrypt_buffer = &[_]u8{};
 
@@ -778,6 +782,36 @@ const TunnelClient = struct {
         const msg_type: tunnel.MessageType = @enumFromInt(message_slice[0]);
 
         switch (msg_type) {
+            .connect => {
+                // REVERSE MODE: Server is asking us to connect to local target
+                const connect_msg = try tunnel.ConnectMsg.decode(message_slice, global_allocator);
+                defer global_allocator.free(connect_msg.target_host);
+                defer global_allocator.free(connect_msg.token);
+
+                tracePrint(enable_tunnel_trace, "[CLIENT] CONNECT from server (reverse mode): service_id={} stream_id={} target={s}:{}\n", .{
+                    connect_msg.service_id,
+                    connect_msg.stream_id,
+                    connect_msg.target_host,
+                    connect_msg.target_port,
+                });
+
+                self.handleReverseConnect(connect_msg) catch |err| {
+                    std.debug.print("[CLIENT] Failed to handle reverse CONNECT: {}\n", .{err});
+                    // Send error response back to server
+                    const error_msg = tunnel.ConnectErrorMsg{
+                        .service_id = connect_msg.service_id,
+                        .stream_id = connect_msg.stream_id,
+                        .error_msg = "Connection to local target failed",
+                    };
+
+                    var encode_buf: [128]u8 = undefined;
+                    const encoded_len = error_msg.encodeInto(&encode_buf) catch return;
+
+                    self.sendEncryptedMessage(encode_buf[0..encoded_len]) catch |send_err| {
+                        self.handleSendFailure(send_err);
+                    };
+                };
+            },
             .connect_ack => {
                 const ack = try tunnel.ConnectAckMsg.decode(message_slice);
                 tracePrint(enable_tunnel_trace, "[CLIENT] CONNECT_ACK stream_id={}\n", .{ack.stream_id});
@@ -843,10 +877,51 @@ const TunnelClient = struct {
                 self.last_heartbeat_time.store(std.time.milliTimestamp(), .release);
                 tracePrint(enable_tunnel_trace, "[HEARTBEAT] Received from server: timestamp={}\n", .{heartbeat_msg.timestamp});
             },
-            else => {
-                std.debug.print("[CLIENT] Unknown message type: {}\n", .{msg_type});
-            },
         }
+    }
+
+    fn handleReverseConnect(self: *TunnelClient, msg: tunnel.ConnectMsg) !void {
+        // Connect to local target (reverse mode - server initiated)
+        std.debug.print("[CLIENT-REVERSE] Connecting to local target {s}:{} for stream_id={}\n", .{
+            msg.target_host,
+            msg.target_port,
+            msg.stream_id,
+        });
+
+        const address = try std.net.Address.parseIp4(msg.target_host, msg.target_port);
+        const local_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+        errdefer posix.close(local_fd);
+
+        setSockOpts(local_fd, self.cfg);
+
+        try posix.connect(local_fd, &address.any, address.getOsSockLen());
+
+        std.debug.print("[CLIENT-REVERSE] Connected to local target for stream_id={}\n", .{msg.stream_id});
+
+        // Create LocalConnection to handle forwarding
+        const conn = try LocalConnection.create(global_allocator, msg.service_id, msg.stream_id, local_fd, self);
+
+        self.connections_mutex.lock();
+        self.connections.put(msg.stream_id, conn) catch |err| {
+            self.connections_mutex.unlock();
+            conn.stop();
+            conn.destroy();
+            return err;
+        };
+        self.connections_mutex.unlock();
+
+        // Send CONNECT_ACK back to server
+        const ack_msg = tunnel.ConnectAckMsg{
+            .service_id = msg.service_id,
+            .stream_id = msg.stream_id,
+        };
+
+        var encode_buf: [16]u8 = undefined; // ACK is 7 bytes
+        const encoded_len = try ack_msg.encodeInto(&encode_buf);
+
+        try self.sendEncryptedMessage(encode_buf[0..encoded_len]);
+
+        std.debug.print("[CLIENT-REVERSE] Sent CONNECT_ACK to server for stream_id={}\n", .{msg.stream_id});
     }
 
     fn handleNewConnection(self: *TunnelClient, local_fd: posix.fd_t) !void {

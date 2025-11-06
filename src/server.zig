@@ -663,6 +663,12 @@ const TunnelConnection = struct {
         const msg_type: tunnel.MessageType = @enumFromInt(message_slice[0]);
 
         switch (msg_type) {
+            .connect_ack => {
+                // REVERSE MODE: Client acknowledged connection to local target
+                const ack = try tunnel.ConnectAckMsg.decode(message_slice);
+                tracePrint(enable_tunnel_trace, "[TUNNEL-REVERSE] CONNECT_ACK from client stream_id={}\n", .{ack.stream_id});
+                // Connection established, stream thread will start forwarding
+            },
             .connect => {
                 const connect_msg = try tunnel.ConnectMsg.decode(message_slice, global_allocator);
                 defer global_allocator.free(connect_msg.target_host);
@@ -731,14 +737,28 @@ const TunnelConnection = struct {
                     std.debug.print("[UDP] Received UDP data but no forwarder exists\n", .{});
                 }
             },
+            .connect_error => {
+                // REVERSE MODE: Client failed to connect to local target
+                const err_msg = try tunnel.ConnectErrorMsg.decode(message_slice, global_allocator);
+                defer global_allocator.free(err_msg.error_msg);
+                std.debug.print("[TUNNEL-REVERSE] CONNECT_ERROR from client: stream_id={} error={s}\n", .{ err_msg.stream_id, err_msg.error_msg });
+
+                // Close the stream on the server side
+                self.streams_mutex.lock();
+                const key = StreamKey{ .service_id = err_msg.service_id, .stream_id = err_msg.stream_id };
+                const maybe_stream = self.streams.fetchRemove(key);
+                self.streams_mutex.unlock();
+
+                if (maybe_stream) |entry| {
+                    entry.value.stop();
+                    entry.value.destroy();
+                }
+            },
             .heartbeat => {
                 // Server doesn't need to process heartbeat responses from client
                 // (client -> server heartbeat is handled by client-side timeout logic)
                 const heartbeat_msg = try tunnel.HeartbeatMsg.decode(message_slice);
                 tracePrint(enable_tunnel_trace, "[HEARTBEAT] Received from client: timestamp={}\n", .{heartbeat_msg.timestamp});
-            },
-            else => {
-                std.debug.print("[TUNNEL] Unknown message type: {}\n", .{msg_type});
             },
         }
     }
@@ -749,6 +769,13 @@ const TunnelConnection = struct {
             return error.UnknownService;
         };
         const service = service_ptr.*;
+
+        // Reverse mode services don't handle CONNECT from client
+        // (server initiates CONNECT to client in reverse mode)
+        if (service.mode == .reverse) {
+            std.debug.print("[REVERSE] Ignoring CONNECT from client for reverse service_id={}\n", .{msg.service_id});
+            return error.InvalidOperation;
+        }
 
         const expected_token = if (service.token.len > 0) service.token else self.cfg.default_token;
         if (expected_token.len > 0) {
@@ -1135,6 +1162,16 @@ pub fn main() !void {
         connections.deinit(allocator);
     }
 
+    // Track reverse service listener threads
+    var reverse_listener_threads = std.ArrayListUnmanaged(std.Thread){};
+    defer {
+        // Threads will exit when shutdown_flag is set
+        for (reverse_listener_threads.items) |thread| {
+            thread.join();
+        }
+        reverse_listener_threads.deinit(allocator);
+    }
+
     // Accept loop
     while (!shutdown_flag.load(.acquire)) {
         // Check for config reload request
@@ -1215,6 +1252,45 @@ pub fn main() !void {
             tunnel_conn.destroy();
             continue;
         };
+
+        // Start reverse service listeners for this tunnel connection
+        var reverse_iter = cfg.services.valueIterator();
+        while (reverse_iter.next()) |service| {
+            if (service.mode == .reverse) {
+                std.debug.print("[SERVER] Starting reverse service listener for '{s}' (id={}, port={})\n", .{
+                    service.name,
+                    service.service_id,
+                    service.local_port,
+                });
+
+                const ctx = allocator.create(ReverseServiceListenerContext) catch |err| {
+                    std.debug.print("[SERVER] Failed to allocate reverse listener context: {}\n", .{err});
+                    continue;
+                };
+
+                ctx.* = .{
+                    .allocator = allocator,
+                    .service_id = service.service_id,
+                    .listen_port = service.local_port,
+                    .target_host = service.target_host,
+                    .target_port = service.target_port,
+                    .token = service.token,
+                    .tunnel_conn = tunnel_conn,
+                    .next_stream_id = std.atomic.Value(u32).init(1),
+                };
+
+                const listener_thread = std.Thread.spawn(.{}, reverseServiceListener, .{ctx}) catch |err| {
+                    std.debug.print("[SERVER] Failed to spawn reverse listener thread: {}\n", .{err});
+                    allocator.destroy(ctx);
+                    continue;
+                };
+
+                reverse_listener_threads.append(allocator, listener_thread) catch |err| {
+                    std.debug.print("[SERVER] Failed to track reverse listener thread: {}\n", .{err});
+                    // Thread is already running, let it continue
+                };
+            }
+        }
     }
 
     std.debug.print("\n[SHUTDOWN] Server stopped.\n", .{});
@@ -1223,4 +1299,118 @@ pub fn main() !void {
 fn tunnelConnectionThread(conn: *TunnelConnection) void {
     conn.run();
     // Note: conn.destroy() is called by main thread on shutdown
+}
+
+/// Context for reverse service listener thread
+const ReverseServiceListenerContext = struct {
+    allocator: std.mem.Allocator,
+    service_id: tunnel.ServiceId,
+    listen_port: u16,
+    target_host: []const u8,
+    target_port: u16,
+    token: []const u8,
+    tunnel_conn: *TunnelConnection,
+    next_stream_id: std.atomic.Value(u32),
+};
+
+/// Reverse service listener thread - handles one reverse mode service
+/// Listens on a public port, sends CONNECT to client when users connect
+fn reverseServiceListener(ctx_ptr: *anyopaque) void {
+    const ctx: *ReverseServiceListenerContext = @ptrCast(@alignCast(ctx_ptr));
+    defer ctx.allocator.destroy(ctx);
+
+    // Create listener socket
+    const listen_fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch |err| {
+        std.debug.print("[REVERSE-SERVICE] Failed to create socket for service_id={}: {}\n", .{ ctx.service_id, err });
+        return;
+    };
+    defer posix.close(listen_fd);
+
+    posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+
+    const local_addr = std.net.Address.parseIp4("0.0.0.0", ctx.listen_port) catch |err| {
+        std.debug.print("[REVERSE-SERVICE] Failed to parse address for service_id={}: {}\n", .{ ctx.service_id, err });
+        return;
+    };
+
+    posix.bind(listen_fd, &local_addr.any, local_addr.getOsSockLen()) catch |err| {
+        std.debug.print("[REVERSE-SERVICE] Failed to bind service_id={} on port {}: {}\n", .{ ctx.service_id, ctx.listen_port, err });
+        return;
+    };
+
+    posix.listen(listen_fd, 128) catch |err| {
+        std.debug.print("[REVERSE-SERVICE] Failed to listen for service_id={}: {}\n", .{ ctx.service_id, err });
+        return;
+    };
+
+    std.debug.print("[REVERSE-SERVICE] Listening on 0.0.0.0:{} (service_id={}, reverse mode)\n", .{ ctx.listen_port, ctx.service_id });
+
+    // Accept loop
+    while (!shutdown_flag.load(.acquire) and ctx.tunnel_conn.running.load(.acquire)) {
+        // Poll for accept with timeout
+        var fds = [_]posix.pollfd{
+            .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 },
+        };
+
+        const ready = posix.poll(&fds, 1000) catch continue; // 1s timeout
+        if (ready == 0) continue; // Timeout, check shutdown
+
+        const user_fd = posix.accept(listen_fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
+            std.debug.print("[REVERSE-SERVICE] Accept error for service_id={}: {}\n", .{ ctx.service_id, err });
+            continue;
+        };
+
+        // Generate stream_id
+        const stream_id = ctx.next_stream_id.fetchAdd(1, .acq_rel);
+
+        std.debug.print("[REVERSE-SERVICE] External user connected, sending CONNECT to client (service_id={}, stream_id={})\n", .{ ctx.service_id, stream_id });
+
+        // Apply socket tuning
+        TunnelConnection.setSockOpts(user_fd, ctx.tunnel_conn.cfg);
+
+        // Send CONNECT message to client through tunnel
+        const connect_msg = tunnel.ConnectMsg{
+            .service_id = ctx.service_id,
+            .stream_id = stream_id,
+            .target_host = ctx.target_host,
+            .target_port = ctx.target_port,
+            .token = ctx.token,
+        };
+
+        var encode_buf: [512]u8 = undefined;
+        const encoded_len = connect_msg.encodeInto(&encode_buf) catch {
+            std.debug.print("[REVERSE-SERVICE] Failed to encode CONNECT message\n", .{});
+            posix.close(user_fd);
+            continue;
+        };
+
+        ctx.tunnel_conn.sendEncryptedMessage(encode_buf[0..encoded_len]) catch |err| {
+            std.debug.print("[REVERSE-SERVICE] Failed to send CONNECT to client: {}\n", .{err});
+            ctx.tunnel_conn.handleSendFailure(err);
+            posix.close(user_fd);
+            continue;
+        };
+
+        // Create Stream to forward user_socket <-> tunnel
+        const stream = Stream.create(global_allocator, ctx.service_id, stream_id, user_fd, ctx.tunnel_conn) catch |err| {
+            std.debug.print("[REVERSE-SERVICE] Failed to create stream: {}\n", .{err});
+            posix.close(user_fd);
+            continue;
+        };
+
+        ctx.tunnel_conn.streams_mutex.lock();
+        const key = StreamKey{ .service_id = ctx.service_id, .stream_id = stream_id };
+        ctx.tunnel_conn.streams.put(key, stream) catch |err| {
+            ctx.tunnel_conn.streams_mutex.unlock();
+            std.debug.print("[REVERSE-SERVICE] Failed to register stream: {}\n", .{err});
+            stream.stop();
+            stream.destroy();
+            continue;
+        };
+        ctx.tunnel_conn.streams_mutex.unlock();
+
+        std.debug.print("[REVERSE-SERVICE] Stream {} created for reverse connection\n", .{stream_id});
+    }
+
+    std.debug.print("[REVERSE-SERVICE] Service listener stopped for service_id={}\n", .{ctx.service_id});
 }

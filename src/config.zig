@@ -15,6 +15,17 @@ pub const Transport = enum {
     }
 };
 
+pub const ServiceMode = enum {
+    forward,  // Server connects to target (default, current behavior)
+    reverse,  // Server listens, client connects to target (new!)
+
+    pub fn fromString(s: []const u8) ?ServiceMode {
+        if (std.mem.eql(u8, s, "forward")) return .forward;
+        if (std.mem.eql(u8, s, "reverse")) return .reverse;
+        return null;
+    }
+};
+
 fn dupString(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     return allocator.dupe(u8, value);
 }
@@ -23,8 +34,10 @@ pub const ServerServiceConfig = struct {
     name: []const u8,
     service_id: tunnel.ServiceId,
     transport: Transport,
+    mode: ServiceMode,
     target_host: []const u8,
     target_port: u16,
+    local_port: u16,  // For reverse mode: port server listens on
     token: []const u8,
 
     fn deinit(self: *ServerServiceConfig, allocator: std.mem.Allocator) void {
@@ -162,8 +175,10 @@ pub const ServerConfig = struct {
                         .name = try dupString(allocator, name),
                         .service_id = 0,
                         .transport = config.transport,
+                        .mode = .forward,  // Default to forward mode
                         .target_host = try dupString(allocator, ""),
                         .target_port = 0,
+                        .local_port = 0,  // For reverse mode
                         .token = try dupString(allocator, ""),
                     };
                     current_section = "server.services";
@@ -189,8 +204,12 @@ pub const ServerConfig = struct {
                 if (current_service) |*service| {
                     if (std.mem.eql(u8, key, "id")) {
                         service.service_id = std.fmt.parseInt(tunnel.ServiceId, value, 10) catch service.service_id;
+                    } else if (std.mem.eql(u8, key, "mode")) {
+                        service.mode = ServiceMode.fromString(value) orelse service.mode;
                     } else if (std.mem.eql(u8, key, "transport")) {
                         service.transport = Transport.fromString(value) orelse service.transport;
+                    } else if (std.mem.eql(u8, key, "local_port")) {
+                        service.local_port = std.fmt.parseInt(u16, value, 10) catch service.local_port;
                     } else if (std.mem.eql(u8, key, "target_host")) {
                         allocator.free(service.target_host);
                         service.target_host = try dupString(allocator, value);
