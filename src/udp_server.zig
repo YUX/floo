@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const tunnel = @import("tunnel.zig");
+const noise = @import("noise.zig");
 const common = @import("common.zig");
 
 /// Server-side UDP forwarder.
@@ -11,7 +12,7 @@ pub const UdpForwarder = struct {
     service_id: tunnel.ServiceId,
     target_addr: std.net.Address,
     tunnel_conn: *anyopaque,
-    send_fn: *const fn (conn: *anyopaque, payload: []const u8) anyerror!void,
+    send_fn: *const fn (conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void,
     running: std.atomic.Value(bool),
     timeout_ns: i64,
     sessions: std.AutoHashMap(tunnel.StreamId, *Session),
@@ -23,7 +24,7 @@ pub const UdpForwarder = struct {
         target_host: []const u8,
         target_port: u16,
         tunnel_conn: *anyopaque,
-        send_fn: *const fn (conn: *anyopaque, payload: []const u8) anyerror!void,
+        send_fn: *const fn (conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void,
         timeout_seconds: u64,
     ) !*UdpForwarder {
         const target_addr = try std.net.Address.resolveIp(target_host, target_port);
@@ -168,7 +169,7 @@ pub const UdpForwarder = struct {
 
             session.last_activity_ns.store(@as(i64, @intCast(std.time.nanoTimestamp())), .release);
 
-            var encode_buf: [70000]u8 = undefined;
+            var encode_buf: [70016]u8 = undefined;
             const udp_msg = tunnel.UdpDataMsg{
                 .service_id = forwarder.service_id,
                 .stream_id = session.stream_id,
@@ -181,7 +182,7 @@ pub const UdpForwarder = struct {
                 continue;
             };
 
-            forwarder.send_fn(forwarder.tunnel_conn, encode_buf[0..encoded_len]) catch |err| {
+            forwarder.send_fn(forwarder.tunnel_conn, encode_buf[0 .. encoded_len + noise.TAG_LEN], encoded_len) catch |err| {
                 std.debug.print("[UDP-SERVER] Failed to send to tunnel: {}\n", .{err});
             };
         }

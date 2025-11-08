@@ -7,6 +7,9 @@ token = "corp-proxy-token"
 intranet = "127.0.0.1:9443"  # Local port for internal HTTPS
 
 [advanced]
-num_tunnels = 1
+num_tunnels = 1                 # Stay within proxy limits (set 0 for auto scaling)
+pin_threads = true
+io_batch_bytes = 65536
+socket_buffer_size = 4194304
 reconnect_enabled = true
 proxy_url = "socks5://proxy.corp.local:1080"

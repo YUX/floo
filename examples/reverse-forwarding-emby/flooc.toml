@@ -7,13 +7,15 @@ token = "emby-access-token"
 emby = "127.0.0.1:8096"
 
 [advanced]
-num_tunnels = 2
+num_tunnels = 0  # Auto-match CPU cores
+pin_threads = true
+io_batch_bytes = 131072
 tcp_nodelay = true
 tcp_keepalive = true
 tcp_keepalive_idle = 30
 tcp_keepalive_interval = 10
 tcp_keepalive_count = 3
-socket_buffer_size = 524288
+socket_buffer_size = 8388608
 heartbeat_timeout_seconds = 60
 reconnect_enabled = true
 reconnect_initial_delay_ms = 1000

@@ -7,5 +7,8 @@ token = "balancer-token"
 webcluster = "10.0.1.10:8080"  # Site A origin
 
 [advanced]
-num_tunnels = 2
+num_tunnels = 0  # Auto-match CPU cores
+pin_threads = true
+io_batch_bytes = 131072
+socket_buffer_size = 8388608
 reconnect_enabled = true

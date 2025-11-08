@@ -9,5 +9,8 @@ postgres = "127.0.0.1:5432"
 
 [advanced]
 tcp_keepalive = true
+pin_threads = true
+io_batch_bytes = 65536
+socket_buffer_size = 8388608
 heartbeat_interval_seconds = 60
 heartbeat_timeout_seconds = 80

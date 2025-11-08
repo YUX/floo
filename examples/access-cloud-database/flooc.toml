@@ -7,6 +7,9 @@ token = "database-access-token"
 postgres = "127.0.0.1:5432"
 
 [advanced]
-num_tunnels = 2
+num_tunnels = 0  # Auto-match CPU cores
+pin_threads = true
+io_batch_bytes = 65536
+socket_buffer_size = 8388608
 reconnect_enabled = true
 heartbeat_timeout_seconds = 120

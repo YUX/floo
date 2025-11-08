@@ -30,8 +30,9 @@ Once the tunnel is up:
 
 ## Tips
 
-- Increase `num_tunnels` (client side) when simultaneous media streams and SSH
-  sessions need their own backpressure.
+- Leave `num_tunnels = 0` to let Floo match your CPU cores automatically; set an
+  explicit value (e.g. `num_tunnels = 4`) only when you want to cap or boost
+  tunnel fan-out for specific workloads.
 - Add more sections under `[reverse_services]` to expose additional ports using
   the same tunnel.
 - Use per-service tokens to gate sensitive ports (SSH, admin dashboards) while

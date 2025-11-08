@@ -1,14 +1,20 @@
-# Minimal Floo client configuration
-server = "tunnel.example.com:8443"
+# Minimal Floo Client Configuration
+# ==================================
+# Credentials must match your server!
+
+server = "your-server:8443"
 cipher = "aes256gcm"
-psk = "replace-with-strong-psk"
-token = "replace-with-token"
+psk = "REPLACE_ME"      # ⚠️ Must match server PSK!
+token = "REPLACE_ME"    # ⚠️ Must match server token!
 
-# Option A: expose a local service (reverse mode)
+# Expose local service through server's reverse tunnel
 [reverse_services]
-webapp = "127.0.0.1:3000"
+webapp = "127.0.0.1:8080"
 
-# Option B: reach a remote service (forward mode)
-# Uncomment if you need a local listener instead.
+# Or access remote services locally
 # [services]
-# db = "127.0.0.1:5432"
+# database = "127.0.0.1:5432"
+
+[advanced]
+num_tunnels = 0
+pin_threads = true

@@ -20,7 +20,12 @@ export default function Features() {
     {
       icon: '⚡',
       title: 'Parallel Tunnels',
-      description: 'Multiple concurrent tunnels with round-robin load balancing for maximum throughput.'
+      description: 'Automatically matches your CPU cores and pins tunnel threads for maximum throughput.'
+    },
+    {
+      icon: '📈',
+      title: 'Live Metrics',
+      description: 'Emit per-tunnel throughput and crypto timing with a single SIGUSR1—no extra agent required.'
     },
     {
       icon: '🌐',

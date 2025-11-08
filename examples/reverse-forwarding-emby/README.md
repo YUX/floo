@@ -38,7 +38,8 @@ starting the reverse listener.
 
 ## Hardening + tuning
 
-- Increase `num_tunnels` if multiple people will stream simultaneously.
+- Leave `num_tunnels = 0` to auto-scale with CPU cores; bump it only if you need
+  more dedicated tunnels than the hardware provides.
 - Bump `socket_buffer_size` beyond 512 KB when pushing 4K video across
   high-latency links.
 - Combine Floo with an HTTPS reverse proxy (Caddy/Traefik/nginx) on the VPS if

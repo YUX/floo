@@ -80,6 +80,7 @@ pub const UdpSessionManager = struct {
     reverse_map: std.AutoHashMap(tunnel.StreamId, SessionKey),
     mutex: std.Thread.Mutex,
     next_stream_id: std.atomic.Value(u32),
+    scratch_keys: std.ArrayListUnmanaged(SessionKey),
 
     pub fn init(allocator: std.mem.Allocator) UdpSessionManager {
         return .{
@@ -88,12 +89,14 @@ pub const UdpSessionManager = struct {
             .reverse_map = std.AutoHashMap(tunnel.StreamId, SessionKey).init(allocator),
             .mutex = std.Thread.Mutex{},
             .next_stream_id = std.atomic.Value(u32).init(1),
+            .scratch_keys = .{},
         };
     }
 
     pub fn deinit(self: *UdpSessionManager) void {
         self.sessions.deinit();
         self.reverse_map.deinit();
+        self.scratch_keys.deinit(self.allocator);
     }
 
     /// Get or create session for a source address
@@ -135,28 +138,23 @@ pub const UdpSessionManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Collect expired keys (using bounded temporary buffer)
-        var expired_keys: [256]SessionKey = undefined;
-        var expired_count: usize = 0;
+        self.scratch_keys.clearRetainingCapacity();
 
         var iter = self.sessions.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.isExpired(timeout_seconds)) {
-                if (expired_count < expired_keys.len) {
-                    expired_keys[expired_count] = entry.key_ptr.*;
-                    expired_count += 1;
-                }
+                try self.scratch_keys.append(self.allocator, entry.key_ptr.*);
             }
         }
 
         // Remove expired sessions
-        for (expired_keys[0..expired_count]) |key| {
+        for (self.scratch_keys.items) |key| {
             if (self.sessions.fetchRemove(key)) |removed| {
                 _ = self.reverse_map.remove(removed.value.stream_id);
             }
         }
 
-        return expired_count;
+        return self.scratch_keys.items.len;
     }
 
     /// Count active sessions

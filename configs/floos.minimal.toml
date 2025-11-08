@@ -1,14 +1,23 @@
-# Minimal Floo server configuration
+# Minimal Floo Server Configuration
+# ==================================
+# Generate credentials with:
+#   openssl rand -base64 32  (for psk)
+#   openssl rand -base64 24  (for token)
+
 bind = "0.0.0.0"
 port = 8443
 cipher = "aes256gcm"
-psk = "replace-with-strong-psk"
-token = "replace-with-token"
+psk = "REPLACE_ME"      # ⚠️ Replace or server will refuse to start!
+token = "REPLACE_ME"    # ⚠️ Replace or server will refuse to start!
 
-# Accept a reverse tunnel from clients and publish it publicly
+# Accept reverse tunnel from clients and expose publicly
 [reverse_services]
 webapp = "0.0.0.0:80"
 
-# Or allow clients to reach an internal service through the tunnel
+# Or allow clients to reach internal services through tunnel
 # [services]
 # database = "127.0.0.1:5432"
+
+[advanced]
+pin_threads = true
+socket_buffer_size = 8388608

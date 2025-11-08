@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const tunnel = @import("tunnel.zig");
+const noise = @import("noise.zig");
 const udp_session = @import("udp_session.zig");
 const common = @import("common.zig");
 const resolveHostPort = common.resolveHostPort;
@@ -17,7 +18,7 @@ pub const UdpForwarder = struct {
     local_port: u16,
     local_fd: posix.fd_t,
     tunnel_conn: *anyopaque, // Opaque pointer to TunnelClient
-    send_fn: *const fn (conn: *anyopaque, payload: []const u8) anyerror!void,
+    send_fn: *const fn (conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void,
     running: std.atomic.Value(bool),
     thread: std.Thread,
     session_manager: udp_session.UdpSessionManager,
@@ -29,7 +30,7 @@ pub const UdpForwarder = struct {
         local_host: []const u8,
         local_port: u16,
         tunnel_conn: *anyopaque,
-        send_fn: *const fn (conn: *anyopaque, payload: []const u8) anyerror!void,
+        send_fn: *const fn (conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void,
         timeout_seconds: u64,
     ) !*UdpForwarder {
         // Resolve and bind local UDP socket
@@ -106,7 +107,7 @@ pub const UdpForwarder = struct {
             });
 
             // Encode UDP data message
-            var encode_buf: [70000]u8 = undefined;
+            var encode_buf: [70016]u8 = undefined;
 
             // Get source address bytes for encoding
             var addr_bytes: [16]u8 = undefined;
@@ -143,7 +144,7 @@ pub const UdpForwarder = struct {
             };
 
             // Send through tunnel
-            self.send_fn(self.tunnel_conn, encode_buf[0..encoded_len]) catch |err| {
+            self.send_fn(self.tunnel_conn, encode_buf[0 .. encoded_len + noise.TAG_LEN], encoded_len) catch |err| {
                 std.debug.print("[UDP-CLIENT] Tunnel send error: {}\n", .{err});
             };
         }

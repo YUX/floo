@@ -1,60 +1,200 @@
+# ============================================================================
 # Floo Client Configuration (flooc.toml)
-# ======================================
-# This template is split into three sections:
-#   1. Core tunnel settings
-#   2. Services you want to reach (forward) or expose (reverse)
-#   3. Optional advanced tuning knobs
+# ============================================================================
+#
+# This is the CLIENT component that connects to a floo server (floos).
+# Use this to access remote services or expose local services.
+#
+# Quick Start:
+# 1. Get credentials from your server administrator (PSK and token)
+#    OR generate them yourself:
+#    openssl rand -base64 32  # For PSK
+#    openssl rand -base64 24  # For token
+#
+# 2. Replace the placeholder values below with actual credentials
+#
+# 3. Define your services or reverse_services
+#
+# 4. Run: ./flooc flooc.toml
+#
+# ============================================================================
 
-# -----------------------------------------------------------------------------
-# 1. Core tunnel settings
-# -----------------------------------------------------------------------------
-server = "tunnel.example.com:8443"    # floos public address and port
-cipher = "aes256gcm"                   # Supported: chacha20poly1305, aes256gcm, aes128gcm, aegis128l, aegis256, none
-psk = "replace-with-strong-psk"        # Must match floos
-token = "replace-with-client-token"    # Default token for services without their own token
-# default_service = "web"              # Optional: auto-select this service when only one listener is needed
+# ----------------------------------------------------------------------------
+# Core Tunnel Settings (REQUIRED)
+# ----------------------------------------------------------------------------
 
-# -----------------------------------------------------------------------------
-# 2. Services
-# -----------------------------------------------------------------------------
+# Server address (hostname or IP + port)
+# This is where your floo server (floos) is running
+server = "your-vps-hostname.com:8443"
 
-# Forward mode: listen locally and connect to remote targets through the tunnel.
-# Format: name = "listen_host:listen_port[/transport]" (transport defaults to tcp)
+# ----------------------------------------------------------------------------
+# Security Settings (REQUIRED - MUST MATCH SERVER!)
+# ----------------------------------------------------------------------------
+
+# Cipher: MUST match the server's cipher setting
+#   - aes256gcm (recommended): Fast on modern CPUs with AES-NI
+#   - aegis128l: Fastest on ARMv8+ and modern x86 (22+ Gbps)
+#   - chacha20poly1305: Best for older CPUs without AES-NI
+cipher = "aes256gcm"
+
+# PSK (Pre-Shared Key): MUST match server exactly!
+# Get this from your server administrator
+# ⚠️  NEVER use the placeholder below - the client will fail to connect!
+psk = "REPLACE_WITH_SERVER_PSK_HERE"
+
+# Default token: MUST match server's default token
+# Get this from your server administrator
+# ⚠️  NEVER use the placeholder below - connections will be rejected!
+token = "REPLACE_WITH_SERVER_TOKEN_HERE"
+
+# Optional: Auto-select this service when running in single-service mode
+# default_service = "web"
+
+# ----------------------------------------------------------------------------
+# Forward Mode Services
+# ----------------------------------------------------------------------------
+# Forward mode: Create local listeners that connect through the tunnel
+# Format: service_name = "listen_host:port[/transport]"
+#
+# Example: Access remote database as if it's running locally
+# ----------------------------------------------------------------------------
+
 [services]
-web = "127.0.0.1:8080"                 # Visit http://localhost:8080 to reach remote web service
-ssh = "127.0.0.1:2222"                 # ssh -p 2222 localhost → remote SSH
-ssh.token = "ssh-session-token"        # Require explicit token when requesting SSH tunnel
-# dns = "127.0.0.1:5300/udp"          # Local UDP listener → remote DNS over tunnel
+# Example: Access remote web service via http://localhost:8080
+# web = "127.0.0.1:8080"
 
-# Reverse mode: expose local services to the floos server.
-# Format: name = "local_host:local_port[/transport]"
+# Example: SSH to remote machine via localhost:2222
+# ssh = "127.0.0.1:2222"
+# ssh.token = "specific-ssh-token"  # If server requires different token
+
+# Example: Access remote PostgreSQL database
+# database = "127.0.0.1:5432"
+# database.token = "database-specific-token"
+
+# Example: Local DNS forwarding (UDP)
+# dns = "127.0.0.1:5300/udp"
+
+# ----------------------------------------------------------------------------
+# Reverse Mode Services
+# ----------------------------------------------------------------------------
+# Reverse mode: Expose local services through the server
+# Format: service_name = "local_host:port[/transport]"
+#
+# Example: Share your local Jellyfin server with friends
+# ----------------------------------------------------------------------------
+
 [reverse_services]
-media = "127.0.0.1:8096"               # Share Jellyfin/Emby from home network
-metrics = "127.0.0.1:9000"             # Expose Prometheus exporter
-metrics.token = "metrics-only-token"
-# udp_cam = "127.0.0.1:5000/udp"       # Send local UDP stream through the tunnel
+# Example: Expose local Jellyfin/Emby/Plex media server
+# Server binds 0.0.0.0:8096, forwards to your local 127.0.0.1:8096
+# media = "127.0.0.1:8096"
 
-# -----------------------------------------------------------------------------
-# 3. Advanced tuning (all optional)
-# -----------------------------------------------------------------------------
+# Example: Expose local SSH for remote access
+# ssh_home = "127.0.0.1:22"
+# ssh_home.token = "home-ssh-token"  # Recommended for security
+
+# Example: Expose Prometheus metrics
+# metrics = "127.0.0.1:9090"
+
+# Example: UDP service (camera stream, VoIP, etc.)
+# camera = "127.0.0.1:5000/udp"
+
+# ----------------------------------------------------------------------------
+# Advanced Tuning (OPTIONAL)
+# ----------------------------------------------------------------------------
+# Most users don't need to change these - defaults work well
+# ----------------------------------------------------------------------------
+
 [advanced]
-num_tunnels = 2                         # Parallel TCP tunnels per client (1-16)
-udp_timeout_seconds = 60                # Tear down idle UDP flows
-socket_buffer_size = 524288             # Per-socket buffer (bytes); raise for high bitrates
+# Parallel tunnels (0 = auto, matches CPU cores)
+# Set >0 only when you need to force a specific number.
+num_tunnels = 0
 
-# TCP keepalive / latency controls
-tcp_nodelay = true
-tcp_keepalive = true
-tcp_keepalive_idle = 45
-tcp_keepalive_interval = 10
-tcp_keepalive_count = 3
+# Pin each tunnel handler to a dedicated CPU core (Linux/Unix only)
+pin_threads = true
 
-# Heartbeats & reconnection policy
-heartbeat_timeout_seconds = 60
-reconnect_enabled = true
-reconnect_initial_delay_ms = 1000
-reconnect_max_delay_ms = 30000
-reconnect_backoff_multiplier = 2
+# Per-stream IO buffer size in bytes
+# Increase for high-latency links or very large frames.
+io_batch_bytes = 131072
 
-# Optional outbound proxy (socks5:// or http://)
+# UDP session timeout in seconds (default: 60)
+# How long to keep UDP "connections" alive without traffic
+udp_timeout_seconds = 60
+
+# Socket buffer size in bytes (default: 8MB)
+# Increase for high-bandwidth applications (e.g., 16777216 for 16MB)
+socket_buffer_size = 8388608
+
+# TCP optimization
+tcp_nodelay = true                      # Lower latency (disable Nagle)
+tcp_keepalive = true                    # Detect dead connections
+tcp_keepalive_idle = 45                 # Seconds before first keepalive probe
+tcp_keepalive_interval = 10             # Seconds between keepalive probes
+tcp_keepalive_count = 3                 # Failed probes before timeout
+
+# Heartbeat and reconnection
+heartbeat_timeout_seconds = 60          # Detect server disconnection
+reconnect_enabled = true                # Auto-reconnect on disconnect
+reconnect_initial_delay_ms = 1000       # Wait 1 second after disconnect
+reconnect_max_delay_ms = 30000          # Max 30 seconds between attempts
+reconnect_backoff_multiplier = 2        # Exponential backoff
+
+# Proxy support (for corporate firewalls)
+# Supports: socks5://host:port or http://host:port
+# Leave empty if not using a proxy
 proxy_url = ""
+
+# Example proxy configurations:
+# proxy_url = "socks5://corporate-proxy:1080"
+# proxy_url = "http://corporate-proxy:8080"
+
+# ----------------------------------------------------------------------------
+# Common Scenarios
+# ----------------------------------------------------------------------------
+#
+# SCENARIO 1: Access home database from anywhere
+# -----------------------------------------------
+# Server (floos.toml):
+#   [services]
+#   postgres = "10.0.0.5:5432"
+#
+# Client (flooc.toml):
+#   [services]
+#   postgres = "127.0.0.1:5432"
+#
+# Usage: psql -h 127.0.0.1 -p 5432
+#
+# SCENARIO 2: Share home media server
+# ------------------------------------
+# Server (floos.toml):
+#   [reverse_services]
+#   jellyfin = "0.0.0.0:8096"
+#
+# Client (flooc.toml):
+#   [reverse_services]
+#   jellyfin = "127.0.0.1:8096"
+#
+# Friends access: http://your-vps-ip:8096
+#
+# SCENARIO 3: Through corporate firewall
+# ---------------------------------------
+# [advanced]
+# proxy_url = "socks5://corporate-proxy:1080"
+#
+# ----------------------------------------------------------------------------
+# Security Best Practices
+# ----------------------------------------------------------------------------
+#
+# ✅ DO:
+#   - Keep credentials secure (never commit to git)
+#   - Use different tokens for different services
+#   - Verify server certificate/identity before connecting
+#   - Monitor connection logs for suspicious activity
+#   - Rotate credentials periodically
+#
+# ❌ DON'T:
+#   - Use weak or default credentials (connection will fail)
+#   - Share credentials over unsecured channels
+#   - Connect to untrusted servers
+#   - Use cipher = "none" on untrusted networks
+#
+# ----------------------------------------------------------------------------

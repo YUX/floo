@@ -9,6 +9,8 @@ const noise = @import("noise.zig");
 const udp_server = @import("udp_server.zig");
 const diagnostics = @import("diagnostics.zig");
 const common = @import("common.zig");
+const transport = @import("transport/channel.zig");
+const c = std.c;
 
 const tracePrint = common.tracePrint;
 const tcpOptionsFromSettings = common.tcpOptionsFromSettings;
@@ -28,6 +30,89 @@ var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var config_path_global: []const u8 = undefined; // Store config path for reload
 var encrypt_total_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var encrypt_calls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var tunnel_tx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var tunnel_rx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var flush_stats_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var sighup_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var signal_pipe_read_fd: std.atomic.Value(posix.fd_t) = std.atomic.Value(posix.fd_t).init(-1);
+var signal_pipe_write_fd: std.atomic.Value(posix.fd_t) = std.atomic.Value(posix.fd_t).init(-1);
+var cpu_assigner: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var cached_cpu_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+
+fn setupSignalPipe() !void {
+    if (builtin.target.os.tag == .windows) return;
+    if (signal_pipe_read_fd.load(.acquire) != -1) return;
+
+    const fds = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    signal_pipe_read_fd.store(fds[0], .release);
+    signal_pipe_write_fd.store(fds[1], .release);
+}
+
+fn cleanupSignalPipe() void {
+    if (builtin.target.os.tag == .windows) return;
+
+    const rd = signal_pipe_read_fd.swap(-1, .acq_rel);
+    if (rd != -1) {
+        posix.close(rd);
+    }
+
+    const wr = signal_pipe_write_fd.swap(-1, .acq_rel);
+    if (wr != -1) {
+        posix.close(wr);
+    }
+}
+
+fn drainSignalPipe() void {
+    const rd = signal_pipe_read_fd.load(.acquire);
+    if (rd == -1) return;
+
+    var buf: [32]u8 = undefined;
+    while (true) {
+        const result = posix.read(rd, buf[0..]) catch |err| switch (err) {
+            error.WouldBlock, error.BrokenPipe => return,
+            else => return,
+        };
+        if (result == 0) return;
+    }
+}
+
+fn notifySignalPipe(sig: c_int) void {
+    const wr = signal_pipe_write_fd.load(.acquire);
+    if (wr == -1) return;
+    var byte = [_]u8{@intCast(@as(u8, @intCast(sig & 0xFF)))};
+    _ = c.write(wr, &byte, byte.len);
+}
+
+fn cpuCountCached() usize {
+    const cached = cached_cpu_count.load(.acquire);
+    if (cached != 0) return cached;
+    const detected = std.Thread.getCpuCount() catch 1;
+    cached_cpu_count.store(detected, .release);
+    return detected;
+}
+
+fn nextCpuIndex() usize {
+    const count = cpuCountCached();
+    const idx = cpu_assigner.fetchAdd(1, .acq_rel);
+    return idx % @max(count, 1);
+}
+
+fn applyThreadAffinity(index_opt: ?usize) void {
+    if (index_opt == null) return;
+    if (builtin.target.os.tag == .linux) {
+        setThreadAffinityLinux(index_opt.?);
+    }
+}
+
+fn setThreadAffinityLinux(cpu_index: usize) void {
+    if (builtin.target.os.tag != .linux) return;
+    const linux = std.os.linux;
+    var mask = linux.cpu_set_t{};
+    linux.CPU_ZERO(&mask);
+    const limited = cpu_index % linux.CPU_SETSIZE;
+    linux.CPU_SET(@intCast(@as(c_uint, @intCast(limited))), &mask);
+    _ = linux.sched_setaffinity(0, @sizeOf(linux.cpu_set_t), &mask) catch {};
+}
 
 const CliMode = enum { run, help, version, doctor, ping };
 
@@ -304,12 +389,14 @@ const StreamKeyContext = struct {
 
 fn handleSignal(sig: c_int) callconv(.c) void {
     if (sig == posix.SIG.INT or sig == posix.SIG.TERM) {
-        std.debug.print("\n[SHUTDOWN] Received interrupt, stopping server...\n", .{});
         shutdown_flag.store(true, .release);
-    } else if (sig == posix.SIG.HUP) {
-        std.debug.print("\n[INFO] Configuration reload via SIGHUP is currently disabled; restart floos to apply changes.\n", .{});
+    } else if (@hasDecl(posix.SIG, "HUP") and sig == posix.SIG.HUP) {
+        sighup_requested.store(true, .release);
     } else if (@hasDecl(posix.SIG, "USR1") and sig == posix.SIG.USR1) {
-        diagnostics.flushEncryptStats("server", &encrypt_total_ns, &encrypt_calls);
+        flush_stats_requested.store(true, .release);
+    }
+    if (builtin.target.os.tag != .windows) {
+        notifySignalPipe(sig);
     }
 }
 
@@ -389,7 +476,7 @@ const ReverseListener = struct {
                 continue;
             };
 
-            self.tunnel_conn.sendEncryptedMessage(encode_buf[0..encoded_len]) catch |err| {
+            self.tunnel_conn.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
                 std.debug.print("[REVERSE] Failed to send REVERSE_CONNECT: {}\n", .{err});
                 posix.close(client_fd);
                 continue;
@@ -450,31 +537,32 @@ const Stream = struct {
     stream_id: tunnel.StreamId,
     target_fd: posix.fd_t,
     tunnel: *TunnelConnection,
-    thread: std.Thread,
-    running: std.atomic.Value(bool),
     fd_closed: std.atomic.Value(bool), // Track if target_fd is closed
     ref_count: std.atomic.Value(usize),
-    thread_joined: std.atomic.Value(bool),
+    read_buffer: []u8,
+    frame_buffer: []u8,
 
     fn create(allocator: std.mem.Allocator, service_id: tunnel.ServiceId, stream_id: tunnel.StreamId, target_fd: posix.fd_t, tunnel_conn: *TunnelConnection) !*Stream {
+        const io_batch = tunnel_conn.cfg.advanced.io_batch_bytes;
+        const read_buffer = try allocator.alloc(u8, io_batch);
+        errdefer allocator.free(read_buffer);
+
+        const header_len: usize = 7;
+        const frame_capacity = header_len + io_batch + noise.TAG_LEN + 32;
+        const frame_buffer = try allocator.alloc(u8, frame_capacity);
+        errdefer allocator.free(frame_buffer);
+
         const stream = try allocator.create(Stream);
         stream.* = .{
             .service_id = service_id,
             .stream_id = stream_id,
             .target_fd = target_fd,
             .tunnel = tunnel_conn,
-            .thread = undefined,
-            .running = std.atomic.Value(bool).init(true),
             .fd_closed = std.atomic.Value(bool).init(false),
-            .ref_count = std.atomic.Value(usize).init(1), // owned by worker thread
-            .thread_joined = std.atomic.Value(bool).init(false),
+            .ref_count = std.atomic.Value(usize).init(1),
+            .read_buffer = read_buffer,
+            .frame_buffer = frame_buffer,
         };
-
-        // Spawn thread to handle target -> tunnel forwarding
-        stream.thread = try std.Thread.spawn(.{
-            .stack_size = common.DEFAULT_THREAD_STACK,
-        }, streamThreadMain, .{stream});
-
         return stream;
     }
 
@@ -491,115 +579,16 @@ const Stream = struct {
     }
 
     fn destroyInternal(self: *Stream) void {
+        self.stop();
+        if (self.read_buffer.len > 0) global_allocator.free(self.read_buffer);
+        if (self.frame_buffer.len > 0) global_allocator.free(self.frame_buffer);
         global_allocator.destroy(self);
     }
 
-    fn streamThreadMain(self: *Stream) void {
-        var buf: [common.SOCKET_BUFFER_SIZE]u8 align(64) = undefined;
-        var frame_buf: [70016]u8 align(64) = undefined; // Buffer for framing + tag
-        const message_header_len: usize = 7;
-
-        std.debug.print("[STREAM {}] Thread started, reading from target fd={}\n", .{ self.stream_id, self.target_fd });
-
-        // Ensure we remove ourselves from the HashMap on exit and drop references
-        defer {
-            const key = StreamKey{ .service_id = self.service_id, .stream_id = self.stream_id };
-            var released_map_ref = false;
-            self.tunnel.streams_mutex.lock();
-            if (self.tunnel.streams.remove(key)) {
-                released_map_ref = true;
-            }
-            self.tunnel.streams_mutex.unlock();
-            if (released_map_ref) {
-                self.releaseRef(); // drop map-held reference
-            }
-            std.debug.print("[STREAM {}] Removed from streams map\n", .{self.stream_id});
-            self.releaseRef(); // drop worker-thread reference
-        }
-
-        while (self.running.load(.acquire)) {
-            // Blocking read from target
-            const recv_slice: []u8 = if (self.tunnel.encryption_enabled) &buf else frame_buf[message_header_len..];
-            const n = posix.recv(self.target_fd, recv_slice, 0) catch |err| {
-                std.debug.print("[STREAM {}] recv() error: {}\n", .{ self.stream_id, err });
-                break;
-            };
-            tracePrint(enable_stream_trace, "[STREAM {}] recv() returned {} bytes\n", .{ self.stream_id, n });
-            if (n == 0) {
-                std.debug.print("[STREAM {}] EOF from target, sending CLOSE\n", .{self.stream_id});
-                // Send CLOSE message to peer (no allocation - use stack buffer)
-                const close_msg = tunnel.CloseMsg{ .service_id = self.service_id, .stream_id = self.stream_id };
-
-                var encode_buf: [16]u8 = undefined; // CLOSE is 7 bytes
-                const encoded_len = close_msg.encodeInto(&encode_buf) catch break;
-                self.tunnel.sendEncryptedMessage(encode_buf[0..encoded_len]) catch |err| {
-                    self.tunnel.handleSendFailure(err);
-                };
-                break; // EOF
-            }
-
-            if (!self.tunnel.encryption_enabled) {
-                frame_buf[0] = @intFromEnum(tunnel.MessageType.data);
-                std.mem.writeInt(u16, frame_buf[1..3], self.service_id, .big);
-                std.mem.writeInt(u32, frame_buf[3..7], self.stream_id, .big);
-
-                self.tunnel.sendPlainFrame(frame_buf[0 .. message_header_len + n]) catch |err| {
-                    std.debug.print("[STREAM {}] send() error: {}\n", .{ self.stream_id, err });
-                    self.tunnel.handleSendFailure(err);
-                    break;
-                };
-                continue;
-            }
-
-            // Encode DATA message directly into frame buffer
-            const data_msg = tunnel.DataMsg{ .service_id = self.service_id, .stream_id = self.stream_id, .data = buf[0..n] };
-            const encoded_len = data_msg.encodeInto(frame_buf[0..]) catch break;
-
-            self.tunnel.send_mutex.lock();
-            const encrypted_len = encoded_len + noise.TAG_LEN;
-
-            if (self.tunnel.send_cipher) |*cipher| {
-                const start_ns = std.time.nanoTimestamp();
-                cipher.encrypt(frame_buf[0..encoded_len], frame_buf[0..encrypted_len]) catch |err| {
-                    std.debug.print("[STREAM {}] Encryption error: {}\n", .{ self.stream_id, err });
-                    self.tunnel.send_mutex.unlock();
-                    break;
-                };
-                const end_ns = std.time.nanoTimestamp();
-                const delta = @as(u64, @intCast(end_ns - start_ns));
-                _ = encrypt_total_ns.fetchAdd(delta, .acq_rel);
-                _ = encrypt_calls.fetchAdd(1, .acq_rel);
-            } else {
-                std.debug.print("[STREAM {}] Missing send cipher, closing stream\n", .{self.stream_id});
-                self.tunnel.send_mutex.unlock();
-                break;
-            }
-
-            self.tunnel.writeFrameLocked(frame_buf[0..encrypted_len]) catch |err| {
-                std.debug.print("[STREAM {}] send() error: {}\n", .{ self.stream_id, err });
-                self.tunnel.handleSendFailure(err);
-                self.tunnel.send_mutex.unlock();
-                break;
-            };
-            self.tunnel.send_mutex.unlock();
-        }
-
-        // Cleanup
-        std.debug.print("[STREAM {}] Thread exiting\n", .{self.stream_id});
-
-        // Atomically mark fd as closed before actually closing it
-        self.fd_closed.store(true, .release);
-        posix.close(self.target_fd);
-    }
-
     fn stop(self: *Stream) void {
-        if (self.thread_joined.swap(true, .acq_rel)) return;
-        self.running.store(false, .release);
-        // Shutdown socket to unblock recv() call in thread (only if not already closed)
-        if (!self.fd_closed.load(.acquire)) {
-            posix.shutdown(self.target_fd, .recv) catch {};
+        if (!self.fd_closed.swap(true, .acq_rel)) {
+            posix.close(self.target_fd);
         }
-        self.thread.join();
     }
 };
 
@@ -608,16 +597,8 @@ const TunnelConnection = struct {
     tunnel_fd: posix.fd_t,
     streams: std.HashMap(StreamKey, *Stream, StreamKeyContext, 80),
     streams_mutex: std.Thread.Mutex,
-    send_mutex: std.Thread.Mutex, // Protect tunnel sends from multiple stream threads
-    send_cipher: ?noise.TransportCipher,
-    recv_cipher: ?noise.TransportCipher,
-    encryption_enabled: bool,
-    decrypt_buffer: []u8,
+    channel: transport.Channel,
     running: std.atomic.Value(bool),
-
-    // Pre-allocated buffer for control messages (avoid per-frame allocation)
-    control_msg_buffer: [common.CONTROL_MSG_BUFFER_SIZE]u8,
-    control_msg_mutex: std.Thread.Mutex,
 
     // UDP support (only one forwarder per tunnel connection)
     udp_forwarder: ?*udp_server.UdpForwarder,
@@ -663,7 +644,7 @@ const TunnelConnection = struct {
                 continue;
             };
 
-            self.sendEncryptedMessage(encode_buf[0..encoded_len]) catch |err| {
+            self.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
                 std.debug.print("[HEARTBEAT] Send error: {}\n", .{err});
                 // Continue trying even if send fails
             };
@@ -678,92 +659,32 @@ const TunnelConnection = struct {
         setSockOpts(tunnel_fd, cfg);
 
         const canonical_cipher = config.canonicalCipher(cfg);
-        const encryption_enabled = !std.mem.eql(u8, canonical_cipher, "none");
 
         var tunnel_fd_owned = true;
         errdefer if (tunnel_fd_owned) posix.close(tunnel_fd);
 
-        var send_cipher: ?noise.TransportCipher = null;
-        var recv_cipher: ?noise.TransportCipher = null;
-        var decrypt_buffer: []u8 = &[_]u8{};
-        errdefer if (decrypt_buffer.len != 0) allocator.free(decrypt_buffer);
-
-        if (encryption_enabled) {
-            const cipher_type = noise.CipherType.fromString(canonical_cipher) catch {
-                std.debug.print("[NOISE] Invalid cipher '{s}' in configuration\n", .{cfg.cipher});
-                return error.InvalidCipher;
-            };
-
-            // Perform Noise_XX handshake (server is responder, uses persistent static key)
-            const handshake = noise.noiseXXHandshake(tunnel_fd, cipher_type, false, static_keypair, cfg.psk) catch |err| switch (err) {
-                error.MissingPsk => {
-                    std.debug.print("[NOISE] PSK must be configured when encryption is enabled\n", .{});
-                    return err;
-                },
-                else => return error.HandshakeFailed,
-            };
-
-            send_cipher = handshake.send_cipher;
-            recv_cipher = handshake.recv_cipher;
-
-            decrypt_buffer = try allocator.alloc(u8, protocol.MAX_FRAME_SIZE);
-
-            // Exchange version information after successful handshake
-            // Server receives client version first
-            var frame_buf: [256]u8 = undefined;
-            var frame_offset: usize = 0;
-
-            // Read frame header (4 bytes)
-            while (frame_offset < 4) {
-                const n = try posix.recv(tunnel_fd, frame_buf[frame_offset..], 0);
-                if (n == 0) return error.ConnectionClosed;
-                frame_offset += n;
-            }
-
-            const frame_len = std.mem.readInt(u32, frame_buf[0..4], .big);
-            if (frame_len > frame_buf.len - 4) return error.FrameTooLarge;
-
-            // Read frame payload
-            while (frame_offset < 4 + frame_len) {
-                const n = try posix.recv(tunnel_fd, frame_buf[frame_offset..], 0);
-                if (n == 0) return error.ConnectionClosed;
-                frame_offset += n;
-            }
-
-            // Decrypt client version
-            var decrypted_version: [128]u8 = undefined;
-            const decrypted_len = frame_len - noise.TAG_LEN;
-            try recv_cipher.?.decrypt(frame_buf[4 .. 4 + frame_len], decrypted_version[0..decrypted_len]);
-
-            // Parse version message
-            const client_version_msg = try tunnel.VersionMsg.decode(decrypted_version[0..decrypted_len], allocator);
-            defer allocator.free(client_version_msg.version);
-
-            // Check version compatibility
-            if (!std.mem.eql(u8, client_version_msg.version, build_options.version)) {
-                std.debug.print("[ERROR] Version mismatch: server={s}, client={s}\n", .{ build_options.version, client_version_msg.version });
-                std.debug.print("[ERROR] Rejecting connection - versions must match\n", .{});
-                return error.VersionMismatch;
-            }
-
-            std.debug.print("[SERVER] Version check passed: {s}\n", .{build_options.version});
-
-            // Send our version to client
-            const server_version_msg = tunnel.VersionMsg{ .version = build_options.version };
-            var version_buf: [64]u8 = undefined;
-            const version_len = try server_version_msg.encodeInto(&version_buf);
-
-            // Encrypt and send our version
-            var encrypted_version: [128]u8 = undefined;
-            const encrypted_len = version_len + noise.TAG_LEN;
-            try send_cipher.?.encrypt(version_buf[0..version_len], encrypted_version[0..encrypted_len]);
-
-            // Write frame directly (no mutex needed during handshake)
-            var frame_header: [4]u8 = undefined;
-            std.mem.writeInt(u32, &frame_header, @intCast(encrypted_len), .big);
-            try common.sendAllToFd(tunnel_fd, &frame_header);
-            try common.sendAllToFd(tunnel_fd, encrypted_version[0..encrypted_len]);
-        }
+        const channel = try transport.Channel.init(.{
+            .allocator = allocator,
+            .fd = tunnel_fd,
+            .cipher = canonical_cipher,
+            .psk = cfg.psk,
+            .static_keypair = static_keypair,
+            .role = .server,
+            .version = build_options.version,
+            .stats = transport.EncryptionStats{
+                .total_ns = &encrypt_total_ns,
+                .calls = &encrypt_calls,
+            },
+            .throughput = transport.ThroughputStats{
+                .tx_bytes = &tunnel_tx_bytes,
+                .rx_bytes = &tunnel_rx_bytes,
+            },
+        });
+        var channel_guard = true;
+        defer if (channel_guard) {
+            var tmp = channel;
+            tmp.deinit();
+        };
 
         const conn = try allocator.create(TunnelConnection);
 
@@ -772,14 +693,8 @@ const TunnelConnection = struct {
             .tunnel_fd = tunnel_fd,
             .streams = std.HashMap(StreamKey, *Stream, StreamKeyContext, 80).init(allocator),
             .streams_mutex = .{},
-            .send_mutex = .{},
-            .send_cipher = send_cipher,
-            .recv_cipher = recv_cipher,
-            .encryption_enabled = encryption_enabled,
-            .decrypt_buffer = decrypt_buffer,
+            .channel = channel,
             .running = std.atomic.Value(bool).init(true),
-            .control_msg_buffer = undefined, // Pre-allocated buffer for control messages
-            .control_msg_mutex = .{},
             .udp_forwarder = null,
             .udp_service_id = null,
             .heartbeat_interval_ms = cfg.advanced.heartbeat_interval_seconds * 1000, // Convert to milliseconds
@@ -788,7 +703,7 @@ const TunnelConnection = struct {
             .cfg = cfg,
         };
         tunnel_fd_owned = false;
-        decrypt_buffer = &[_]u8{};
+        channel_guard = false;
 
         // Spawn heartbeat thread if enabled
         if (conn.heartbeat_interval_ms > 0) {
@@ -829,37 +744,126 @@ const TunnelConnection = struct {
 
         std.debug.print("[TUNNEL] Connection handler started (buffer size: {})\n", .{decoder.buffer.len});
 
+        const PollEntry = union(enum) {
+            tunnel,
+            stream: *Stream,
+        };
+        var poll_fds = std.ArrayListUnmanaged(posix.pollfd){};
+        defer poll_fds.deinit(global_allocator);
+        var poll_entries = std.ArrayListUnmanaged(PollEntry){};
+        defer poll_entries.deinit(global_allocator);
+        const poll_timeout_ms: i32 = 1000;
+
         while (self.running.load(.acquire) and !shutdown_flag.load(.acquire)) {
-            // Blocking read from tunnel
-            const n = posix.recv(self.tunnel_fd, &buf, 0) catch |err| {
-                std.debug.print("[TUNNEL] Recv error: {}\n", .{err});
-                break;
-            };
+            poll_fds.clearRetainingCapacity();
+            poll_entries.clearRetainingCapacity();
 
-            if (n == 0) {
-                std.debug.print("[TUNNEL] Client disconnected\n", .{});
-                break;
-            }
+            poll_fds.append(global_allocator, .{
+                .fd = self.tunnel_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }) catch unreachable;
+            poll_entries.append(global_allocator, .{ .tunnel = {} }) catch unreachable;
 
-            tracePrint(enable_tunnel_trace, "[TUNNEL] Received {} bytes from client\n", .{n});
-
-            // Feed decoder
-            decoder.feed(buf[0..n]) catch |err| {
-                std.debug.print("[TUNNEL] Decoder feed error: {}\n", .{err});
-                break;
-            };
-
-            // Process all complete frames
-            while (decoder.decode() catch null) |frame_payload| {
-                self.handleMessage(frame_payload) catch |err| {
-                    std.debug.print("[TUNNEL] Handle message error: {}\n", .{err});
-                    self.running.store(false, .release);
-                    break;
+            self.streams_mutex.lock();
+            var iter = self.streams.iterator();
+            while (iter.next()) |entry| {
+                const stream_ptr = entry.value_ptr.*;
+                stream_ptr.acquireRef();
+                poll_entries.append(global_allocator, .{ .stream = stream_ptr }) catch {
+                    stream_ptr.releaseRef();
+                    continue;
                 };
-                if (!self.running.load(.acquire)) break;
+                poll_fds.append(global_allocator, .{
+                    .fd = stream_ptr.target_fd,
+                    .events = posix.POLL.IN,
+                    .revents = 0,
+                }) catch {
+                    _ = poll_entries.pop();
+                    stream_ptr.releaseRef();
+                    continue;
+                };
+            }
+            self.streams_mutex.unlock();
+
+            const ready = posix.poll(poll_fds.items, poll_timeout_ms) catch |err| {
+                std.debug.print("[TUNNEL] Poll error: {}\n", .{err});
+                break;
+            };
+
+            if (ready == 0) {
+                for (poll_entries.items) |entry| {
+                    switch (entry) {
+                        .stream => |stream_ptr| stream_ptr.releaseRef(),
+                        .tunnel => {},
+                    }
+                }
+                continue;
             }
 
-            if (!self.running.load(.acquire)) break;
+            var fatal_error = false;
+            var idx: usize = 0;
+            loop: while (idx < poll_entries.items.len) : (idx += 1) {
+                const entry = poll_entries.items[idx];
+                const fd_info = poll_fds.items[idx];
+                switch (entry) {
+                    .tunnel => {
+                        if ((fd_info.revents & posix.POLL.IN) == 0) continue;
+
+                        const n = posix.recv(self.tunnel_fd, &buf, 0) catch |err| {
+                            std.debug.print("[TUNNEL] Recv error: {}\n", .{err});
+                            fatal_error = true;
+                            break :loop;
+                        };
+
+                        if (n == 0) {
+                            std.debug.print("[TUNNEL] Client disconnected\n", .{});
+                            fatal_error = true;
+                            break :loop;
+                        }
+
+                        tracePrint(enable_tunnel_trace, "[TUNNEL] Received {} bytes from client\n", .{n});
+
+                        decoder.feed(buf[0..n]) catch |err| {
+                            std.debug.print("[TUNNEL] Decoder feed error: {}\n", .{err});
+                            fatal_error = true;
+                            break :loop;
+                        };
+
+                        while (decoder.decode() catch null) |frame_payload| {
+                            self.handleMessage(frame_payload) catch |err| {
+                                std.debug.print("[TUNNEL] Handle message error: {}\n", .{err});
+                                self.running.store(false, .release);
+                                fatal_error = true;
+                                break :loop;
+                            };
+                            if (!self.running.load(.acquire)) break;
+                        }
+
+                        if (!self.running.load(.acquire)) {
+                            fatal_error = true;
+                            break :loop;
+                        }
+                    },
+                    .stream => {
+                        if (fd_info.revents != 0) {
+                            self.handleStreamPollEvent(entry.stream, fd_info.revents);
+                        }
+                        entry.stream.releaseRef();
+                    },
+                }
+            }
+
+            if (fatal_error) {
+                var release_idx = idx + 1;
+                while (release_idx < poll_entries.items.len) : (release_idx += 1) {
+                    switch (poll_entries.items[release_idx]) {
+                        .stream => |stream_ptr| stream_ptr.releaseRef(),
+                        .tunnel => {},
+                    }
+                }
+                break;
+            }
         }
 
         std.debug.print("[TUNNEL] Connection handler stopping\n", .{});
@@ -870,28 +874,7 @@ const TunnelConnection = struct {
     fn handleMessage(self: *TunnelConnection, payload: []const u8) !void {
         if (payload.len == 0) return;
 
-        var message_slice: []const u8 = payload;
-
-        if (self.encryption_enabled) {
-            if (payload.len < noise.TAG_LEN) return error.InvalidPayload;
-
-            const decrypted_len = payload.len - noise.TAG_LEN;
-            if (decrypted_len > self.decrypt_buffer.len) {
-                return error.InvalidPayload;
-            }
-
-            // Decrypt with atomic nonce (no mutex needed) - use pointer capture
-            const target = self.decrypt_buffer[0..decrypted_len];
-            if (self.recv_cipher) |*cipher| {
-                cipher.decrypt(payload, target) catch |err| {
-                    std.debug.print("[TUNNEL] Decryption error: {} (len={})\n", .{ err, payload.len });
-                    return err;
-                };
-            } else return error.CipherUnavailable;
-
-            message_slice = target;
-        }
-
+        const message_slice = try self.channel.decryptFrame(payload);
         if (message_slice.len == 0) return;
 
         const msg_type: tunnel.MessageType = @enumFromInt(message_slice[0]);
@@ -933,7 +916,7 @@ const TunnelConnection = struct {
                     var encode_buf: [128]u8 = undefined; // ERROR message with text
                     const encoded_len = error_msg.encodeInto(&encode_buf) catch return;
 
-                    self.sendEncryptedMessage(encode_buf[0..encoded_len]) catch |send_err| {
+                    self.channel.sendCopy(encode_buf[0..encoded_len]) catch |send_err| {
                         self.handleSendFailure(send_err);
                     };
                 };
@@ -1028,6 +1011,103 @@ const TunnelConnection = struct {
         }
     }
 
+    fn handleStreamPollEvent(self: *TunnelConnection, stream: *Stream, revents: i16) void {
+        var closed = false;
+        if ((revents & posix.POLL.IN) != 0) {
+            self.forwardTargetData(stream) catch |err| switch (err) {
+                error.ConnectionClosed => {
+                    self.completeStream(stream, false);
+                    closed = true;
+                },
+                else => {
+                    std.debug.print("[STREAM {}] Forward error: {}\n", .{ stream.stream_id, err });
+                    self.completeStream(stream, true);
+                    closed = true;
+                },
+            };
+        }
+
+        const extra_error_mask: i16 = if (@hasDecl(posix.POLL, "NVAL")) posix.POLL.NVAL else 0;
+        const error_mask: i16 = posix.POLL.HUP | posix.POLL.ERR | extra_error_mask;
+        if (!closed and (revents & error_mask) != 0) {
+            self.completeStream(stream, true);
+        }
+    }
+
+    fn forwardTargetData(self: *TunnelConnection, stream: *Stream) anyerror!void {
+        const message_header_len: usize = 7;
+        const encrypted = self.channel.isEncrypted();
+
+        const recv_slice: []u8 = if (encrypted) stream.read_buffer else stream.frame_buffer[message_header_len..];
+        const n = posix.recv(stream.target_fd, recv_slice, 0) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => return err,
+        };
+        tracePrint(enable_stream_trace, "[STREAM {}] recv() returned {} bytes\n", .{ stream.stream_id, n });
+
+        if (n == 0) {
+            self.sendStreamClose(stream);
+            return error.ConnectionClosed;
+        }
+
+        if (!encrypted) {
+            stream.frame_buffer[0] = @intFromEnum(tunnel.MessageType.data);
+            std.mem.writeInt(u16, stream.frame_buffer[1..3], stream.service_id, .big);
+            std.mem.writeInt(u32, stream.frame_buffer[3..7], stream.stream_id, .big);
+
+            const slice = stream.frame_buffer[0 .. message_header_len + n];
+            self.channel.sendDataInPlace(slice, message_header_len + n) catch |err| {
+                std.debug.print("[STREAM {}] send() error: {}\n", .{ stream.stream_id, err });
+                self.handleSendFailure(err);
+                return error.ConnectionClosed;
+            };
+            return;
+        }
+
+        const data_msg = tunnel.DataMsg{
+            .service_id = stream.service_id,
+            .stream_id = stream.stream_id,
+            .data = stream.read_buffer[0..n],
+        };
+
+        const encoded_len = data_msg.encodeInto(stream.frame_buffer[0..]) catch {
+            return error.ConnectionClosed;
+        };
+
+        const slice = stream.frame_buffer[0 .. encoded_len + noise.TAG_LEN];
+        self.channel.sendDataInPlace(slice, encoded_len) catch |err| {
+            std.debug.print("[STREAM {}] send() error: {}\n", .{ stream.stream_id, err });
+            self.handleSendFailure(err);
+            return error.ConnectionClosed;
+        };
+    }
+
+    fn completeStream(self: *TunnelConnection, stream: *Stream, send_close: bool) void {
+        const already_closed = stream.fd_closed.load(.acquire);
+        if (send_close and !already_closed) {
+            self.sendStreamClose(stream);
+        }
+
+        self.streams_mutex.lock();
+        const key = StreamKey{ .service_id = stream.service_id, .stream_id = stream.stream_id };
+        const removed = self.streams.fetchRemove(key);
+        self.streams_mutex.unlock();
+        if (removed) |_| {
+            stream.releaseRef();
+        }
+
+        stream.stop();
+    }
+
+    fn sendStreamClose(self: *TunnelConnection, stream: *Stream) void {
+        var encode_buf: [16]u8 = undefined;
+        const close_msg = tunnel.CloseMsg{ .service_id = stream.service_id, .stream_id = stream.stream_id };
+        const encoded_len = close_msg.encodeInto(&encode_buf) catch return;
+        self.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
+            self.handleSendFailure(err);
+        };
+    }
+
     fn handleConnect(self: *TunnelConnection, msg: tunnel.ConnectMsg) !void {
         const service_ptr = self.cfg.getServiceById(msg.service_id) orelse {
             std.debug.print("[AUTH] Unknown service_id={} stream_id={}\n", .{ msg.service_id, msg.stream_id });
@@ -1084,7 +1164,7 @@ const TunnelConnection = struct {
                         service.address,
                         service.port,
                         @ptrCast(self),
-                        sendEncryptedMessageWrapper,
+                        sendTunnelPayload,
                         self.cfg.advanced.udp_timeout_seconds,
                     );
                     self.udp_forwarder = forwarder;
@@ -1106,25 +1186,14 @@ const TunnelConnection = struct {
         var encode_buf: [16]u8 = undefined; // ACK is 7 bytes
         const encoded_len = try ack_msg.encodeInto(&encode_buf);
 
-        try self.sendEncryptedMessage(encode_buf[0..encoded_len]);
+        try self.channel.sendCopy(encode_buf[0..encoded_len]);
     }
 
     // Wrapper for UDP forwarder callback (converts opaque pointer back to TunnelConnection)
-    fn sendEncryptedMessageWrapper(conn: *anyopaque, payload: []const u8) anyerror!void {
+    fn sendTunnelPayload(conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void {
         const self: *TunnelConnection = @ptrCast(@alignCast(conn));
-        try self.sendEncryptedMessage(payload);
-    }
-
-    /// Send plaintext frame (framing only, no encryption).
-    /// NOTE: Similar implementation exists in client.zig. Consider unifying.
-    fn sendPlainFrame(self: *TunnelConnection, payload: []const u8) !void {
-        self.send_mutex.lock();
-        defer self.send_mutex.unlock();
-
-        self.writeFrameLocked(payload) catch |err| {
-            self.handleSendFailure(err);
-            return err;
-        };
+        const slice = buffer[0 .. payload_len + noise.TAG_LEN];
+        try self.channel.sendDataInPlace(slice, payload_len);
     }
 
     fn handleSendFailure(self: *TunnelConnection, err: anyerror) void {
@@ -1137,52 +1206,6 @@ const TunnelConnection = struct {
     /// Send all data to a file descriptor, looping until complete.
     /// Extracted to common.zig to eliminate duplication with client.zig.
     const sendAllToFd = common.sendAllToFd;
-
-    /// Write length-prefixed frame using writev() for scatter-gather I/O.
-    /// Extracted to common.zig to eliminate duplication with client.zig.
-    fn writeFrameLocked(self: *TunnelConnection, payload: []const u8) !void {
-        return common.writeFrameLocked(self.tunnel_fd, payload);
-    }
-
-    /// Encrypt a message payload and send it with frame length prefix.
-    /// NOTE: Similar implementation exists in client.zig. Consider unifying.
-    fn sendEncryptedMessage(self: *TunnelConnection, payload: []const u8) !void {
-        if (!self.encryption_enabled) {
-            try self.sendPlainFrame(payload);
-            return;
-        }
-
-        self.control_msg_mutex.lock();
-        defer self.control_msg_mutex.unlock();
-
-        const encrypted_len = payload.len + noise.TAG_LEN;
-        if (encrypted_len > self.control_msg_buffer.len) {
-            return error.ControlMessageTooLarge;
-        }
-
-        @memcpy(self.control_msg_buffer[0..payload.len], payload);
-
-        if (self.send_cipher) |*cipher| {
-            const start_ns = std.time.nanoTimestamp();
-            cipher.encrypt(self.control_msg_buffer[0..payload.len], self.control_msg_buffer[0..encrypted_len]) catch |err| {
-                return err;
-            };
-            const end_ns = std.time.nanoTimestamp();
-            const delta = @as(u64, @intCast(end_ns - start_ns));
-            _ = encrypt_total_ns.fetchAdd(delta, .acq_rel);
-            _ = encrypt_calls.fetchAdd(1, .acq_rel);
-        } else {
-            return error.CipherUnavailable;
-        }
-
-        self.send_mutex.lock();
-        const send_result = self.writeFrameLocked(self.control_msg_buffer[0..encrypted_len]);
-        self.send_mutex.unlock();
-        send_result catch |err| {
-            self.handleSendFailure(err);
-            return err;
-        };
-    }
 
     fn cleanup(self: *TunnelConnection) void {
         // Stop heartbeat thread first
@@ -1217,12 +1240,8 @@ const TunnelConnection = struct {
             self.udp_service_id = null;
         }
 
-        if (self.decrypt_buffer.len > 0) {
-            global_allocator.free(self.decrypt_buffer);
-            self.decrypt_buffer = &[_]u8{};
-        }
-
         posix.close(self.tunnel_fd);
+        self.tunnel_fd = -1;
     }
 
     fn destroy(self: *TunnelConnection) void {
@@ -1234,12 +1253,80 @@ const TunnelConnection = struct {
             self.udp_service_id = null;
         }
 
-        if (self.decrypt_buffer.len > 0) {
-            global_allocator.free(self.decrypt_buffer);
+        if (self.tunnel_fd != -1) {
+            posix.close(self.tunnel_fd);
+            self.tunnel_fd = -1;
         }
+
+        self.channel.deinit();
         global_allocator.destroy(self);
     }
 };
+
+test "forwardTargetData sends plaintext frames" {
+    if (builtin.target.os.tag == .windows) return;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    global_allocator = allocator;
+
+    var cfg = try config.ServerConfig.init(allocator);
+    defer cfg.deinit();
+
+    const tunnel_pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(tunnel_pair[0]);
+    defer posix.close(tunnel_pair[1]);
+
+    const target_pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    defer posix.close(target_pair[0]);
+    defer posix.close(target_pair[1]);
+
+    const channel = try transport.Channel.init(.{
+        .allocator = allocator,
+        .fd = tunnel_pair[0],
+        .cipher = "none",
+        .psk = "",
+        .static_keypair = std.crypto.dh.X25519.KeyPair.generate(),
+        .role = .server,
+        .version = build_options.version,
+    });
+
+    var conn = TunnelConnection{
+        .tunnel_fd = tunnel_pair[0],
+        .streams = std.HashMap(StreamKey, *Stream, StreamKeyContext, 80).init(allocator),
+        .streams_mutex = .{},
+        .channel = channel,
+        .running = std.atomic.Value(bool).init(true),
+        .udp_forwarder = null,
+        .udp_service_id = null,
+        .heartbeat_interval_ms = 0,
+        .heartbeat_thread = null,
+        .next_stream_id = std.atomic.Value(u32).init(1),
+        .cfg = &cfg,
+    };
+    defer conn.channel.deinit();
+    defer conn.streams.deinit();
+
+    const stream = try Stream.create(allocator, 2, 99, target_pair[0], &conn);
+    defer stream.releaseRef();
+
+    _ = try posix.write(target_pair[1], "pong");
+
+    try conn.forwardTargetData(stream);
+
+    var frame_header: [4]u8 = undefined;
+    try common.recvAllFromFd(tunnel_pair[1], &frame_header);
+    const frame_len = std.mem.readInt(u32, frame_header[0..4], .big);
+    var payload = try allocator.alloc(u8, frame_len);
+    defer allocator.free(payload);
+    try common.recvAllFromFd(tunnel_pair[1], payload);
+
+    try std.testing.expectEqual(@as(u8, @intFromEnum(tunnel.MessageType.data)), payload[0]);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, payload[1..3], .big));
+    try std.testing.expectEqual(@as(u32, 99), std.mem.readInt(u32, payload[3..7], .big));
+    try std.testing.expectEqualStrings("pong", payload[7..]);
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
@@ -1247,6 +1334,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     global_allocator = allocator;
     defer diagnostics.flushEncryptStats("server", &encrypt_total_ns, &encrypt_calls);
+    defer diagnostics.flushThroughputStats("server", &tunnel_tx_bytes, &tunnel_rx_bytes);
+    defer cleanupSignalPipe();
 
     var exit_code: u8 = 0;
     defer if (exit_code != 0) posix.exit(exit_code);
@@ -1333,11 +1422,14 @@ pub fn main() !void {
     std.debug.print("Floo Tunnel Server (floos-blocking)\n", .{});
     std.debug.print("====================================\n\n", .{});
     std.debug.print("[CONFIG] Port: {}\n", .{port});
+    std.debug.print("[CONFIG] Thread Pinning: {s}\n", .{if (cfg.advanced.pin_threads) "enabled" else "disabled"});
+    std.debug.print("[CONFIG] IO Batch Bytes: {}\n", .{cfg.advanced.io_batch_bytes});
     std.debug.print("[CONFIG] Mode: Blocking I/O + Threads\n", .{});
     std.debug.print("[CONFIG] Hot Reload: Disabled (restart floos to apply configuration changes)\n\n", .{});
 
     // Register signal handlers (POSIX only)
     if (builtin.target.os.tag != .windows and @hasDecl(posix, "Sigaction") and @hasDecl(posix, "sigaction")) {
+        try setupSignalPipe();
         const sig_action = posix.Sigaction{
             .handler = .{ .handler = handleSignal },
             .mask = std.mem.zeroes(posix.sigset_t),
@@ -1404,8 +1496,23 @@ pub fn main() !void {
         connections.deinit(allocator);
     }
 
-    // Accept loop
+    // Accept loop with rate limiting to prevent connection flood attacks
+    // Allow up to 100 new connections per second (reasonable for production)
+    var rate_limiter = common.RateLimiter.init(100);
+    var shutdown_notice_printed = false;
     while (!shutdown_flag.load(.acquire)) {
+        if (flush_stats_requested.swap(false, .acq_rel)) {
+            diagnostics.flushEncryptStats("server", &encrypt_total_ns, &encrypt_calls);
+            diagnostics.flushThroughputStats("server", &tunnel_tx_bytes, &tunnel_rx_bytes);
+        }
+        if (sighup_requested.swap(false, .acq_rel)) {
+            std.debug.print("\n[INFO] Configuration reload via SIGHUP is currently disabled; restart floos to apply changes.\n", .{});
+        }
+        if (shutdown_flag.load(.acquire) and !shutdown_notice_printed) {
+            std.debug.print("\n[SHUTDOWN] Received interrupt, stopping server...\n", .{});
+            shutdown_notice_printed = true;
+        }
+
         // Reap completed connections
         var idx: usize = 0;
         while (idx < connections.items.len) {
@@ -1425,18 +1532,41 @@ pub fn main() !void {
             idx += 1;
         }
 
-        // Accept with timeout (poll for shutdown and reload)
-        var fds = [_]posix.pollfd{
-            .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 },
-        };
+        // Accept with timeout (poll for shutdown and signal pipe)
+        var poll_buf: [2]posix.pollfd = undefined;
+        var poll_count: usize = 1;
+        poll_buf[0] = .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 };
+        const signal_fd = signal_pipe_read_fd.load(.acquire);
+        if (signal_fd != -1) {
+            poll_count = 2;
+            poll_buf[1] = .{ .fd = signal_fd, .events = posix.POLL.IN, .revents = 0 };
+        } else {
+            poll_count = 1;
+        }
 
-        const ready = posix.poll(&fds, 1000) catch continue; // 1s timeout
+        const ready = posix.poll(poll_buf[0..poll_count], 1000) catch continue; // 1s timeout
+
+        if (signal_fd != -1) {
+            const signal_events = poll_buf[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR);
+            if (signal_events != 0) {
+                drainSignalPipe();
+            }
+        }
+
         if (ready == 0) continue; // Timeout, check flags
+        if ((poll_buf[0].revents & posix.POLL.IN) == 0) continue;
 
         const tunnel_fd = posix.accept(listen_fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
             std.debug.print("[SERVER] Accept error: {}\n", .{err});
             continue;
         };
+
+        // Apply rate limiting to prevent connection flood attacks
+        if (!rate_limiter.tryAcquire()) {
+            std.debug.print("[SERVER] Rate limit exceeded, rejecting connection fd={}\n", .{tunnel_fd});
+            posix.close(tunnel_fd);
+            continue;
+        }
 
         std.debug.print("[SERVER] Accepted tunnel connection: fd={}\n", .{tunnel_fd});
         tuneSocketBuffers(tunnel_fd, cfg.advanced.socket_buffer_size);
@@ -1457,9 +1587,10 @@ pub fn main() !void {
         };
 
         // Spawn thread for this connection
+        const cpu_index = if (cfg.advanced.pin_threads) nextCpuIndex() else null;
         const thread = try std.Thread.spawn(.{
             .stack_size = common.TUNNEL_THREAD_STACK,
-        }, tunnelConnectionThread, .{tunnel_conn});
+        }, tunnelConnectionThread, .{ TunnelThreadContext{ .conn = tunnel_conn, .cpu_index = cpu_index } });
 
         connections.append(allocator, .{ .conn = tunnel_conn, .thread = thread }) catch |err| {
             std.debug.print("[SERVER] Failed to track connection: {}\n", .{err});
@@ -1503,7 +1634,17 @@ pub fn main() !void {
     std.debug.print("\n[SHUTDOWN] Server stopped.\n", .{});
 }
 
-fn tunnelConnectionThread(conn: *TunnelConnection) void {
+const TunnelThreadContext = struct {
+    conn: *TunnelConnection,
+    cpu_index: ?usize,
+};
+
+fn tunnelConnectionThread(ctx: TunnelThreadContext) void {
+    applyThreadAffinity(ctx.cpu_index);
+    tunnelConnectionThreadMain(ctx.conn);
+}
+
+fn tunnelConnectionThreadMain(conn: *TunnelConnection) void {
     conn.run();
     // Note: conn.destroy() is called by main thread on shutdown
 }
@@ -1590,7 +1731,7 @@ fn reverseServiceListener(ctx_ptr: *anyopaque) void {
             continue;
         };
 
-        ctx.tunnel_conn.sendEncryptedMessage(encode_buf[0..encoded_len]) catch |err| {
+        ctx.tunnel_conn.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
             std.debug.print("[REVERSE-SERVICE] Failed to send CONNECT to client: {}\n", .{err});
             ctx.tunnel_conn.handleSendFailure(err);
             posix.close(user_fd);

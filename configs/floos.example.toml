@@ -1,51 +1,145 @@
+# ============================================================================
 # Floo Server Configuration (floos.toml)
-# ======================================
-# Layout mirrors the client template:
-#   1. Core listener / security settings
-#   2. Services provided by the server (forward) or accepted from clients (reverse)
-#   3. Optional performance tuning
+# ============================================================================
+#
+# This is the SERVER component that runs on your public VPS or relay server.
+# Clients (flooc) connect to this server to establish encrypted tunnels.
+#
+# Quick Start:
+# 1. Generate strong credentials:
+#    openssl rand -base64 32  # For PSK
+#    openssl rand -base64 24  # For token
+#
+# 2. Replace the placeholder values below with your generated credentials
+#
+# 3. Define your services (forward mode) or reverse_services (reverse mode)
+#
+# 4. Run: ./floos floos.toml
+#
+# ============================================================================
 
-# -----------------------------------------------------------------------------
-# 1. Core listener + tunnel security
-# -----------------------------------------------------------------------------
-bind = "0.0.0.0"                        # Interface to bind the tunnel listener
-port = 8443                              # TCP port flooc instances will hit
-cipher = "aes256gcm"                     # Supported: chacha20poly1305, aes256gcm, aes128gcm, aegis128l, aegis256, none
-psk = "replace-with-strong-psk"          # Shared secret for Noise handshake
-token = "replace-with-server-token"      # Default per-service token (may be overridden per entry)
+# ----------------------------------------------------------------------------
+# Core Server Settings (REQUIRED)
+# ----------------------------------------------------------------------------
 
-# -----------------------------------------------------------------------------
-# 2. Services
-# -----------------------------------------------------------------------------
+bind = "0.0.0.0"        # Listen on all interfaces (use "127.0.0.1" for local only)
+port = 8443             # Port for tunnel connections (clients connect here)
 
-# Forward mode: allow clients to connect through the tunnel to targets reachable
-# from this server. Format: name = "target_host:target_port[/transport]".
+# ----------------------------------------------------------------------------
+# Security Settings (REQUIRED - REPLACE THESE!)
+# ----------------------------------------------------------------------------
+
+# Cipher: Choose based on your CPU
+#   - aes256gcm (recommended): Fast on modern CPUs with AES-NI
+#   - aegis128l: Fastest on ARMv8+ and modern x86 (22+ Gbps)
+#   - chacha20poly1305: Best for older CPUs without AES-NI
+#   - aes128gcm: Faster than aes256gcm, still secure
+cipher = "aes256gcm"
+
+# PSK (Pre-Shared Key): MUST be strong and random!
+# Generate with: openssl rand -base64 32
+# ⚠️  NEVER use the placeholder below - the server will refuse to start!
+psk = "REPLACE_WITH_OPENSSL_RAND_BASE64_32_OUTPUT"
+
+# Default token: Used for service authentication
+# Generate with: openssl rand -base64 24
+# ⚠️  NEVER use the placeholder below - the server will refuse to start!
+token = "REPLACE_WITH_OPENSSL_RAND_BASE64_24_OUTPUT"
+
+# ----------------------------------------------------------------------------
+# Forward Mode Services
+# ----------------------------------------------------------------------------
+# Forward mode: Clients connect through the tunnel to reach these targets.
+# Format: service_name = "target_host:port[/transport]"
+#
+# Example use case: Allow remote access to internal/private networks
+# ----------------------------------------------------------------------------
+
 [services]
-internal_api = "10.0.0.10:443"          # Reverse proxy to internal HTTPS service
-database = "10.0.0.20:5432"             # PostgreSQL reachable only from the server LAN
-database.token = "db-per-service-token" # Optional override: clients must present this token
-# telemetry = "[fd00::10]:9100"         # IPv6 target example
+# Example: Expose internal API server
+# Clients will connect to this through the tunnel
+# api = "10.0.0.10:8080"
 
-# Reverse mode: accept connections from clients and bind them on the public server.
-# Format: name = "bind_host:bind_port[/transport]".
+# Example: PostgreSQL database in private subnet
+# database = "10.0.0.20:5432"
+# database.token = "unique-db-token-here"  # Optional: per-service token
+
+# Example: Internal Kubernetes dashboard
+# k8s_dashboard = "192.168.1.100:8443"
+
+# Example: UDP service (DNS, VoIP, etc.)
+# dns = "10.0.0.53:53/udp"
+
+# ----------------------------------------------------------------------------
+# Reverse Mode Services
+# ----------------------------------------------------------------------------
+# Reverse mode: Accept connections from clients and expose them publicly
+# Format: service_name = "bind_host:port[/transport]"
+#
+# Example use case: Share home services without port forwarding/dynamic DNS
+# ----------------------------------------------------------------------------
+
 [reverse_services]
-media = "0.0.0.0:8096"                  # Publish home media servers
-dev_ssh = "0.0.0.0:2222"                # Provide SSH access via token per service
-dev_ssh.token = "ssh-only-token"
-# udp_cam = "0.0.0.0:5000/udp"          # Accept UDP video stream
+# Example: Accept media server connections from home
+# Friends can access http://your-vps-ip:8096
+# media = "0.0.0.0:8096"
 
-# -----------------------------------------------------------------------------
-# 3. Advanced tuning (server-side)
-# -----------------------------------------------------------------------------
+# Example: SSH access to home machines
+# ssh = "0.0.0.0:2222"
+# ssh.token = "unique-ssh-token-here"  # Recommended for sensitive services
+
+# Example: Home security camera streams
+# camera = "0.0.0.0:5000/udp"
+
+# ----------------------------------------------------------------------------
+# Advanced Performance Tuning (OPTIONAL)
+# ----------------------------------------------------------------------------
+# Only modify these if you understand the implications
+# Default values work well for most deployments
+# ----------------------------------------------------------------------------
+
 [advanced]
-socket_buffer_size = 524288              # Raise for higher throughput
-udp_timeout_seconds = 60                 # How long to keep idle UDP mappings
+# Socket buffer size in bytes (default: 8MB)
+# Increase for high-bandwidth connections (e.g., 16777216 for 16MB)
+socket_buffer_size = 8388608
 
-tcp_nodelay = true
-tcp_keepalive = true
-tcp_keepalive_idle = 45
-tcp_keepalive_interval = 10
-tcp_keepalive_count = 3
+# UDP session timeout in seconds (default: 60)
+# How long to keep UDP "connections" alive without traffic
+udp_timeout_seconds = 60
 
-heartbeat_interval_seconds = 30
-heartbeat_timeout_seconds = 45          # Must be > heartbeat_interval_seconds
+# Pin worker threads to dedicated CPU cores (Linux/Unix)
+pin_threads = true
+
+# Per-stream IO buffer size (in bytes)
+io_batch_bytes = 131072
+
+# TCP optimization settings
+tcp_nodelay = true                      # Disable Nagle's algorithm (lower latency)
+tcp_keepalive = true                    # Enable TCP keepalive
+tcp_keepalive_idle = 45                 # Seconds before first keepalive probe
+tcp_keepalive_interval = 10             # Seconds between keepalive probes
+tcp_keepalive_count = 3                 # Number of failed probes before timeout
+
+# Heartbeat settings (detect dead connections)
+heartbeat_interval_seconds = 30         # How often to send heartbeats
+heartbeat_timeout_seconds = 60          # Consider connection dead after this
+
+# ----------------------------------------------------------------------------
+# Security Best Practices
+# ----------------------------------------------------------------------------
+#
+# ✅ DO:
+#   - Use strong random credentials (openssl rand -base64)
+#   - Use different tokens for different services
+#   - Rotate credentials periodically
+#   - Use per-service tokens for sensitive services (database, ssh)
+#   - Monitor connection logs
+#
+# ❌ DON'T:
+#   - Use weak or default credentials (server will refuse to start)
+#   - Commit credentials to version control
+#   - Share credentials over unsecured channels
+#   - Use cipher = "none" in production (debugging only!)
+#   - Bind reverse_services to 0.0.0.0 unless you want public access
+#
+# ----------------------------------------------------------------------------

@@ -65,7 +65,9 @@ pub const CipherType = enum {
 
 pub const KEY_LEN = 32;
 pub const TAG_LEN = 16;
-pub const MAX_NONCE = 0xFFFFFFFFFFFF; // 2^48 - 1 for nonce rekey
+// Force reconnection before theoretical nonce limit to prevent wraparound
+// 2^40 (~1.1 trillion messages) provides 256x safety margin before 2^48 limit
+pub const MAX_NONCE = 0xFFFFFFFFFF; // 2^40 - 1
 pub const DH_LEN = 32; // X25519 public key length
 pub const HASH_LEN = 32; // SHA256 hash length
 

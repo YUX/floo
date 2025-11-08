@@ -1,19 +1,29 @@
-# Public server (VPS/Raspberry Pi)
+# Floo Server Config - Expose Home Media Server Example
+# =======================================================
+# Run this on your PUBLIC VPS to accept tunnel connections
+
 bind = "0.0.0.0"
 port = 8443
 cipher = "aes256gcm"
-psk = "your-secure-pre-shared-key"
-token = "your-auth-token"
+
+# ⚠️  REPLACE THESE! Generate with: openssl rand -base64 32/24
+psk = "REPLACE_WITH_YOUR_PSK_FROM_OPENSSL"
+token = "REPLACE_WITH_YOUR_TOKEN_FROM_OPENSSL"
 
 [reverse_services]
-webapp = "0.0.0.0:80"  # Visitors connect here; traffic is relayed over the tunnel
+# Accept connections from home and expose on port 8096
+# Friends access: http://YOUR_VPS_IP:8096
+jellyfin = "0.0.0.0:8096"
 
 [advanced]
+# Optimized for media streaming
 tcp_nodelay = true
 tcp_keepalive = true
 tcp_keepalive_idle = 45
 tcp_keepalive_interval = 10
 tcp_keepalive_count = 3
-socket_buffer_size = 524288
+socket_buffer_size = 8388608         # 8MB buffers for 4K streaming
+pin_threads = true
+io_batch_bytes = 131072
 heartbeat_interval_seconds = 30
-heartbeat_timeout_seconds = 45
+heartbeat_timeout_seconds = 60

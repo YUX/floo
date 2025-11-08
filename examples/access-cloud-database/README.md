@@ -29,6 +29,7 @@ psql -h 127.0.0.1 -p 5432 -U dbuser dbname
 - Change `[services]` entries to point at different targets (e.g. Redis on 6379,
   MongoDB on 27017). Run multiple flooc instances if you want separate local
   ports.
-- Set `num_tunnels = 2` or higher when heavy workloads open many concurrent DB
+- Leave `num_tunnels = 0` so Floo auto-matches CPU cores; only set a manual value
+  when you need to cap or boost concurrency for specific workloads.
   connections.
 - Increase `socket_buffer_size` for large result sets over high-latency links.

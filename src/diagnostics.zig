@@ -23,6 +23,27 @@ pub fn flushEncryptStats(prefix: []const u8, total: *std.atomic.Value(u64), call
     appendProfileLine(prefix, total_ns, call_count, avg);
 }
 
+pub fn flushThroughputStats(
+    prefix: []const u8,
+    tx: *std.atomic.Value(u64),
+    rx: *std.atomic.Value(u64),
+) void {
+    const tx_bytes = tx.load(.acquire);
+    const rx_bytes = rx.load(.acquire);
+    if (tx_bytes == 0 and rx_bytes == 0) return;
+
+    const tx_mb = asDecimalMB(tx_bytes);
+    const rx_mb = asDecimalMB(rx_bytes);
+    std.debug.print(
+        "[PROFILE] {s} throughput tx={} bytes ({d:.2} MB) rx={} bytes ({d:.2} MB)\n",
+        .{ prefix, tx_bytes, tx_mb, rx_bytes, rx_mb },
+    );
+}
+
+fn asDecimalMB(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+}
+
 fn appendProfileLine(prefix: []const u8, total: u64, calls: u64, avg: u64) void {
     const path = "/tmp/floo_profile.log";
     _ = std.fs.createFileAbsolute(path, .{ .truncate = false, .read = false }) catch {};

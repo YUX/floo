@@ -70,31 +70,18 @@ pub inline fn tracePrint(comptime enabled: bool, comptime fmt: []const u8, args:
 /// Security: Use this for comparing authentication tokens, passwords,
 /// PSKs, HMAC tags, or any secret values.
 pub fn constantTimeEqual(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) {
-        // Length mismatch - still perform work to maintain constant time
-        // This prevents timing attacks based on early returns
-        var dummy: u8 = 0;
-        const min_len = @min(a.len, b.len);
+    const max_len = @max(a.len, b.len);
+    var diff: u8 = 0;
 
-        // Do comparison work even though we know result is false
-        for (0..min_len) |i| {
-            dummy |= a[i % a.len] ^ b[i % b.len];
-        }
-
-        // Ensure compiler doesn't optimize away the dummy work
-        std.mem.doNotOptimizeAway(dummy);
-
-        return false;
+    // Walk the full max length so timing does not leak the shorter prefix.
+    var i: usize = 0;
+    while (i < max_len) : (i += 1) {
+        const lhs = if (i < a.len) a[i] else 0;
+        const rhs = if (i < b.len) b[i] else 0;
+        diff |= lhs ^ rhs;
     }
 
-    // Constant-time comparison of equal-length slices
-    var result: u8 = 0;
-    for (a, b) |x, y| {
-        result |= x ^ y;
-    }
-
-    // result is 0 if all bytes match, non-zero otherwise
-    return result == 0;
+    return diff == 0 and a.len == b.len;
 }
 
 pub const TcpOptions = struct {
@@ -270,3 +257,64 @@ pub fn recvAllFromFd(fd: posix.fd_t, buffer: []u8) !void {
         offset += n;
     }
 }
+
+// ============================================================================
+// Connection Rate Limiting
+// ============================================================================
+
+/// Simple token bucket rate limiter to prevent connection flood attacks
+pub const RateLimiter = struct {
+    tokens: std.atomic.Value(u32),
+    max_tokens: u32,
+    refill_interval_ns: i128,
+    last_refill: std.atomic.Value(i128),
+
+    /// Create a rate limiter allowing `max_per_second` operations per second
+    pub fn init(max_per_second: u32) RateLimiter {
+        return .{
+            .tokens = std.atomic.Value(u32).init(max_per_second),
+            .max_tokens = max_per_second,
+            .refill_interval_ns = @divTrunc(std.time.ns_per_s, max_per_second),
+            .last_refill = std.atomic.Value(i128).init(std.time.nanoTimestamp()),
+        };
+    }
+
+    /// Try to consume a token. Returns true if allowed, false if rate limited
+    pub fn tryAcquire(self: *RateLimiter) bool {
+        const now = std.time.nanoTimestamp();
+        const last = self.last_refill.load(.monotonic);
+        const elapsed = now - last;
+
+        // Refill tokens based on time elapsed
+        if (elapsed >= self.refill_interval_ns) {
+            const tokens_to_add = @min(
+                @as(u32, @intCast(@divTrunc(elapsed, self.refill_interval_ns))),
+                self.max_tokens,
+            );
+
+            if (tokens_to_add > 0) {
+                const current = self.tokens.load(.monotonic);
+                const new_tokens = @min(current + tokens_to_add, self.max_tokens);
+                self.tokens.store(new_tokens, .monotonic);
+                _ = self.last_refill.cmpxchgWeak(last, now, .monotonic, .monotonic);
+            }
+        }
+
+        // Try to consume a token
+        var current = self.tokens.load(.monotonic);
+        while (current > 0) {
+            if (self.tokens.cmpxchgWeak(
+                current,
+                current - 1,
+                .monotonic,
+                .monotonic,
+            )) |updated| {
+                current = updated;
+            } else {
+                return true; // Successfully consumed a token
+            }
+        }
+
+        return false; // No tokens available
+    }
+};

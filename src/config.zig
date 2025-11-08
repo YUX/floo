@@ -39,6 +39,8 @@ pub const AdvancedSettings = struct {
     // Network tuning
     socket_buffer_size: u32 = 4 * 1024 * 1024, // 4MB default
     udp_timeout_seconds: u64 = 60,
+    io_batch_bytes: usize = 64 * 1024, // size of per-stream IO buffers
+    pin_threads: bool = true, // pin tunnel threads to CPU cores when available
 
     // TCP tuning
     tcp_nodelay: bool = true,
@@ -52,7 +54,7 @@ pub const AdvancedSettings = struct {
     heartbeat_timeout_seconds: u32 = 40,
 
     // Client-specific
-    num_tunnels: usize = 4, // Parallel connections
+    num_tunnels: usize = 0, // 0 = auto (parallel connections)
     reconnect_enabled: bool = true,
     reconnect_initial_delay_ms: u64 = 1000,
     reconnect_max_delay_ms: u64 = 30000,
@@ -163,6 +165,11 @@ pub const ServerConfig = struct {
         // Validate services
         if (self.services.count() == 0 and self.reverse_services.count() == 0) {
             std.debug.print("[CONFIG] Warning: no services or reverse_services configured\n", .{});
+        }
+
+        if (self.advanced.io_batch_bytes < 4096) {
+            std.debug.print("[CONFIG] Error: io_batch_bytes must be at least 4096\n", .{});
+            return error.InvalidBatchSize;
         }
     }
 
@@ -300,6 +307,10 @@ pub const ServerConfig = struct {
                         config.advanced.socket_buffer_size = std.fmt.parseInt(u32, value, 10) catch config.advanced.socket_buffer_size;
                     } else if (std.mem.eql(u8, key, "udp_timeout_seconds")) {
                         config.advanced.udp_timeout_seconds = std.fmt.parseInt(u64, value, 10) catch config.advanced.udp_timeout_seconds;
+                    } else if (std.mem.eql(u8, key, "io_batch_bytes")) {
+                        config.advanced.io_batch_bytes = std.fmt.parseInt(usize, value, 10) catch config.advanced.io_batch_bytes;
+                    } else if (std.mem.eql(u8, key, "pin_threads")) {
+                        config.advanced.pin_threads = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "tcp_nodelay")) {
                         config.advanced.tcp_nodelay = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "tcp_keepalive")) {
@@ -445,11 +456,11 @@ pub const ClientConfig = struct {
 
         // Validate num_tunnels
         if (self.advanced.num_tunnels == 0) {
-            std.debug.print("[CONFIG] Error: num_tunnels must be at least 1\n", .{});
-            return error.InvalidNumTunnels;
-        }
-        if (self.advanced.num_tunnels > 32) {
-            std.debug.print("[CONFIG] Warning: num_tunnels > 32 may cause excessive overhead\n", .{});
+            std.debug.print("[CONFIG] Info: num_tunnels=0 → auto scale based on CPU count\n", .{});
+        } else {
+            if (self.advanced.num_tunnels > 64) {
+                std.debug.print("[CONFIG] Warning: num_tunnels > 64 may cause excessive overhead\n", .{});
+            }
         }
 
         // Validate reconnect settings
@@ -466,6 +477,11 @@ pub const ClientConfig = struct {
                 std.debug.print("[CONFIG] Error: default_service '{s}' not found in services\n", .{ds});
                 return error.InvalidDefaultService;
             }
+        }
+
+        if (self.advanced.io_batch_bytes < 4096) {
+            std.debug.print("[CONFIG] Error: io_batch_bytes must be at least 4096\n", .{});
+            return error.InvalidBatchSize;
         }
     }
 
@@ -612,6 +628,10 @@ pub const ClientConfig = struct {
                         config.advanced.socket_buffer_size = std.fmt.parseInt(u32, value, 10) catch config.advanced.socket_buffer_size;
                     } else if (std.mem.eql(u8, key, "udp_timeout_seconds")) {
                         config.advanced.udp_timeout_seconds = std.fmt.parseInt(u64, value, 10) catch config.advanced.udp_timeout_seconds;
+                    } else if (std.mem.eql(u8, key, "io_batch_bytes")) {
+                        config.advanced.io_batch_bytes = std.fmt.parseInt(usize, value, 10) catch config.advanced.io_batch_bytes;
+                    } else if (std.mem.eql(u8, key, "pin_threads")) {
+                        config.advanced.pin_threads = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "tcp_nodelay")) {
                         config.advanced.tcp_nodelay = std.mem.eql(u8, value, "true");
                     } else if (std.mem.eql(u8, key, "tcp_keepalive")) {
@@ -708,14 +728,16 @@ pub fn canonicalCipher(config: anytype) []const u8 {
     return canonicalizeCipher(config.cipher) orelse config.cipher;
 }
 
-// Generate service ID from name (simple hash)
+// Generate service ID from name using cryptographic hash to prevent collisions
 fn generateServiceId(name: []const u8) tunnel.ServiceId {
-    var hash: u32 = 0;
-    for (name) |c| {
-        hash = hash *% 31 +% c;
-    }
-    // Ensure non-zero and within u16 range
-    return @intCast(@min(@max(hash % 65535, 1), 65535));
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(name);
+    var hash: [32]u8 = undefined;
+    hasher.final(&hash);
+
+    // Use first 2 bytes of hash, ensure non-zero
+    const id = std.mem.readInt(u16, hash[0..2], .little);
+    return if (id == 0) 1 else id;
 }
 
 fn registerServiceId(
@@ -819,13 +841,23 @@ fn applyServiceProperty(
 fn validateSecurity(config: anytype) !void {
     const canonical = canonicalizeCipher(config.cipher) orelse return error.InvalidCipher;
     const encryption_enabled = !std.mem.eql(u8, canonical, "none");
+
+    // Always reject default PSK if present, even if encryption is currently disabled
+    if (config.psk.len > 0 and std.ascii.eqlIgnoreCase(config.psk, DEFAULT_PSK)) {
+        std.debug.print("[SECURITY] Cannot use default PSK '{s}' - change it in config file\n", .{DEFAULT_PSK});
+        return error.DefaultCredentials;
+    }
+
+    // Always reject default token if present, even if not currently needed
+    if (config.token.len > 0 and std.ascii.eqlIgnoreCase(config.token, DEFAULT_TOKEN)) {
+        std.debug.print("[SECURITY] Cannot use default token '{s}' - change it in config file\n", .{DEFAULT_TOKEN});
+        return error.DefaultCredentials;
+    }
+
     if (encryption_enabled and config.psk.len == 0) {
         return error.MissingPsk;
     }
     if (encryption_enabled and config.psk.len < 16) {
-        return error.WeakPSK;
-    }
-    if (encryption_enabled and std.ascii.eqlIgnoreCase(config.psk, DEFAULT_PSK)) {
         return error.WeakPSK;
     }
 
@@ -839,13 +871,8 @@ fn validateSecurity(config: anytype) !void {
         }
     }
 
-    if (needs_token) {
-        if (config.token.len == 0) {
-            return error.MissingToken;
-        }
-        if (std.ascii.eqlIgnoreCase(config.token, DEFAULT_TOKEN)) {
-            return error.WeakToken;
-        }
+    if (needs_token and config.token.len == 0) {
+        return error.MissingToken;
     }
 }
 
@@ -1023,5 +1050,5 @@ test "canonicalize cipher names is case-insensitive" {
 test "validateSecurity rejects default PSK" {
     var cfg = try ServerConfig.init(std.testing.allocator);
     defer cfg.deinit();
-    try std.testing.expectError(error.WeakPSK, validateSecurity(&cfg));
+    try std.testing.expectError(error.DefaultCredentials, validateSecurity(&cfg));
 }

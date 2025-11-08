@@ -8,5 +8,8 @@ token = "balancer-token"
 webcluster = "0.0.0.0:8080"
 
 [advanced]
+pin_threads = true
+io_batch_bytes = 131072
+socket_buffer_size = 8388608
 heartbeat_interval_seconds = 20
 heartbeat_timeout_seconds = 35

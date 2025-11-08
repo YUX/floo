@@ -9,7 +9,9 @@ usage() {
 
 STREAMS=${FLOO_STREAMS:-4}
 DURATION=${FLOO_DURATION:-3}
-NUM_TUNNELS=${FLOO_TUNNELS:-4}
+# Auto-detect parallel tunnels if not provided
+CPU_COUNT=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+NUM_TUNNELS=${FLOO_TUNNELS:-$CPU_COUNT}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
