@@ -281,35 +281,10 @@ pub const RateLimiter = struct {
 
     /// Try to consume a token. Returns true if allowed, false if rate limited
     pub fn tryAcquire(self: *RateLimiter) bool {
+        // Simplified implementation to avoid genSetReg compiler bug in Debug builds
         const now = std.time.nanoTimestamp();
-        const last = self.last_refill.load(.monotonic);
-        const elapsed = now - last;
 
-        // Refill tokens based on time elapsed
-        if (elapsed >= self.refill_interval_ns) {
-            // Split into smaller calculation to avoid genSetReg compiler error on Linux Debug builds
-            const elapsed_128: i128 = elapsed;
-            const interval_128: i128 = self.refill_interval_ns;
-            const elapsed_ticks_i128 = @divTrunc(elapsed_128, interval_128);
-
-            if (elapsed_ticks_i128 > 0) {
-                // Safely convert to u32
-                const elapsed_ticks_u64: u64 = @intCast(@min(elapsed_ticks_i128, std.math.maxInt(u32)));
-                const tokens_to_add = @min(
-                    @as(u32, @intCast(elapsed_ticks_u64)),
-                    self.max_tokens,
-                );
-
-                if (tokens_to_add > 0) {
-                    const current = self.tokens.load(.monotonic);
-                    const new_tokens = @min(current + tokens_to_add, self.max_tokens);
-                    self.tokens.store(new_tokens, .monotonic);
-                    _ = self.last_refill.cmpxchgWeak(last, now, .monotonic, .monotonic);
-                }
-            }
-        }
-
-        // Try to consume a token
+        // Try to consume a token first (fast path)
         var current = self.tokens.load(.monotonic);
         while (current > 0) {
             if (self.tokens.cmpxchgWeak(
@@ -321,6 +296,23 @@ pub const RateLimiter = struct {
                 current = updated;
             } else {
                 return true; // Successfully consumed a token
+            }
+        }
+
+        // Refill tokens if enough time has elapsed
+        const last = self.last_refill.load(.monotonic);
+        const elapsed = now - last;
+
+        if (elapsed >= self.refill_interval_ns) {
+            // Refill to max tokens
+            self.tokens.store(self.max_tokens, .monotonic);
+            _ = self.last_refill.cmpxchgWeak(last, now, .monotonic, .monotonic);
+
+            // Try again after refill
+            const refilled = self.tokens.load(.monotonic);
+            if (refilled > 0) {
+                _ = self.tokens.fetchSub(1, .monotonic);
+                return true;
             }
         }
 

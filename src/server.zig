@@ -114,7 +114,8 @@ fn setThreadAffinityLinux(cpu_index: usize) void {
     const word_idx = limited / @bitSizeOf(c_ulong);
     const bit_idx = limited % @bitSizeOf(c_ulong);
     mask[word_idx] |= @as(c_ulong, 1) << @intCast(bit_idx);
-    _ = linux.sched_setaffinity(0, @sizeOf(linux.cpu_set_t), &mask) catch {};
+    // sched_setaffinity in Zig takes (pid, mask_ptr) - size is implicit
+    _ = linux.sched_setaffinity(0, &mask) catch {};
 }
 
 const CliMode = enum { run, help, version, doctor, ping };
