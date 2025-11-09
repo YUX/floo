@@ -266,16 +266,16 @@ pub fn recvAllFromFd(fd: posix.fd_t, buffer: []u8) !void {
 pub const RateLimiter = struct {
     tokens: std.atomic.Value(u32),
     max_tokens: u32,
-    refill_interval_ns: i128,
-    last_refill: std.atomic.Value(i128),
+    refill_interval_ns: i64,
+    last_refill: std.atomic.Value(i64),
 
     /// Create a rate limiter allowing `max_per_second` operations per second
     pub fn init(max_per_second: u32) RateLimiter {
         return .{
             .tokens = std.atomic.Value(u32).init(max_per_second),
             .max_tokens = max_per_second,
-            .refill_interval_ns = @divTrunc(std.time.ns_per_s, max_per_second),
-            .last_refill = std.atomic.Value(i128).init(std.time.nanoTimestamp()),
+            .refill_interval_ns = @intCast(@divTrunc(std.time.ns_per_s, max_per_second)),
+            .last_refill = std.atomic.Value(i64).init(@intCast(std.time.nanoTimestamp())),
         };
     }
 
@@ -302,7 +302,7 @@ pub const RateLimiter = struct {
         }
 
         // Refill if needed
-        const now = std.time.nanoTimestamp();
+        const now: i64 = @intCast(std.time.nanoTimestamp());
         const last = self.last_refill.load(.monotonic);
         const elapsed = now - last;
 
