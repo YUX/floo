@@ -77,7 +77,7 @@ fn notifySignalPipe(sig: c_int) void {
     const wr = signal_pipe_write_fd.load(.acquire);
     if (wr == -1) return;
     var byte = [_]u8{@intCast(@as(u8, @intCast(sig & 0xFF)))};
-    _ = c.write(wr, &byte, byte.len);
+    _ = posix.write(wr, &byte) catch {};
 }
 
 fn clientCpuCountCached() usize {
@@ -104,7 +104,7 @@ fn clientApplyThreadAffinity(index_opt: ?usize) void {
 fn setThreadAffinityLinux(cpu_index: usize) void {
     if (builtin.target.os.tag != .linux) return;
     const linux = std.os.linux;
-    var mask = linux.cpu_set_t{};
+    var mask: linux.cpu_set_t = undefined;
     linux.CPU_ZERO(&mask);
     const limited = cpu_index % linux.CPU_SETSIZE;
     linux.CPU_SET(@intCast(@as(c_uint, @intCast(limited))), &mask);

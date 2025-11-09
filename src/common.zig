@@ -287,16 +287,19 @@ pub const RateLimiter = struct {
 
         // Refill tokens based on time elapsed
         if (elapsed >= self.refill_interval_ns) {
-            const tokens_to_add = @min(
-                @as(u32, @intCast(@divTrunc(elapsed, self.refill_interval_ns))),
-                self.max_tokens,
-            );
+            const elapsed_ticks = @divTrunc(elapsed, self.refill_interval_ns);
+            if (elapsed_ticks > 0) {
+                const tokens_to_add = @min(
+                    @as(u32, @intCast(elapsed_ticks)),
+                    self.max_tokens,
+                );
 
-            if (tokens_to_add > 0) {
-                const current = self.tokens.load(.monotonic);
-                const new_tokens = @min(current + tokens_to_add, self.max_tokens);
-                self.tokens.store(new_tokens, .monotonic);
-                _ = self.last_refill.cmpxchgWeak(last, now, .monotonic, .monotonic);
+                if (tokens_to_add > 0) {
+                    const current = self.tokens.load(.monotonic);
+                    const new_tokens = @min(current + tokens_to_add, self.max_tokens);
+                    self.tokens.store(new_tokens, .monotonic);
+                    _ = self.last_refill.cmpxchgWeak(last, now, .monotonic, .monotonic);
+                }
             }
         }
 
