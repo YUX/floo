@@ -564,7 +564,7 @@ const LocalConnection = struct {
         
         const header_len: usize = 7;
         const send_capacity = header_len + io_batch + noise.TAG_LEN + 32;
-        const send_buffer = try allocator.alloc(u8, send_capacity);
+        const send_buffer = try allocator.alignedAlloc(u8, .@"64", send_capacity);
         errdefer allocator.free(send_buffer);
 
         const conn = try allocator.create(LocalConnection);
@@ -1203,6 +1203,7 @@ const TunnelClient = struct {
     }
 
     fn forwardLocalData(self: *TunnelClient, conn: *LocalConnection) anyerror!void {
+        @setRuntimeSafety(false);
         const message_header_len: usize = 7;
         const io_batch = self.cfg.advanced.io_batch_bytes;
         

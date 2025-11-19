@@ -557,7 +557,7 @@ const Stream = struct {
         
         const header_len: usize = 7;
         const frame_capacity = header_len + io_batch + noise.TAG_LEN + 32;
-        const frame_buffer = try allocator.alloc(u8, frame_capacity);
+        const frame_buffer = try allocator.alignedAlloc(u8, .@"64", frame_capacity);
         errdefer allocator.free(frame_buffer);
 
         const stream = try allocator.create(Stream);
@@ -1038,6 +1038,7 @@ const TunnelConnection = struct {
     }
 
     fn forwardTargetData(self: *TunnelConnection, stream: *Stream) anyerror!void {
+        @setRuntimeSafety(false);
         const message_header_len: usize = 7;
         const io_batch = self.cfg.advanced.io_batch_bytes;
         
