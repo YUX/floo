@@ -91,12 +91,7 @@ pub const Address = extern union {
         // hints must be zeroed?
         @memset(@as([*]u8, @ptrCast(&hints))[0..@sizeOf(c.addrinfo)], 0);
 
-        // Handle platform differences for flags (packed struct on macOS, int on Linux)
-        if (builtin.os.tag.isDarwin()) {
-            hints.flags = @bitCast(@as(u32, 0));
-        } else {
-            hints.flags = 0;
-        }
+        hints.flags = std.mem.zeroes(@TypeOf(hints.flags));
         hints.family = posix.AF.UNSPEC;
         hints.socktype = posix.SOCK.STREAM;
         hints.protocol = posix.IPPROTO.TCP;
