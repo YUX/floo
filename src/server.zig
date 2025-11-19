@@ -549,6 +549,8 @@ const Stream = struct {
     target_fd: posix.fd_t,
     tunnel: *TunnelConnection,
     fd_closed: std.atomic.Value(bool), // Track if target_fd is closed
+    local_closed: bool, // We sent CloseMsg (EOF from target_fd)
+    remote_closed: bool, // We received CloseMsg (shutdown target_fd write)
     ref_count: std.atomic.Value(usize),
     read_buffer: []u8,
     frame_buffer: []u8,
@@ -570,6 +572,8 @@ const Stream = struct {
             .target_fd = target_fd,
             .tunnel = tunnel_conn,
             .fd_closed = std.atomic.Value(bool).init(false),
+            .local_closed = false,
+            .remote_closed = false,
             .ref_count = std.atomic.Value(usize).init(1),
             .read_buffer = read_buffer,
             .frame_buffer = frame_buffer,
@@ -781,20 +785,18 @@ const TunnelConnection = struct {
             var iter = self.streams.iterator();
             while (iter.next()) |entry| {
                 const stream_ptr = entry.value_ptr.*;
-                stream_ptr.acquireRef();
-                poll_entries.append(global_allocator, .{ .stream = stream_ptr }) catch {
-                    stream_ptr.releaseRef();
-                    continue;
-                };
-                poll_fds.append(global_allocator, .{
-                    .fd = stream_ptr.target_fd,
-                    .events = posix.POLL.IN,
-                    .revents = 0,
-                }) catch {
-                    _ = poll_entries.pop();
-                    stream_ptr.releaseRef();
-                    continue;
-                };
+                if (!stream_ptr.local_closed) {
+                    stream_ptr.acquireRef();
+                    poll_entries.append(global_allocator, .{ .stream = stream_ptr }) catch {
+                        stream_ptr.releaseRef();
+                        continue;
+                    };
+                    poll_fds.append(global_allocator, .{
+                        .fd = stream_ptr.target_fd,
+                        .events = posix.POLL.IN,
+                        .revents = 0,
+                    }) catch unreachable;
+                }
             }
             self.streams_mutex.unlock();
 
@@ -951,6 +953,7 @@ const TunnelConnection = struct {
                     if (!s.fd_closed.load(.acquire)) {
                         sendAllToFd(s.target_fd, data_msg.data) catch |err| {
                             std.debug.print("[STREAM {}] Send to target failed: {}\n", .{ data_msg.stream_id, err });
+                            self.completeStream(s, true);
                         };
                     }
                 }
@@ -961,17 +964,28 @@ const TunnelConnection = struct {
 
                 const key = StreamKey{ .service_id = close_msg.service_id, .stream_id = close_msg.stream_id };
                 self.streams_mutex.lock();
-                const maybe_stream = self.streams.fetchRemove(key);
-                self.streams_mutex.unlock();
+                const ptr = self.streams.getPtr(key);
 
-                if (maybe_stream) |entry| {
-                    // Stream still exists, stop and destroy it
-                    // Note: The stream may have already removed itself, in which case this won't execute
-                    entry.value.stop();
-                    entry.value.releaseRef(); // drop map reference
-                    std.debug.print("[TUNNEL] Stream {} cleaned up after CLOSE message\n", .{close_msg.stream_id});
+                if (ptr) |stream_ptr| {
+                    const s = stream_ptr.*;
+                    s.remote_closed = true;
+                    // Shutdown write side to signal EOF to application
+                    _ = posix.shutdown(s.target_fd, .send) catch {};
+
+                    if (s.local_closed) {
+                        // Both sides closed, remove and destroy
+                        _ = self.streams.remove(key);
+                        self.streams_mutex.unlock();
+                        s.releaseRef(); // Map ref
+                        s.stop();
+                        std.debug.print("[TUNNEL] Stream {} cleaned up after CLOSE message (full close)\n", .{close_msg.stream_id});
+                    } else {
+                        // Half-close: keep stream in map to handle local EOF later
+                        self.streams_mutex.unlock();
+                        tracePrint(enable_tunnel_trace, "[TUNNEL] Stream {} remote closed (half-close)\n", .{close_msg.stream_id});
+                    }
                 } else {
-                    // Stream already cleaned itself up
+                    self.streams_mutex.unlock();
                     tracePrint(enable_tunnel_trace, "[TUNNEL] Stream {} already removed (self-cleanup)\n", .{close_msg.stream_id});
                 }
             },
@@ -1058,8 +1072,12 @@ const TunnelConnection = struct {
         tracePrint(enable_stream_trace, "[STREAM {}] recv() returned {} bytes\n", .{ stream.stream_id, n });
 
         if (n == 0) {
+            stream.local_closed = true;
             self.sendStreamClose(stream);
-            return error.ConnectionClosed;
+            if (stream.remote_closed) {
+                return error.ConnectionClosed;
+            }
+            return;
         }
 
         if (!encrypted) {
