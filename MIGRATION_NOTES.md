@@ -104,17 +104,69 @@ synchronous flows, treat `error.Cancel` like a graceful shutdown signal.
 
 ## Migration order (bottom-up; each stage breaks compile until the next lands)
 
-1. ✅ **Mechanical** (commit `1cc860a`): allocator, args, ArrayListUnmanaged, posix.exit.
-2. ⏳ **`main()` signature** — server.zig, client.zig take `std.process.Init`.
-3. ⏳ **`common.zig`** — `sendAllToFd`/`recvAllFromFd`/`writeFrameLocked` accept `io: Io` + `Stream`.
-4. ⏳ **`noise.zig`** — `noiseXXHandshake` takes `Stream` + `io` (or pre-built reader/writer).
-5. ⏳ **`transport/channel.zig`** — `Channel` holds `Stream` not `fd_t`; takes `io` via init.
-6. ⏳ **`net_compat.zig`** — delete; callers use `std.Io.net.IpAddress`.
-7. **`proxy.zig`** — `connectViaSocks5` / `connectViaHttpConnect` return `Stream`.
-8. **`udp_session.zig`, `udp_client.zig`, `udp_server.zig`** — use `Socket`, `IncomingMessage`.
-9. **`server.zig`** — `ReverseListener.create` uses `addr.listen()`; main accept loop uses `Server.accept`.
-10. **`client.zig`** — `tcpServiceListener` uses `addr.listen()`; tunnel reconnection uses `addr.connect()`.
-11. **`config.zig`, `diagnostics.zig`** — `Io.Dir.cwd()` / `Io.Dir.createFile`.
+1. ✅ **Mechanical** (`1cc860a`): allocator, args, ArrayListUnmanaged, posix.exit.
+2. ✅ **`main()` signature** (`f959381`): server.zig, client.zig take `std.process.Init`.
+3. ✅ **`common.zig`** (`f959381`): I/O helpers take `*Io.Reader` / `*Io.Writer`.
+4. ✅ **`noise.zig`** (`f959381`): `noiseXXHandshake(reader, writer, ...)`.
+5. ✅ **`transport/channel.zig`** (`a84cf95`): holds `Stream` + reader/writer.
+6. ✅ **`proxy.zig`** (`95e2807`): SOCKS5/HTTP CONNECT return `Stream`.
+7. ✅ **`udp_session.zig`** (`5275734`): uses `IpAddress`.
+8. ✅ **`udp_client.zig`** (`206d9f0`): uses `Socket`, `IncomingMessage`.
+9. ✅ **`udp_server.zig`** (`f0fe2f8`): ephemeral `Socket` per session, no connected-UDP.
+10. ✅ **`config.zig` + `diagnostics.zig`** (`6cb5ae6`): `Io.Dir.cwd().readFileAlloc`; dropped /tmp log.
+11. ⏳ **`server.zig`** — see plan below.
+12. ⏳ **`client.zig`** — see plan below.
+13. ⏳ **`net_compat.zig`** — delete after server/client are off it.
+
+## server.zig migration plan (~54 posix call sites)
+
+Strategy: **keep `posix.poll` for the data-plane multiplexing** (it's still in 0.16
+and rewriting the poll loop into `io.async`/`Group` semantics is out of scope for
+this WP). Use `Stream` everywhere a TCP connection is held; pull the raw
+`socket.handle` for `posix.poll` and `posix.read`. Use `Server.accept(io)` for the
+listener side. Use raw `posix.system.write` for outbound on the data path so we
+don't have to plumb a per-stream `Io.Writer` (which would just buffer once before
+the syscall — no perf win).
+
+Concrete changes by region:
+
+- **Imports & globals**: drop `net = @import("net_compat.zig")`, add `Io = std.Io`.
+  `global_io` already exists.
+- **`Stream` struct (~line 540)**: `target_fd: posix.fd_t` → `target_stream: Io.net.Stream`.
+  `stop()` and `destroyInternal()` use `target_stream.close(global_io)`. `fd_closed`
+  atomic still works (idempotent close guard).
+- **`TunnelConnection` struct (~line 600)**: `tunnel_fd` → `tunnel_stream: Io.net.Stream`
+  + `tunnel_reader_buf`, `tunnel_writer_buf` ([4096]u8 each) + cached `tunnel_reader: Io.net.Stream.Reader`
+  and `tunnel_writer: Io.net.Stream.Writer`. Channel gets `&tunnel_reader.interface` and
+  `&tunnel_writer.interface`.
+- **`TunnelConnection.run()` poll loop (~line 740-870)**: poll_fds populated from
+  `stream.socket.handle`. After poll returns, read via `posix.read(handle, buf)`
+  on the raw fd (we want unbuffered framing reads, not the buffered `Io.Reader`).
+- **`forwardTargetData` (~line 1040)**: same — `posix.read` on raw handle.
+- **`handleConnect` TCP path (~line 1118)**: `posix.socket+posix.connect` →
+  `addr.connect(io, .{})` returning Stream. Apply TCP options to `stream.socket.handle`
+  via existing `common.applyTcpOptions`.
+- **`ReverseListener.create` (~line 418)**: `posix.socket+bind+listen` →
+  `addr.listen(io, .{ .reuse_address = true })` returning `Server`.
+- **`ReverseListener.acceptorThread` (~line 457)**: `c.accept` → `server.accept(io)`
+  returning Stream. Drop the manual fcntl(CLOEXEC) — `Server.accept` sets it.
+- **`main()` accept loop (~line 1474-1620)**: same pattern as ReverseListener.
+- **Signal pipe (~line 47)**: `posix.pipe2` IS still available (verified).
+- **CPU pinning (~line 108)**: unchanged — `linux.sched_setaffinity` survives.
+
+Estimated edit: ~150-200 line diff. One commit, one iteration.
+
+## client.zig migration plan (~similar surface as server but bigger)
+
+Same patterns as server.zig. Notable additions:
+- `tcpServiceListener` (~line 1383): same listener pattern.
+- `tunnelThreadWithReconnection` (~line 1475): `proxy.connectWithProxy` returns
+  `Stream` already; just thread `io` to it.
+- `LocalConnection` (~line 553): `local_fd: posix.fd_t` → `local_stream: Io.net.Stream`.
+- `handleReverseConnect` (~line 981): `posix.socket+posix.connect` →
+  `addr.connect(io, .{})`.
+
+## Decisions to revisit
 
 ## Decisions to revisit
 
