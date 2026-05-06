@@ -708,7 +708,8 @@ const TunnelConnection = struct {
     }
 
     fn run(self: *TunnelConnection) void {
-        var buf: [256 * 1024]u8 align(64) = undefined; // 256KB for better batching
+        // Recv hot path reads directly into the decoder buffer via
+        // pendingTail/commitWrite — no intermediate stack buffer + memcpy.
         var decoder = protocol.FrameDecoder.init(global_allocator);
         defer decoder.deinit();
 
@@ -784,7 +785,15 @@ const TunnelConnection = struct {
                     .tunnel => {
                         if ((fd_info.revents & posix.POLL.IN) == 0) continue;
 
-                        const n = posix.read(self.tunnel_stream.socket.handle, &buf) catch |err| {
+                        // Zero-copy recv: read straight into the decoder's
+                        // internal buffer.
+                        const dst = decoder.pendingTail();
+                        if (dst.len == 0) {
+                            std.debug.print("[TUNNEL] Decoder buffer full; framing stalled\n", .{});
+                            fatal_error = true;
+                            break :loop;
+                        }
+                        const n = posix.read(self.tunnel_stream.socket.handle, dst) catch |err| {
                             std.debug.print("[TUNNEL] Recv error: {}\n", .{err});
                             fatal_error = true;
                             break :loop;
@@ -797,12 +806,7 @@ const TunnelConnection = struct {
                         }
 
                         tracePrint(enable_tunnel_trace, "[TUNNEL] Received {} bytes from client\n", .{n});
-
-                        decoder.feed(buf[0..n]) catch |err| {
-                            std.debug.print("[TUNNEL] Decoder feed error: {}\n", .{err});
-                            fatal_error = true;
-                            break :loop;
-                        };
+                        decoder.commitWrite(n);
 
                         while (decoder.decode() catch null) |frame_payload| {
                             self.handleMessage(frame_payload) catch |err| {

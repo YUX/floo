@@ -704,7 +704,8 @@ const TunnelClient = struct {
     }
 
     fn run(self: *TunnelClient) void {
-        var buf: [256 * 1024]u8 align(64) = undefined; // 256KB
+        // Recv hot path reads directly into the decoder buffer via
+        // pendingTail/commitWrite — no intermediate stack buffer + memcpy.
         var decoder = protocol.FrameDecoder.init(global_allocator);
         defer decoder.deinit();
 
@@ -801,7 +802,16 @@ const TunnelClient = struct {
                     .tunnel => {
                         if ((fd_info.revents & posix.POLL.IN) == 0) continue;
 
-                        const n = posix.read(self.tunnel_stream.socket.handle, &buf) catch |err| {
+                        // Zero-copy recv: read straight into the decoder's
+                        // internal buffer.
+                        const dst = decoder.pendingTail();
+                        if (dst.len == 0) {
+                            std.debug.print("[CLIENT] Decoder buffer full; framing stalled\n", .{});
+                            self.running.store(false, .release);
+                            fatal_error = true;
+                            break :loop;
+                        }
+                        const n = posix.read(self.tunnel_stream.socket.handle, dst) catch |err| {
                             std.debug.print("[CLIENT] Recv error: {}\n", .{err});
                             self.running.store(false, .release);
                             fatal_error = true;
@@ -815,13 +825,7 @@ const TunnelClient = struct {
                             break :loop;
                         }
 
-                        // Feed decoder
-                        decoder.feed(buf[0..n]) catch {
-                            std.debug.print("[CLIENT] Decoder feed error\n", .{});
-                            self.running.store(false, .release);
-                            fatal_error = true;
-                            break :loop;
-                        };
+                        decoder.commitWrite(n);
 
                         // Process all complete frames
                         var decoder_had_error = false;

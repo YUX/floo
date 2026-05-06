@@ -83,23 +83,42 @@ pub const FrameDecoder = struct {
         }
     }
 
-    /// Feed data into the decoder.
+    /// Feed data into the decoder by copying it into the internal buffer.
+    ///
+    /// On the recv hot path prefer `pendingTail` + `commitWrite` instead — they
+    /// let the caller `read(2)` directly into the decoder's buffer, eliminating
+    /// this memcpy. `feed` remains for callers that already have an owned
+    /// buffer (tests, the version-exchange path).
     pub fn feed(self: *FrameDecoder, data: []const u8) !void {
-        // Compact if we don't have enough space
-        const available_space = self.buffer.len - self.write_pos;
-        if (data.len > available_space) {
+        const dst = self.pendingTail();
+        if (data.len > dst.len) return error.BufferFull;
+        @memcpy(dst[0..data.len], data);
+        self.commitWrite(data.len);
+    }
+
+    /// Return a writable slice into the decoder's internal buffer where new
+    /// bytes should be deposited (e.g. by `posix.read(fd, slice)`). Compacts
+    /// the buffer if `read_pos > 0` so the maximum contiguous tail is
+    /// available. Caller must follow with `commitWrite(n_bytes_written)`.
+    ///
+    /// Returns an empty slice if the buffer is full of undecoded frames; the
+    /// caller should drain `decode()` first in that case.
+    pub fn pendingTail(self: *FrameDecoder) []u8 {
+        if (self.write_pos == self.read_pos) {
+            // Active region is empty — fast reset to base.
+            self.read_pos = 0;
+            self.write_pos = 0;
+        } else if (self.read_pos > 0) {
             self.compact();
         }
+        return self.buffer[self.write_pos..];
+    }
 
-        // If still not enough space after compaction, error
-        const space_after_compact = self.buffer.len - self.write_pos;
-        if (data.len > space_after_compact) {
-            return error.BufferFull;
-        }
-
-        // Append data at write position
-        @memcpy(self.buffer[self.write_pos..][0..data.len], data);
-        self.write_pos += data.len;
+    /// Advance `write_pos` by `n` bytes after caller-side write into the
+    /// slice returned by `pendingTail`.
+    pub fn commitWrite(self: *FrameDecoder, n: usize) void {
+        std.debug.assert(self.write_pos + n <= self.buffer.len);
+        self.write_pos += n;
     }
 
     /// Try to decode the next frame.
@@ -320,4 +339,60 @@ test "encodeAlloc" {
     try std.testing.expectEqual(@as(usize, 4 + payload.len), encoded.len);
     try std.testing.expectEqual(@as(u32, payload.len), std.mem.readInt(u32, encoded[0..4], .big));
     try std.testing.expectEqualSlices(u8, payload, encoded[4..]);
+}
+
+test "pendingTail/commitWrite path produces same frames as feed" {
+    const allocator = std.testing.allocator;
+    var decoder = FrameDecoder.init(allocator);
+    defer decoder.deinit();
+
+    const payload1 = "first payload";
+    const payload2 = "second longer payload";
+    var encoded: [128]u8 = undefined;
+    const len1 = try (Frame{ .payload = payload1 }).encode(encoded[0..]);
+    const len2 = try (Frame{ .payload = payload2 }).encode(encoded[len1..]);
+    const total = len1 + len2;
+
+    // Drop bytes into the decoder via the zero-copy API in two halves to
+    // exercise compaction/partial-frame state.
+    {
+        const dst1 = decoder.pendingTail();
+        try std.testing.expect(dst1.len >= 5);
+        @memcpy(dst1[0..5], encoded[0..5]);
+        decoder.commitWrite(5);
+    }
+    {
+        const dst2 = decoder.pendingTail();
+        try std.testing.expect(dst2.len >= total - 5);
+        @memcpy(dst2[0 .. total - 5], encoded[5..total]);
+        decoder.commitWrite(total - 5);
+    }
+
+    const decoded1 = try decoder.decode();
+    try std.testing.expect(decoded1 != null);
+    try std.testing.expectEqualSlices(u8, payload1, decoded1.?);
+
+    const decoded2 = try decoder.decode();
+    try std.testing.expect(decoded2 != null);
+    try std.testing.expectEqualSlices(u8, payload2, decoded2.?);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), try decoder.decode());
+}
+
+test "pendingTail compacts when read_pos > 0" {
+    const allocator = std.testing.allocator;
+    var decoder = FrameDecoder.init(allocator);
+    defer decoder.deinit();
+
+    const payload = "abc";
+    var encoded: [16]u8 = undefined;
+    const len = try (Frame{ .payload = payload }).encode(&encoded);
+
+    try decoder.feed(encoded[0..len]);
+    _ = try decoder.decode(); // advances read_pos
+
+    // After decode, read_pos > 0; pendingTail should compact and return
+    // the full buffer width minus 0 (since active region is empty post-drain).
+    const dst = decoder.pendingTail();
+    try std.testing.expectEqual(decoder.buffer.len, dst.len);
 }
