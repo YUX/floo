@@ -104,18 +104,21 @@ pub const UdpSessionManager = struct {
         self.scratch_keys.deinit(self.allocator);
     }
 
-    /// Get or create session for a source address
+    /// Get or create session for a source address.
+    ///
+    /// Hot path on every inbound UDP datagram. The previous implementation did
+    /// `get(value-copy) → touch copy → put(re-hash)`, paying a full hash +
+    /// chain-walk + entry-replace on every packet. Now we mutate via `getPtr`
+    /// so the existing-session fast path is a single hash lookup.
     pub fn getOrCreate(self: *UdpSessionManager, source_addr: Io.net.IpAddress) !UdpSession {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         const key = SessionKey.initFromAddress(source_addr);
 
-        if (self.sessions.get(key)) |*session| {
-            var updated = session.*;
-            updated.touch();
-            try self.sessions.put(key, updated);
-            return updated;
+        if (self.sessions.getPtr(key)) |session_ptr| {
+            session_ptr.touch();
+            return session_ptr.*;
         }
 
         const stream_id = self.next_stream_id.fetchAdd(1, .monotonic);

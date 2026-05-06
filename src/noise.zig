@@ -787,10 +787,15 @@ pub fn noiseXXHandshake(
 
     // Generate ephemeral keypair (static keypair is provided)
     const e_keypair = X25519.KeyPair.generate(io);
+    // Zeroize ephemeral private key on every exit path. Stack frames
+    // otherwise persist after return until overwritten by later calls,
+    // leaving session-key material in memory across the channel's lifetime.
+    defer crypto.secureZero(u8, @constCast(&e_keypair.secret_key));
     const s_keypair = static_keypair;
 
     // Initialize Noise state
     var chaining_key: [HASH_LEN]u8 = undefined;
+    defer crypto.secureZero(u8, &chaining_key);
     var h: [HASH_LEN]u8 = undefined;
 
     // h = HASH(protocol_name) - build based on actual cipher
@@ -838,9 +843,11 @@ pub fn noiseXXHandshake(
 
         // ee - MixKey(dh_ee): Updates ck and derives temp_k from DH output
         const dh_ee = X25519.scalarmult(e_keypair.secret_key, re.*) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_ee));
 
         // Decrypt rs
         var temp_k: [KEY_LEN]u8 = undefined;
+        defer crypto.secureZero(u8, &temp_k);
         var rs: [DH_LEN]u8 = undefined;
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_ee);
 
@@ -864,6 +871,7 @@ pub fn noiseXXHandshake(
 
         // es - MixKey(dh_es): Updates ck and derives temp_k from DH output
         const dh_es = X25519.scalarmult(e_keypair.secret_key, rs) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_es));
 
         // Verify empty payload tag from msg2
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_es);
@@ -904,6 +912,7 @@ pub fn noiseXXHandshake(
 
         // se - MixKey(dh_se): Updates ck and derives temp_k from DH output
         const dh_se = X25519.scalarmult(s_keypair.secret_key, re.*) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_se));
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_se);
 
         // Encrypt empty payload (using temp_k from se operation)
@@ -933,6 +942,10 @@ pub fn noiseXXHandshake(
             .send_cipher = TransportCipher.init(key1, cipher_type),
             .recv_cipher = TransportCipher.init(key2, cipher_type),
         };
+        // TransportCipher.init copied the keys into its own state — wipe
+        // local copies before continuing into the PSK auth exchange.
+        crypto.secureZero(u8, &key1);
+        crypto.secureZero(u8, &key2);
 
         const handshake_hash: []const u8 = h[0..];
         const local_tag = computeAuthTag(psk, handshake_hash, 'I');
@@ -974,7 +987,9 @@ pub fn noiseXXHandshake(
 
         // ee - MixKey(dh_ee): Updates ck and derives temp_k from DH output
         const dh_ee = X25519.scalarmult(e_keypair.secret_key, re) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_ee));
         var temp_k: [KEY_LEN]u8 = undefined;
+        defer crypto.secureZero(u8, &temp_k);
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_ee);
 
         // Encrypt s (using temp_k from ee operation)
@@ -998,6 +1013,7 @@ pub fn noiseXXHandshake(
 
         // es - MixKey(dh_es): Updates ck and derives temp_k from DH output
         const dh_es = X25519.scalarmult(s_keypair.secret_key, re) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_es));
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_es);
 
         // Encrypt empty payload (using temp_k from es operation)
@@ -1053,6 +1069,7 @@ pub fn noiseXXHandshake(
 
         // se - MixKey(dh_se): Updates ck and derives temp_k from DH output
         const dh_se = X25519.scalarmult(e_keypair.secret_key, rs) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_se));
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_se);
 
         // Decrypt empty payload (verify tag using temp_k from se operation)
@@ -1077,6 +1094,10 @@ pub fn noiseXXHandshake(
             .send_cipher = TransportCipher.init(key2, cipher_type),
             .recv_cipher = TransportCipher.init(key1, cipher_type),
         };
+        // TransportCipher.init copied the keys into its own state — wipe
+        // local copies before continuing into the PSK auth exchange.
+        crypto.secureZero(u8, &key1);
+        crypto.secureZero(u8, &key2);
 
         const handshake_hash: []const u8 = h[0..];
         var peer_tag_buf: [HASH_LEN]u8 = undefined;
