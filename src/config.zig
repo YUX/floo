@@ -234,20 +234,14 @@ pub const ServerConfig = struct {
 
             const eq_pos = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
             const key = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
-            var value_raw = trimmed[eq_pos + 1 ..];
-
-            // Handle inline comments
-            if (std.mem.indexOfScalar(u8, value_raw, '#')) |comment_pos| {
-                value_raw = value_raw[0..comment_pos];
-            }
-
-            const value = std.mem.trim(u8, value_raw, " \t\"");
+            const value_raw = trimmed[eq_pos + 1 ..];
+            const value = extractTomlValue(value_raw);
 
             switch (section) {
                 .none, .tunnel => {
                     // Treat root-level keys as tunnel settings for minimal configs
                     if (std.mem.eql(u8, key, "port")) {
-                        config.port = std.fmt.parseInt(u16, value, 10) catch config.port;
+                        config.port = try parseAdvancedInt(u16, key, value);
                     } else if (std.mem.eql(u8, key, "bind")) {
                         allocator.free(config.bind);
                         config.bind = try dupString(allocator, value);
@@ -305,27 +299,27 @@ pub const ServerConfig = struct {
 
                 .advanced => {
                     if (std.mem.eql(u8, key, "socket_buffer_size")) {
-                        config.advanced.socket_buffer_size = std.fmt.parseInt(u32, value, 10) catch config.advanced.socket_buffer_size;
+                        config.advanced.socket_buffer_size = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "udp_timeout_seconds")) {
-                        config.advanced.udp_timeout_seconds = std.fmt.parseInt(u64, value, 10) catch config.advanced.udp_timeout_seconds;
+                        config.advanced.udp_timeout_seconds = try parseAdvancedInt(u64, key, value);
                     } else if (std.mem.eql(u8, key, "io_batch_bytes")) {
-                        config.advanced.io_batch_bytes = std.fmt.parseInt(usize, value, 10) catch config.advanced.io_batch_bytes;
+                        config.advanced.io_batch_bytes = try parseAdvancedInt(usize, key, value);
                     } else if (std.mem.eql(u8, key, "pin_threads")) {
-                        config.advanced.pin_threads = std.mem.eql(u8, value, "true");
+                        config.advanced.pin_threads = try parseAdvancedBool(key, value);
                     } else if (std.mem.eql(u8, key, "tcp_nodelay")) {
-                        config.advanced.tcp_nodelay = std.mem.eql(u8, value, "true");
+                        config.advanced.tcp_nodelay = try parseAdvancedBool(key, value);
                     } else if (std.mem.eql(u8, key, "tcp_keepalive")) {
-                        config.advanced.tcp_keepalive = std.mem.eql(u8, value, "true");
+                        config.advanced.tcp_keepalive = try parseAdvancedBool(key, value);
                     } else if (std.mem.eql(u8, key, "tcp_keepalive_idle")) {
-                        config.advanced.tcp_keepalive_idle = std.fmt.parseInt(u32, value, 10) catch config.advanced.tcp_keepalive_idle;
+                        config.advanced.tcp_keepalive_idle = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "tcp_keepalive_interval")) {
-                        config.advanced.tcp_keepalive_interval = std.fmt.parseInt(u32, value, 10) catch config.advanced.tcp_keepalive_interval;
+                        config.advanced.tcp_keepalive_interval = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "tcp_keepalive_count")) {
-                        config.advanced.tcp_keepalive_count = std.fmt.parseInt(u32, value, 10) catch config.advanced.tcp_keepalive_count;
+                        config.advanced.tcp_keepalive_count = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "heartbeat_interval_seconds")) {
-                        config.advanced.heartbeat_interval_seconds = std.fmt.parseInt(u32, value, 10) catch config.advanced.heartbeat_interval_seconds;
+                        config.advanced.heartbeat_interval_seconds = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "heartbeat_timeout_seconds")) {
-                        config.advanced.heartbeat_timeout_seconds = std.fmt.parseInt(u32, value, 10) catch config.advanced.heartbeat_timeout_seconds;
+                        config.advanced.heartbeat_timeout_seconds = try parseAdvancedInt(u32, key, value);
                     }
                 },
             }
@@ -546,14 +540,8 @@ pub const ClientConfig = struct {
 
             const eq_pos = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
             const key = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
-            var value_raw = trimmed[eq_pos + 1 ..];
-
-            // Handle inline comments
-            if (std.mem.indexOfScalar(u8, value_raw, '#')) |comment_pos| {
-                value_raw = value_raw[0..comment_pos];
-            }
-
-            const value = std.mem.trim(u8, value_raw, " \t\"");
+            const value_raw = trimmed[eq_pos + 1 ..];
+            const value = extractTomlValue(value_raw);
 
             switch (section) {
                 .none, .tunnel => {
@@ -626,41 +614,39 @@ pub const ClientConfig = struct {
 
                 .advanced => {
                     if (std.mem.eql(u8, key, "socket_buffer_size")) {
-                        config.advanced.socket_buffer_size = std.fmt.parseInt(u32, value, 10) catch config.advanced.socket_buffer_size;
+                        config.advanced.socket_buffer_size = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "udp_timeout_seconds")) {
-                        config.advanced.udp_timeout_seconds = std.fmt.parseInt(u64, value, 10) catch config.advanced.udp_timeout_seconds;
+                        config.advanced.udp_timeout_seconds = try parseAdvancedInt(u64, key, value);
                     } else if (std.mem.eql(u8, key, "io_batch_bytes")) {
-                        config.advanced.io_batch_bytes = std.fmt.parseInt(usize, value, 10) catch config.advanced.io_batch_bytes;
+                        config.advanced.io_batch_bytes = try parseAdvancedInt(usize, key, value);
                     } else if (std.mem.eql(u8, key, "pin_threads")) {
-                        config.advanced.pin_threads = std.mem.eql(u8, value, "true");
+                        config.advanced.pin_threads = try parseAdvancedBool(key, value);
                     } else if (std.mem.eql(u8, key, "tcp_nodelay")) {
-                        config.advanced.tcp_nodelay = std.mem.eql(u8, value, "true");
+                        config.advanced.tcp_nodelay = try parseAdvancedBool(key, value);
                     } else if (std.mem.eql(u8, key, "tcp_keepalive")) {
-                        config.advanced.tcp_keepalive = std.mem.eql(u8, value, "true");
+                        config.advanced.tcp_keepalive = try parseAdvancedBool(key, value);
                     } else if (std.mem.eql(u8, key, "tcp_keepalive_idle")) {
-                        config.advanced.tcp_keepalive_idle = std.fmt.parseInt(u32, value, 10) catch config.advanced.tcp_keepalive_idle;
+                        config.advanced.tcp_keepalive_idle = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "tcp_keepalive_interval")) {
-                        config.advanced.tcp_keepalive_interval = std.fmt.parseInt(u32, value, 10) catch config.advanced.tcp_keepalive_interval;
+                        config.advanced.tcp_keepalive_interval = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "tcp_keepalive_count")) {
-                        config.advanced.tcp_keepalive_count = std.fmt.parseInt(u32, value, 10) catch config.advanced.tcp_keepalive_count;
+                        config.advanced.tcp_keepalive_count = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "heartbeat_interval_seconds")) {
                         // Server heartbeat sender uses this; client carries it for
-                        // symmetry / round-trip when configs are diff'd. Parser
-                        // previously only honored heartbeat_timeout_seconds on the
-                        // client side — fixed for B-11.
-                        config.advanced.heartbeat_interval_seconds = std.fmt.parseInt(u32, value, 10) catch config.advanced.heartbeat_interval_seconds;
+                        // symmetry / round-trip when configs are diff'd (B-11).
+                        config.advanced.heartbeat_interval_seconds = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "heartbeat_timeout_seconds")) {
-                        config.advanced.heartbeat_timeout_seconds = std.fmt.parseInt(u32, value, 10) catch config.advanced.heartbeat_timeout_seconds;
+                        config.advanced.heartbeat_timeout_seconds = try parseAdvancedInt(u32, key, value);
                     } else if (std.mem.eql(u8, key, "num_tunnels")) {
-                        config.advanced.num_tunnels = std.fmt.parseInt(usize, value, 10) catch config.advanced.num_tunnels;
+                        config.advanced.num_tunnels = try parseAdvancedInt(usize, key, value);
                     } else if (std.mem.eql(u8, key, "reconnect_enabled")) {
-                        config.advanced.reconnect_enabled = std.mem.eql(u8, value, "true");
+                        config.advanced.reconnect_enabled = try parseAdvancedBool(key, value);
                     } else if (std.mem.eql(u8, key, "reconnect_initial_delay_ms")) {
-                        config.advanced.reconnect_initial_delay_ms = std.fmt.parseInt(u64, value, 10) catch config.advanced.reconnect_initial_delay_ms;
+                        config.advanced.reconnect_initial_delay_ms = try parseAdvancedInt(u64, key, value);
                     } else if (std.mem.eql(u8, key, "reconnect_max_delay_ms")) {
-                        config.advanced.reconnect_max_delay_ms = std.fmt.parseInt(u64, value, 10) catch config.advanced.reconnect_max_delay_ms;
+                        config.advanced.reconnect_max_delay_ms = try parseAdvancedInt(u64, key, value);
                     } else if (std.mem.eql(u8, key, "reconnect_backoff_multiplier")) {
-                        config.advanced.reconnect_backoff_multiplier = std.fmt.parseInt(u64, value, 10) catch config.advanced.reconnect_backoff_multiplier;
+                        config.advanced.reconnect_backoff_multiplier = try parseAdvancedInt(u64, key, value);
                     } else if (std.mem.eql(u8, key, "proxy_url")) {
                         allocator.free(config.advanced.proxy_url);
                         config.advanced.proxy_url = try dupString(allocator, value);
@@ -709,6 +695,63 @@ pub const ClientConfig = struct {
 
 fn dupString(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
     return allocator.dupe(u8, value);
+}
+
+/// Extract the value portion of a `key = value` line, honoring quoted
+/// strings. Audit B-9: previously the parser stripped inline `#` comments
+/// before checking for quotes, so a value like `psk = "abc#def"` was
+/// silently truncated to `abc` (followed by a quote-trim that ate the
+/// leading `"`). For credential fields this is silent corruption.
+///
+/// Behavior:
+///   - If the trimmed value starts with `"`, look for the next `"`.
+///     Content between the quotes is returned verbatim (no comment
+///     stripping inside, so `#`, `=`, whitespace are all preserved).
+///     If no closing `"` is found, treat as unquoted (best-effort).
+///   - Otherwise, strip an inline `#` comment, then trim whitespace.
+fn extractTomlValue(value_raw: []const u8) []const u8 {
+    const left_trimmed = std.mem.trimStart(u8, value_raw, " \t");
+    if (left_trimmed.len > 0 and left_trimmed[0] == '"') {
+        if (std.mem.indexOfScalarPos(u8, left_trimmed, 1, '"')) |close_pos| {
+            return left_trimmed[1..close_pos];
+        }
+        // No closing quote — fall through to unquoted handling so the user
+        // gets *something* parsable rather than silently empty.
+    }
+    var v = left_trimmed;
+    if (std.mem.indexOfScalar(u8, v, '#')) |comment_pos| {
+        v = v[0..comment_pos];
+    }
+    return std.mem.trim(u8, v, " \t\"");
+}
+
+test "extractTomlValue preserves `#` inside quotes" {
+    try std.testing.expectEqualStrings("abc#def", extractTomlValue("\"abc#def\""));
+    try std.testing.expectEqualStrings("a b c", extractTomlValue("\"a b c\""));
+    // Comment stripping still works outside quotes
+    try std.testing.expectEqualStrings("plain", extractTomlValue("plain # comment"));
+    // Trim whitespace and strip surrounding quotes for unquoted-looking values
+    try std.testing.expectEqualStrings("v", extractTomlValue("  v  "));
+    // No closing quote: best-effort
+    try std.testing.expectEqualStrings("ab", extractTomlValue("\"ab"));
+}
+
+/// Helper for parsing integers in `[advanced]` blocks. Audit B-10: the
+/// previous `parseInt catch default` pattern silently swallowed typos
+/// (`socket_buffer_size = 8MB` → kept the default with no warning).
+/// This surfaces a named error so the user finds the issue at startup.
+fn parseAdvancedInt(comptime T: type, key: []const u8, value: []const u8) !T {
+    return std.fmt.parseInt(T, value, 10) catch |err| {
+        std.debug.print("[CONFIG] Invalid integer for '{s}' = '{s}': {}\n", .{ key, value, err });
+        return error.InvalidConfigValue;
+    };
+}
+
+fn parseAdvancedBool(key: []const u8, value: []const u8) !bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    std.debug.print("[CONFIG] Invalid boolean for '{s}' = '{s}': expected 'true' or 'false'\n", .{ key, value });
+    return error.InvalidConfigValue;
 }
 
 fn canonicalizeCipher(value: []const u8) ?[]const u8 {
