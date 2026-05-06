@@ -851,6 +851,22 @@ fn applyServiceProperty(
     return true;
 }
 
+/// Detect example/placeholder credentials shipped in configs/ and README.md
+/// quickstarts. README claims "no default credentials — refuses to start with
+/// example passwords"; this check makes that claim true for the actual
+/// example strings users copy-paste.
+fn isPlaceholderCredential(value: []const u8) bool {
+    if (value.len == 0) return false;
+    // Prefix-based: catches REPLACE_WITH_*, REPLACE_ME, YOUR_GENERATED_*, YOUR_*.
+    if (std.ascii.startsWithIgnoreCase(value, "REPLACE_")) return true;
+    if (std.ascii.startsWithIgnoreCase(value, "REPLACE-")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "REPLACE")) return true;
+    if (std.ascii.startsWithIgnoreCase(value, "YOUR_GENERATED")) return true;
+    if (std.ascii.startsWithIgnoreCase(value, "YOUR-GENERATED")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "changeme") or std.ascii.eqlIgnoreCase(value, "change-me")) return true;
+    return false;
+}
+
 fn validateSecurity(config: anytype) !void {
     const canonical = canonicalizeCipher(config.cipher) orelse return error.InvalidCipher;
     const encryption_enabled = !std.mem.eql(u8, canonical, "none");
@@ -864,6 +880,16 @@ fn validateSecurity(config: anytype) !void {
     // Always reject default token if present, even if not currently needed
     if (config.token.len > 0 and std.ascii.eqlIgnoreCase(config.token, DEFAULT_TOKEN)) {
         std.debug.print("[SECURITY] Cannot use default token '{s}' - change it in config file\n", .{DEFAULT_TOKEN});
+        return error.DefaultCredentials;
+    }
+
+    // Reject README/example placeholders that pass the >=16-char weak-PSK gate.
+    if (isPlaceholderCredential(config.psk)) {
+        std.debug.print("[SECURITY] PSK is a placeholder ('{s}'); replace with `openssl rand -base64 32` output\n", .{config.psk});
+        return error.DefaultCredentials;
+    }
+    if (isPlaceholderCredential(config.token)) {
+        std.debug.print("[SECURITY] Token is a placeholder ('{s}'); replace with `openssl rand -base64 24` output\n", .{config.token});
         return error.DefaultCredentials;
     }
 
@@ -1064,4 +1090,36 @@ test "validateSecurity rejects default PSK" {
     var cfg = try ServerConfig.init(std.testing.allocator);
     defer cfg.deinit();
     try std.testing.expectError(error.DefaultCredentials, validateSecurity(&cfg));
+}
+
+test "validateSecurity rejects example placeholder PSK" {
+    var cfg = try ServerConfig.init(std.testing.allocator);
+    defer cfg.deinit();
+    // Replace defaults so we test the placeholder path, not the default-cred path.
+    cfg.allocator.free(cfg.psk);
+    cfg.psk = try dupString(cfg.allocator, "REPLACE_WITH_OPENSSL_RAND_BASE64_32_OUTPUT");
+    cfg.allocator.free(cfg.token);
+    cfg.token = try dupString(cfg.allocator, "real-token-that-passes-checks");
+    try std.testing.expectError(error.DefaultCredentials, validateSecurity(&cfg));
+}
+
+test "validateSecurity rejects example placeholder token" {
+    var cfg = try ServerConfig.init(std.testing.allocator);
+    defer cfg.deinit();
+    cfg.allocator.free(cfg.psk);
+    cfg.psk = try dupString(cfg.allocator, "real-psk-that-passes-length-checks-32-chars");
+    cfg.allocator.free(cfg.token);
+    cfg.token = try dupString(cfg.allocator, "REPLACE_ME");
+    try std.testing.expectError(error.DefaultCredentials, validateSecurity(&cfg));
+}
+
+test "isPlaceholderCredential prefix matching" {
+    try std.testing.expect(isPlaceholderCredential("REPLACE_WITH_ANYTHING"));
+    try std.testing.expect(isPlaceholderCredential("REPLACE_ME"));
+    try std.testing.expect(isPlaceholderCredential("replace_me"));
+    try std.testing.expect(isPlaceholderCredential("YOUR_GENERATED_PSK_HERE"));
+    try std.testing.expect(isPlaceholderCredential("changeme"));
+    try std.testing.expect(!isPlaceholderCredential(""));
+    try std.testing.expect(!isPlaceholderCredential("a-real-strong-secret-from-openssl"));
+    try std.testing.expect(!isPlaceholderCredential("REPLACEMENT-PARTS")); // doesn't start with REPLACE_ or REPLACE-
 }

@@ -735,9 +735,11 @@ const TunnelClient = struct {
             if (self.heartbeat_timeout_ms > 0) {
                 const now = common.milliTimestamp();
                 const last_heartbeat = self.last_heartbeat_time.load(.acquire);
-                const elapsed_ms: u32 = @intCast(now - last_heartbeat);
-
-                if (elapsed_ms > self.heartbeat_timeout_ms) {
+                // Compare in i64 — `now - last_heartbeat` can be negative (clock
+                // skew / suspend-resume / NTP step) or exceed u32 (long pause).
+                // The previous `@intCast(u32)` here trapped under either.
+                const elapsed_ms = now - last_heartbeat;
+                if (elapsed_ms > @as(i64, self.heartbeat_timeout_ms)) {
                     std.debug.print("[CLIENT] Heartbeat timeout! No heartbeat for {}ms (limit: {}ms)\n", .{ elapsed_ms, self.heartbeat_timeout_ms });
                     break; // Connection will be re-established by auto-reconnection logic
                 }
