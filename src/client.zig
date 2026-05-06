@@ -30,6 +30,7 @@ const enable_tunnel_trace = false;
 const enable_listener_trace = false;
 
 var global_allocator: std.mem.Allocator = undefined;
+var global_io: std.Io = undefined;
 var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var config_path_global: []const u8 = undefined; // Store config path for reload
 var encrypt_total_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
@@ -1650,18 +1651,12 @@ test "forwardLocalData sends plaintext frames" {
     try std.testing.expectEqualStrings("ping", payload[7..]);
 }
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    // Zig 0.16: GeneralPurposeAllocator was renamed to DebugAllocator and gained
-    // a thread-safe `smp_allocator` for release builds.
-    var debug_allocator: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
-    const allocator, const is_debug = if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe)
-        .{ debug_allocator.allocator(), true }
-    else
-        .{ std.heap.smp_allocator, false };
-    defer if (is_debug) {
-        _ = debug_allocator.deinit();
-    };
+pub fn main(init: std.process.Init) !void {
+    // Zig 0.16: Init provides Io (Threaded backend by default) and the same gpa
+    // start.zig used (DebugAllocator in debug, smp_allocator in release).
+    const allocator = init.gpa;
     global_allocator = allocator;
+    global_io = init.io;
     defer diagnostics.flushEncryptStats("client", &encrypt_total_ns, &encrypt_calls);
     defer diagnostics.flushThroughputStats("client", &tunnel_tx_bytes, &tunnel_rx_bytes);
     defer cleanupSignalPipe();
@@ -1680,7 +1675,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer if (exit_code != 0) std.process.exit(exit_code);
 
     // Zig 0.16: process.argsAlloc removed; use process.Args.Iterator instead.
-    var args_iter = try std.process.Args.Iterator.initAllocator(init.args, allocator);
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_iter.deinit();
     var args_list_arr: std.ArrayListUnmanaged([:0]const u8) = .empty;
     defer args_list_arr.deinit(allocator);
