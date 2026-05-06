@@ -1793,6 +1793,12 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[CLIENT] All tunnel threads started (reconnection: {})\n", .{cfg.advanced.reconnect_enabled});
     var shutdown_notice_printed = false;
 
+    // Track UDP forwarders created in multi-service mode so we can periodically
+    // prune expired sessions (otherwise UdpSessionManager grows unbounded under
+    // long-lived processes with churn).
+    var multi_service_udp_forwarders = std.ArrayListUnmanaged(*udp_client.UdpForwarder).empty;
+    defer multi_service_udp_forwarders.deinit(allocator);
+
     // Check if multi-service mode is enabled
     if (cfg.services.count() > 0) {
         std.debug.print("\n[MULTI-SERVICE] Starting {} services...\n", .{cfg.services.count()});
@@ -1861,6 +1867,12 @@ pub fn main(init: std.process.Init) !void {
 
                     // Store forwarder reference (for cleanup)
                     first_client.udp_forwarder = forwarder;
+                    // Track for periodic session eviction. Note: with N UDP
+                    // services, the per-tunnel `udp_forwarder` field only
+                    // retains the last one assigned (the others are still
+                    // reachable via this tracking list). Reattach-on-reconnect
+                    // is a separate fix (audit A-1 / plan P3-1).
+                    multi_service_udp_forwarders.append(allocator, forwarder) catch {};
 
                     // Send initial CONNECT message for UDP service
                     const stream_id = first_client.next_stream_id.fetchAdd(1, .acq_rel);
@@ -1881,12 +1893,22 @@ pub fn main(init: std.process.Init) !void {
 
         std.debug.print("\n[READY] All services ready. Press Ctrl+C to stop.\n\n", .{});
 
-        // Wait for shutdown signal
+        // Wait for shutdown signal. Tick every 250ms; once per second we run
+        // UDP session eviction across all forwarders (matches the legacy
+        // single-service path's behavior).
+        var udp_evict_counter: u8 = 0;
         while (!shutdown_flag.load(.acquire)) {
             processSignalNotifications(&shutdown_notice_printed);
             {
                 const ns = 250 * std.time.ns_per_ms;
                 Io.sleep(global_io, .fromNanoseconds(@intCast(ns)), .awake) catch {};
+            }
+            udp_evict_counter +%= 1;
+            if (udp_evict_counter >= 4) { // ~1s
+                udp_evict_counter = 0;
+                for (multi_service_udp_forwarders.items) |fwd| {
+                    fwd.cleanupExpiredSessions() catch {};
+                }
             }
         }
     } else if (default_transport == .udp) {
