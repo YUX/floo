@@ -1,11 +1,10 @@
 const std = @import("std");
 const posix = std.posix;
-const net = @import("net_compat.zig");
+const Io = std.Io;
 const tunnel = @import("tunnel.zig");
 const noise = @import("noise.zig");
 const udp_session = @import("udp_session.zig");
 const common = @import("common.zig");
-const resolveHostPort = common.resolveHostPort;
 
 /// UDP forwarder for client side
 /// Handles local UDP clients and forwards through tunnel
@@ -15,9 +14,10 @@ const resolveHostPort = common.resolveHostPort;
 /// session ID that's used to route responses back correctly.
 pub const UdpForwarder = struct {
     allocator: std.mem.Allocator,
+    io: Io,
     service_id: tunnel.ServiceId,
     local_port: u16,
-    local_fd: posix.fd_t,
+    local_socket: Io.net.Socket,
     tunnel_conn: *anyopaque, // Opaque pointer to TunnelClient
     send_fn: *const fn (conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void,
     running: std.atomic.Value(bool),
@@ -27,6 +27,7 @@ pub const UdpForwarder = struct {
 
     pub fn create(
         allocator: std.mem.Allocator,
+        io: Io,
         service_id: tunnel.ServiceId,
         local_host: []const u8,
         local_port: u16,
@@ -34,24 +35,17 @@ pub const UdpForwarder = struct {
         send_fn: *const fn (conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void,
         timeout_seconds: u64,
     ) !*UdpForwarder {
-        // Resolve and bind local UDP socket
-        const bind_addr = try resolveHostPort(local_host, local_port);
-        const local_fd = try posix.socket(
-            bind_addr.any.family,
-            posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
-            0,
-        );
-        errdefer posix.close(local_fd);
-
-        // Bind to local host/port
-        try posix.bind(local_fd, &bind_addr.any, bind_addr.getOsSockLen());
+        const bind_addr = try common.resolveHostPort(io, local_host, local_port);
+        const local_socket = try bind_addr.bind(io, .{ .mode = .dgram });
+        errdefer local_socket.close(io);
 
         const forwarder = try allocator.create(UdpForwarder);
         forwarder.* = .{
             .allocator = allocator,
+            .io = io,
             .service_id = service_id,
             .local_port = local_port,
-            .local_fd = local_fd,
+            .local_socket = local_socket,
             .tunnel_conn = tunnel_conn,
             .send_fn = send_fn,
             .running = std.atomic.Value(bool).init(true),
@@ -60,7 +54,6 @@ pub const UdpForwarder = struct {
             .timeout_seconds = timeout_seconds,
         };
 
-        // Start local receiver thread
         forwarder.thread = try std.Thread.spawn(.{
             .stack_size = common.DEFAULT_THREAD_STACK,
         }, localReceiveThread, .{forwarder});
@@ -72,38 +65,26 @@ pub const UdpForwarder = struct {
 
     fn localReceiveThread(self: *UdpForwarder) void {
         var buf: [common.SOCKET_BUFFER_SIZE]u8 align(64) = undefined;
-        var from_addr: posix.sockaddr.storage = undefined;
-        var from_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
 
         std.debug.print("[UDP-CLIENT] Local receiver thread started\n", .{});
 
         while (self.running.load(.acquire)) {
-            // Receive UDP packet from local client
-            const n = posix.recvfrom(
-                self.local_fd,
-                &buf,
-                0,
-                @ptrCast(&from_addr),
-                &from_len,
-            ) catch |err| {
-                std.debug.print("[UDP-CLIENT] recvfrom error: {}\n", .{err});
+            const msg = self.local_socket.receive(self.io, &buf) catch |err| {
+                if (!self.running.load(.acquire)) break;
+                std.debug.print("[UDP-CLIENT] receive error: {}\n", .{err});
                 continue;
             };
 
-            if (n == 0) continue;
+            if (msg.data.len == 0) continue;
 
-            // Convert source address
-            const source_addr = net.Address.initPosix(@ptrCast(@alignCast(&from_addr)));
-
-            // Get or create session for this local source
-            const session = self.session_manager.getOrCreate(source_addr) catch |err| {
+            const session = self.session_manager.getOrCreate(msg.from) catch |err| {
                 std.debug.print("[UDP-CLIENT] Session creation error: {}\n", .{err});
                 continue;
             };
 
-            std.debug.print("[UDP-CLIENT] Received {} bytes from local {any}, stream_id={}\n", .{
-                n,
-                source_addr,
+            std.debug.print("[UDP-CLIENT] Received {} bytes from local {f}, stream_id={}\n", .{
+                msg.data.len,
+                msg.from,
                 session.stream_id,
             });
 
@@ -115,20 +96,17 @@ pub const UdpForwarder = struct {
             var addr_len: usize = 0;
             var source_port: u16 = 0;
 
-            switch (source_addr.any.family) {
-                posix.AF.INET => {
-                    const ipv4 = source_addr.in;
-                    @memcpy(addr_bytes[0..4], std.mem.asBytes(&ipv4.addr));
+            switch (msg.from) {
+                .ip4 => |v4| {
+                    @memcpy(addr_bytes[0..4], &v4.bytes);
                     addr_len = 4;
-                    source_port = std.mem.bigToNative(u16, ipv4.port);
+                    source_port = v4.port;
                 },
-                posix.AF.INET6 => {
-                    const ipv6 = source_addr.in6;
-                    @memcpy(&addr_bytes, &ipv6.addr);
+                .ip6 => |v6| {
+                    @memcpy(&addr_bytes, &v6.bytes);
                     addr_len = 16;
-                    source_port = std.mem.bigToNative(u16, ipv6.port);
+                    source_port = v6.port;
                 },
-                else => continue,
             }
 
             const udp_msg = tunnel.UdpDataMsg{
@@ -136,7 +114,7 @@ pub const UdpForwarder = struct {
                 .stream_id = session.stream_id,
                 .source_addr = addr_bytes[0..addr_len],
                 .source_port = source_port,
-                .data = buf[0..n],
+                .data = msg.data,
             };
 
             const encoded_len = udp_msg.encodeInto(&encode_buf) catch |err| {
@@ -144,7 +122,6 @@ pub const UdpForwarder = struct {
                 continue;
             };
 
-            // Send through tunnel
             self.send_fn(self.tunnel_conn, encode_buf[0 .. encoded_len + noise.TAG_LEN], encoded_len) catch |err| {
                 std.debug.print("[UDP-CLIENT] Tunnel send error: {}\n", .{err});
             };
@@ -155,22 +132,14 @@ pub const UdpForwarder = struct {
 
     /// Handle incoming UDP data from tunnel (forward to local client)
     pub fn handleUdpData(self: *UdpForwarder, udp_msg: tunnel.UdpDataMsg) !void {
-        // Look up session by stream_id
         const session = self.session_manager.getByStreamId(udp_msg.stream_id) orelse {
             std.debug.print("[UDP-CLIENT] Unknown stream_id={}, dropping packet\n", .{udp_msg.stream_id});
             return;
         };
 
-        // Send back to local source address
-        _ = try posix.sendto(
-            self.local_fd,
-            udp_msg.data,
-            0,
-            &session.source_addr.any,
-            session.source_addr.getOsSockLen(),
-        );
+        try self.local_socket.send(self.io, &session.source_addr, udp_msg.data);
 
-        std.debug.print("[UDP-CLIENT] Forwarded {} bytes to local {any}\n", .{
+        std.debug.print("[UDP-CLIENT] Forwarded {} bytes to local {f}\n", .{
             udp_msg.data.len,
             session.source_addr,
         });
@@ -186,13 +155,14 @@ pub const UdpForwarder = struct {
 
     pub fn stop(self: *UdpForwarder) void {
         self.running.store(false, .release);
-        // Shutdown socket to unblock recvfrom()
-        posix.shutdown(self.local_fd, .recv) catch {};
+        // Shutdown the receive side to unblock the receiver thread.
+        // Use the raw syscall — std.Io.net.Socket has no shutdown method.
+        _ = posix.system.shutdown(self.local_socket.handle, posix.SHUT.RD);
         self.thread.join();
     }
 
     pub fn destroy(self: *UdpForwarder) void {
-        posix.close(self.local_fd);
+        self.local_socket.close(self.io);
         self.session_manager.deinit();
         self.allocator.destroy(self);
     }
