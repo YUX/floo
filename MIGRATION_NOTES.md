@@ -3,7 +3,7 @@
 **Branch:** `remediation/v0.2.0`
 **Target:** Zig 0.16.0 stable
 **Strategy:** Path C — migrate to `std.Io` (high-level abstraction), unlocks io_uring backend down the line.
-**Status:** In progress. See *Migration progress* below.
+**Status:** ✅ **COMPLETE.** `zig build` produces both binaries on 0.16.0 stable; `zig build test` is 36/36 green; `zig build -Doptimize=ReleaseFast` succeeds. See *Migration progress* below for the per-file commit log.
 
 ---
 
@@ -114,9 +114,22 @@ synchronous flows, treat `error.Cancel` like a graceful shutdown signal.
 8. ✅ **`udp_client.zig`** (`206d9f0`): uses `Socket`, `IncomingMessage`.
 9. ✅ **`udp_server.zig`** (`f0fe2f8`): ephemeral `Socket` per session, no connected-UDP.
 10. ✅ **`config.zig` + `diagnostics.zig`** (`6cb5ae6`): `Io.Dir.cwd().readFileAlloc`; dropped /tmp log.
-11. ⏳ **`server.zig`** — see plan below.
-12. ⏳ **`client.zig`** — see plan below.
-13. ⏳ **`net_compat.zig`** — delete after server/client are off it.
+11. ✅ **`server.zig`** (`5f3d3fe` + `6a808a5`): full Stream/Server migration; signal pipe collapsed to no-op; ~190 lines net delta.
+12. ✅ **`client.zig`** (`800ec13`): mirror of server changes; LocalConnection holds Stream; udp_session.UdpSessionManager gained io field; ~440 lines net delta.
+13. ✅ **`net_compat.zig`** (`bf7a02f`): deleted; ~170 lines retired in favor of `std.Io.net.IpAddress`.
+
+## Result
+
+```
+$ ~/.zvm/0.16.0/zig build           # 0 errors
+$ ~/.zvm/0.16.0/zig build test       # 36/36 pass
+$ ~/.zvm/0.16.0/zig build -Doptimize=ReleaseFast
+$ ls -lh zig-out/bin/
+flooc  535K
+floos  469K
+```
+
+14 commits, ~1100 net lines changed, zero new dependencies. `net_compat.zig` shim retired. CI workflows still need to be pinned to `version: 0.16.0` (was `master`) — that's a one-line change per workflow saved for the same PR that merges this branch.
 
 ## server.zig migration plan (~54 posix call sites)
 
