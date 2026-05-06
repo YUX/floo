@@ -946,8 +946,10 @@ const TunnelClient = struct {
                 }
             },
             .udp_data => {
-                const udp_msg = try tunnel.UdpDataMsg.decode(message_slice, global_allocator);
-                defer global_allocator.free(udp_msg.source_addr);
+                // Hot path: zero-alloc decode. Client.handleUdpData reads only
+                // stream_id and data; source_addr is unused, so the slice
+                // lifetime is trivially safe.
+                const udp_msg = try tunnel.UdpDataMsg.decodeRef(message_slice);
 
                 if (self.udp_forwarder) |forwarder| {
                     forwarder.handleUdpData(udp_msg) catch |err| {

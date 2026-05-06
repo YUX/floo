@@ -938,8 +938,11 @@ const TunnelConnection = struct {
                 }
             },
             .udp_data => {
-                const udp_msg = try tunnel.UdpDataMsg.decode(message_slice, global_allocator);
-                defer global_allocator.free(udp_msg.source_addr);
+                // Hot path: decodeRef avoids the per-packet alloc+memcpy of
+                // source_addr. Slices are valid until the next decoder feed,
+                // and handleUdpData consumes synchronously (copies into the
+                // session's [16]u8 source_addr field on insert).
+                const udp_msg = try tunnel.UdpDataMsg.decodeRef(message_slice);
 
                 if (self.udp_forwarder) |forwarder| {
                     forwarder.handleUdpData(udp_msg) catch |err| {

@@ -340,6 +340,32 @@ pub const UdpDataMsg = struct {
             .data = data[port_offset + 2 ..],
         };
     }
+
+    /// Zero-allocation decode that returns slices into `data`. The returned
+    /// `source_addr` and `data` are valid only until the underlying buffer is
+    /// overwritten or freed — caller must consume synchronously.
+    ///
+    /// Used on the per-packet UDP hot path to avoid the alloc+memcpy that
+    /// `decode` performs on every datagram.
+    pub fn decodeRef(data: []const u8) !UdpDataMsg {
+        if (data.len < 10) return error.InvalidMessage;
+        if (data[0] != @intFromEnum(MessageType.udp_data)) return error.InvalidMessageType;
+
+        const service_id = std.mem.readInt(u16, data[1..3], .big);
+        const stream_id = std.mem.readInt(u32, data[3..7], .big);
+        const addr_len = data[7];
+        if (data.len < 10 + addr_len) return error.InvalidMessage;
+        const port_offset = 8 + addr_len;
+        const port = std.mem.readInt(u16, data[port_offset..][0..2], .big);
+
+        return UdpDataMsg{
+            .service_id = service_id,
+            .stream_id = stream_id,
+            .source_addr = data[8 .. 8 + addr_len],
+            .source_port = port,
+            .data = data[port_offset + 2 ..],
+        };
+    }
 };
 
 /// Heartbeat message: Keep connection alive and detect failures
@@ -502,4 +528,48 @@ test "CloseMsg encode/decode" {
 
     try std.testing.expectEqual(msg.service_id, decoded.service_id);
     try std.testing.expectEqual(msg.stream_id, decoded.stream_id);
+}
+
+test "UdpDataMsg.decodeRef matches decode (no alloc)" {
+    const allocator = std.testing.allocator;
+
+    const msg = UdpDataMsg{
+        .service_id = 4,
+        .stream_id = 0xDEADBEEF,
+        .source_addr = &[_]u8{ 192, 168, 1, 42 },
+        .source_port = 5353,
+        .data = "hello udp",
+    };
+
+    var buf: [128]u8 = undefined;
+    const len = try msg.encodeInto(&buf);
+
+    // Reference path: zero-alloc.
+    const ref = try UdpDataMsg.decodeRef(buf[0..len]);
+    try std.testing.expectEqual(msg.service_id, ref.service_id);
+    try std.testing.expectEqual(msg.stream_id, ref.stream_id);
+    try std.testing.expectEqual(msg.source_port, ref.source_port);
+    try std.testing.expectEqualSlices(u8, msg.source_addr, ref.source_addr);
+    try std.testing.expectEqualSlices(u8, msg.data, ref.data);
+    // The slice must point into the original buffer, not a copy.
+    try std.testing.expect(@intFromPtr(ref.source_addr.ptr) == @intFromPtr(&buf[8]));
+    try std.testing.expect(@intFromPtr(ref.data.ptr) == @intFromPtr(&buf[8 + 4 + 2]));
+
+    // Allocating path: parity check.
+    const owned = try UdpDataMsg.decode(buf[0..len], allocator);
+    defer allocator.free(owned.source_addr);
+    try std.testing.expectEqualSlices(u8, msg.source_addr, owned.source_addr);
+    try std.testing.expectEqualSlices(u8, msg.data, owned.data);
+}
+
+test "UdpDataMsg.decodeRef rejects truncated input" {
+    var buf: [9]u8 = undefined;
+    buf[0] = @intFromEnum(MessageType.udp_data);
+    try std.testing.expectError(error.InvalidMessage, UdpDataMsg.decodeRef(&buf));
+}
+
+test "UdpDataMsg.decodeRef rejects wrong message type" {
+    var buf: [16]u8 = undefined;
+    buf[0] = @intFromEnum(MessageType.data);
+    try std.testing.expectError(error.InvalidMessageType, UdpDataMsg.decodeRef(&buf));
 }
