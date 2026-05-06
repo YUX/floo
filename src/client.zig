@@ -830,7 +830,7 @@ const TunnelClient = struct {
                         // Process all complete frames
                         var decoder_had_error = false;
                         while (true) {
-                            const maybe_frame = decoder.decode() catch |decode_err| {
+                            const maybe_frame = decoder.decodeMut() catch |decode_err| {
                                 std.debug.print("[CLIENT] Decoder error: {}\n", .{decode_err});
                                 decoder_had_error = true;
                                 break;
@@ -878,10 +878,10 @@ const TunnelClient = struct {
         self.cleanup();
     }
 
-    fn handleMessage(self: *TunnelClient, payload: []const u8) !void {
+    fn handleMessage(self: *TunnelClient, payload: []u8) !void {
         if (payload.len == 0) return;
 
-        const message_slice = try self.channel.decryptFrame(payload);
+        const message_slice = try self.channel.decryptFrameInPlace(payload);
         if (message_slice.len == 0) return;
 
         const msg_type: tunnel.MessageType = @enumFromInt(message_slice[0]);

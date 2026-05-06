@@ -808,7 +808,7 @@ const TunnelConnection = struct {
                         tracePrint(enable_tunnel_trace, "[TUNNEL] Received {} bytes from client\n", .{n});
                         decoder.commitWrite(n);
 
-                        while (decoder.decode() catch null) |frame_payload| {
+                        while (decoder.decodeMut() catch null) |frame_payload| {
                             self.handleMessage(frame_payload) catch |err| {
                                 std.debug.print("[TUNNEL] Handle message error: {}\n", .{err});
                                 self.running.store(false, .release);
@@ -849,10 +849,10 @@ const TunnelConnection = struct {
         self.running.store(false, .release);
     }
 
-    fn handleMessage(self: *TunnelConnection, payload: []const u8) !void {
+    fn handleMessage(self: *TunnelConnection, payload: []u8) !void {
         if (payload.len == 0) return;
 
-        const message_slice = try self.channel.decryptFrame(payload);
+        const message_slice = try self.channel.decryptFrameInPlace(payload);
         if (message_slice.len == 0) return;
 
         const msg_type: tunnel.MessageType = @enumFromInt(message_slice[0]);

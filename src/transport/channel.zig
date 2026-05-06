@@ -75,7 +75,6 @@ pub const Channel = struct {
     encryption_enabled: bool,
     send_cipher: ?noise.TransportCipher,
     recv_cipher: ?noise.TransportCipher,
-    decrypt_buffer: []u8,
     control_buffer: []u8,
     large_send_buffer: []u8,
     send_mutex: std.Io.Mutex,
@@ -83,7 +82,6 @@ pub const Channel = struct {
     throughput: ?ThroughputStats,
 
     pub fn init(params: ChannelInit) !Channel {
-        var decrypt_buffer: []u8 = &[_]u8{};
         var control_buffer: []u8 = &[_]u8{};
         const large_send_buffer: []u8 = &[_]u8{};
         var send_cipher: ?noise.TransportCipher = null;
@@ -130,7 +128,6 @@ pub const Channel = struct {
                 params.allocator,
             );
 
-            decrypt_buffer = try params.allocator.alloc(u8, protocol.MAX_FRAME_SIZE);
             control_buffer = try params.allocator.alloc(u8, common.CONTROL_MSG_BUFFER_SIZE + noise.TAG_LEN);
         } else if (params.handshake_metrics) |metrics| {
             metrics.elapsed_ns = 0;
@@ -145,7 +142,6 @@ pub const Channel = struct {
             .encryption_enabled = encryption_enabled,
             .send_cipher = send_cipher,
             .recv_cipher = recv_cipher,
-            .decrypt_buffer = decrypt_buffer,
             .control_buffer = control_buffer,
             .large_send_buffer = large_send_buffer,
             .send_mutex = .init,
@@ -155,9 +151,6 @@ pub const Channel = struct {
     }
 
     pub fn deinit(self: *Channel) void {
-        if (self.decrypt_buffer.len > 0) {
-            self.allocator.free(self.decrypt_buffer);
-        }
         if (self.control_buffer.len > 0) {
             self.allocator.free(self.control_buffer);
         }
@@ -215,8 +208,20 @@ pub const Channel = struct {
         self.recordTx(payload_len);
     }
 
-    /// Decrypt frame payload. Returns plaintext slice with lifetime tied to the channel.
-    pub fn decryptFrame(self: *Channel, encrypted_payload: []const u8) ![]const u8 {
+    /// Decrypt frame payload IN PLACE. The caller-supplied `encrypted_payload`
+    /// slice must point into a mutable backing buffer (e.g. the FrameDecoder's
+    /// internal buffer via `decodeMut`). On return:
+    ///   - Bytes [0..plaintext_len] of the slice contain plaintext.
+    ///   - Bytes [plaintext_len..] are stale (the AEAD tag, now garbage).
+    /// Returns the plaintext slice limited to `plaintext_len`.
+    ///
+    /// The previous implementation maintained a per-channel `decrypt_buffer`
+    /// of MAX_FRAME_SIZE and did one memcpy via `cipher.decrypt(ct, decrypt_buffer)`
+    /// on every received frame. With std.crypto AEADs supporting in-place
+    /// decryption (verified by the regression test in noise.zig), that copy
+    /// is redundant — we save 1 MB of resident memory per tunnel and one
+    /// full memcpy per byte received.
+    pub fn decryptFrameInPlace(self: *Channel, encrypted_payload: []u8) ![]const u8 {
         if (!self.encryption_enabled) {
             return encrypted_payload;
         }
@@ -226,17 +231,14 @@ pub const Channel = struct {
         }
 
         const plaintext_len = encrypted_payload.len - noise.TAG_LEN;
-        if (plaintext_len > self.decrypt_buffer.len) {
-            return error.FrameTooLarge;
-        }
 
         if (self.recv_cipher) |*cipher| {
-            try cipher.decrypt(encrypted_payload, self.decrypt_buffer[0..plaintext_len]);
+            try cipher.decrypt(encrypted_payload, encrypted_payload[0..plaintext_len]);
         } else {
             return error.CipherUnavailable;
         }
         self.recordRx(plaintext_len);
-        return self.decrypt_buffer[0..plaintext_len];
+        return encrypted_payload[0..plaintext_len];
     }
 
     fn prepareSendSlice(self: *Channel, buffer: []u8, payload_len: usize) ![]u8 {

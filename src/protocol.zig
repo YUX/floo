@@ -126,6 +126,15 @@ pub const FrameDecoder = struct {
     /// The returned slice borrows the decoder buffer and stays valid
     /// until the next call to `feed` or `reset`.
     pub fn decode(self: *FrameDecoder) !?[]const u8 {
+        return self.decodeMut();
+    }
+
+    /// Like `decode`, but returns a mutable slice into the decoder's internal
+    /// buffer. Used by the recv hot path to decrypt frames in place — the
+    /// channel layer overwrites the ciphertext bytes with plaintext.
+    /// Same lifetime contract as `decode`: valid until the next call that
+    /// mutates the decoder (`feed`, `pendingTail`, `commitWrite`, `reset`).
+    pub fn decodeMut(self: *FrameDecoder) !?[]u8 {
         const available = self.write_pos - self.read_pos;
 
         // Need at least 4 bytes for length header

@@ -117,6 +117,52 @@ test "CipherType.fromString parses AEGIS-256 variants" {
     try std.testing.expectEqual(@as(usize, 32), CipherType.aegis256x4.nonceLen());
 }
 
+// In-place decryption: pass the same buffer as both ciphertext source and
+// plaintext destination (sliced to drop the tag). Verifies that the
+// std.crypto AEAD implementation reads each ciphertext byte before
+// overwriting it. If this test ever fails for a cipher, the channel
+// layer's decrypt-in-place hot path must NOT be used for that cipher.
+test "AEAD decrypt is safe in-place across all cipher types" {
+    const types = [_]CipherType{
+        .chacha20poly1305,
+        .aes256gcm,
+        .aes128gcm,
+        .aegis128l,
+        .aegis128x2,
+        .aegis128x4,
+        .aegis256,
+        .aegis256x2,
+        .aegis256x4,
+    };
+
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x42);
+
+    const plaintext_in = "in-place AEAD decryption regression vector — abcdefghijklmnopqrstuvwxyz0123456789";
+
+    inline for (types) |ct_type| {
+        var cipher_enc = TransportCipher.init(key, ct_type);
+        var cipher_dec_oop = TransportCipher.init(key, ct_type); // out-of-place decryptor
+        var cipher_dec_in = TransportCipher.init(key, ct_type); // in-place decryptor
+
+        // Encrypt into a fresh buffer so we know the ciphertext.
+        const ct_len = plaintext_in.len + TAG_LEN;
+        var ct_buf: [200]u8 = undefined;
+        try cipher_enc.encrypt(plaintext_in, ct_buf[0..ct_len]);
+
+        // Out-of-place decrypt as the reference.
+        var pt_oop: [plaintext_in.len]u8 = undefined;
+        try cipher_dec_oop.decrypt(ct_buf[0..ct_len], &pt_oop);
+        try std.testing.expectEqualSlices(u8, plaintext_in, &pt_oop);
+
+        // In-place decrypt: source and dest alias the same backing storage.
+        var ct_alias: [200]u8 = undefined;
+        @memcpy(ct_alias[0..ct_len], ct_buf[0..ct_len]);
+        try cipher_dec_in.decrypt(ct_alias[0..ct_len], ct_alias[0..plaintext_in.len]);
+        try std.testing.expectEqualSlices(u8, plaintext_in, ct_alias[0..plaintext_in.len]);
+    }
+}
+
 /// Cipher type for Noise transport
 pub const CipherType = enum {
     chacha20poly1305,
