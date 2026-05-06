@@ -30,11 +30,11 @@ port = 8443             # Port for tunnel connections (clients connect here)
 # ----------------------------------------------------------------------------
 
 # Cipher: Choose based on your CPU
-#   - aes256gcm (recommended): Fast on modern CPUs with AES-NI
-#   - aegis128l: Fastest on ARMv8+ and modern x86 (22+ Gbps)
-#   - chacha20poly1305: Best for older CPUs without AES-NI
+#   - aegis128l (default, recommended): Fastest on ARMv8+ and modern x86 (22+ Gbps)
+#   - aes256gcm: Compatible default with AES-NI hardware
 #   - aes128gcm: Faster than aes256gcm, still secure
-cipher = "aes256gcm"
+#   - chacha20poly1305: Best for older CPUs without AES-NI
+cipher = "aegis128l"
 
 # PSK (Pre-Shared Key): MUST be strong and random!
 # Generate with: openssl rand -base64 32

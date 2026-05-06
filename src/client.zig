@@ -581,9 +581,34 @@ const LocalConnection = struct {
     }
 };
 
-/// Wrapper for UDP forwarder callback
-fn sendTunnelPayload(conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void {
-    const client: *TunnelClient = @ptrCast(@alignCast(conn));
+/// Binds a UDP forwarder to whichever TunnelClient is currently connected on
+/// its preferred tunnel index. The forwarder outlives any single tunnel
+/// connection — when tunnel-0 disconnects and reconnects, main updates this
+/// slot and the forwarder transparently routes through the new client.
+///
+/// Audit fix A-1: previously the forwarder pointed directly at a TunnelClient
+/// that got destroyed on disconnect, killing the UDP service permanently.
+const UdpAttachment = struct {
+    forwarder: *udp_client.UdpForwarder,
+    /// Currently-active tunnel for outbound packets; null while reconnecting.
+    /// Loaded atomically on every send (per-packet); stored atomically by
+    /// tunnelThreadWithReconnection on connect/disconnect.
+    tunnel: std.atomic.Value(?*TunnelClient),
+
+    pub fn init(forwarder: *udp_client.UdpForwarder) UdpAttachment {
+        return .{
+            .forwarder = forwarder,
+            .tunnel = std.atomic.Value(?*TunnelClient).init(null),
+        };
+    }
+};
+
+/// Send shim used by udp_client.UdpForwarder. The opaque pointer is a
+/// `*UdpAttachment`; the current TunnelClient is read atomically and used
+/// for the actual sendDataInPlace.
+fn sendTunnelPayload(att_ptr: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void {
+    const att: *UdpAttachment = @ptrCast(@alignCast(att_ptr));
+    const client = att.tunnel.load(.acquire) orelse return error.NoTunnelAvailable;
     const slice = buffer[0 .. payload_len + noise.TAG_LEN];
     try client.channel.sendDataInPlace(slice, payload_len);
 }
@@ -704,7 +729,8 @@ const TunnelClient = struct {
     }
 
     fn run(self: *TunnelClient) void {
-        var buf: [256 * 1024]u8 align(64) = undefined; // 256KB
+        // Recv hot path reads directly into the decoder buffer via
+        // pendingTail/commitWrite — no intermediate stack buffer + memcpy.
         var decoder = protocol.FrameDecoder.init(global_allocator);
         defer decoder.deinit();
 
@@ -735,9 +761,11 @@ const TunnelClient = struct {
             if (self.heartbeat_timeout_ms > 0) {
                 const now = common.milliTimestamp();
                 const last_heartbeat = self.last_heartbeat_time.load(.acquire);
-                const elapsed_ms: u32 = @intCast(now - last_heartbeat);
-
-                if (elapsed_ms > self.heartbeat_timeout_ms) {
+                // Compare in i64 — `now - last_heartbeat` can be negative (clock
+                // skew / suspend-resume / NTP step) or exceed u32 (long pause).
+                // The previous `@intCast(u32)` here trapped under either.
+                const elapsed_ms = now - last_heartbeat;
+                if (elapsed_ms > @as(i64, self.heartbeat_timeout_ms)) {
                     std.debug.print("[CLIENT] Heartbeat timeout! No heartbeat for {}ms (limit: {}ms)\n", .{ elapsed_ms, self.heartbeat_timeout_ms });
                     break; // Connection will be re-established by auto-reconnection logic
                 }
@@ -799,7 +827,16 @@ const TunnelClient = struct {
                     .tunnel => {
                         if ((fd_info.revents & posix.POLL.IN) == 0) continue;
 
-                        const n = posix.read(self.tunnel_stream.socket.handle, &buf) catch |err| {
+                        // Zero-copy recv: read straight into the decoder's
+                        // internal buffer.
+                        const dst = decoder.pendingTail();
+                        if (dst.len == 0) {
+                            std.debug.print("[CLIENT] Decoder buffer full; framing stalled\n", .{});
+                            self.running.store(false, .release);
+                            fatal_error = true;
+                            break :loop;
+                        }
+                        const n = posix.read(self.tunnel_stream.socket.handle, dst) catch |err| {
                             std.debug.print("[CLIENT] Recv error: {}\n", .{err});
                             self.running.store(false, .release);
                             fatal_error = true;
@@ -813,18 +850,12 @@ const TunnelClient = struct {
                             break :loop;
                         }
 
-                        // Feed decoder
-                        decoder.feed(buf[0..n]) catch {
-                            std.debug.print("[CLIENT] Decoder feed error\n", .{});
-                            self.running.store(false, .release);
-                            fatal_error = true;
-                            break :loop;
-                        };
+                        decoder.commitWrite(n);
 
                         // Process all complete frames
                         var decoder_had_error = false;
                         while (true) {
-                            const maybe_frame = decoder.decode() catch |decode_err| {
+                            const maybe_frame = decoder.decodeMut() catch |decode_err| {
                                 std.debug.print("[CLIENT] Decoder error: {}\n", .{decode_err});
                                 decoder_had_error = true;
                                 break;
@@ -872,10 +903,10 @@ const TunnelClient = struct {
         self.cleanup();
     }
 
-    fn handleMessage(self: *TunnelClient, payload: []const u8) !void {
+    fn handleMessage(self: *TunnelClient, payload: []u8) !void {
         if (payload.len == 0) return;
 
-        const message_slice = try self.channel.decryptFrame(payload);
+        const message_slice = try self.channel.decryptFrameInPlace(payload);
         if (message_slice.len == 0) return;
 
         const msg_type: tunnel.MessageType = @enumFromInt(message_slice[0]);
@@ -892,8 +923,7 @@ const TunnelClient = struct {
                 // Connection established, local thread will start sending
             },
             .connect_error => {
-                const err_msg = try tunnel.ConnectErrorMsg.decode(message_slice, global_allocator);
-                defer global_allocator.free(err_msg.error_msg);
+                const err_msg = try tunnel.ConnectErrorMsg.decodeRef(message_slice);
                 std.debug.print("[CLIENT] CONNECT_ERROR stream_id={} code={s} error={s}\n", .{ err_msg.stream_id, @tagName(err_msg.error_code), err_msg.error_msg });
 
                 self.connections_mutex.lockUncancelable(global_io);
@@ -944,8 +974,10 @@ const TunnelClient = struct {
                 }
             },
             .udp_data => {
-                const udp_msg = try tunnel.UdpDataMsg.decode(message_slice, global_allocator);
-                defer global_allocator.free(udp_msg.source_addr);
+                // Hot path: zero-alloc decode. Client.handleUdpData reads only
+                // stream_id and data; source_addr is unused, so the slice
+                // lifetime is trivially safe.
+                const udp_msg = try tunnel.UdpDataMsg.decodeRef(message_slice);
 
                 if (self.udp_forwarder) |forwarder| {
                     forwarder.handleUdpData(udp_msg) catch |err| {
@@ -1252,12 +1284,10 @@ const TunnelClient = struct {
     }
 
     fn cleanup(self: *TunnelClient) void {
-        // Stop UDP forwarder if present
-        if (self.udp_forwarder) |forwarder| {
-            forwarder.stop();
-            forwarder.destroy();
-            self.udp_forwarder = null;
-        }
+        // The udp_forwarder field is a non-owning dispatch route maintained
+        // by main via UdpAttachment. Just clear it — main owns the forwarder
+        // lifecycle and reattaches it to the next TunnelClient on reconnect.
+        self.udp_forwarder = null;
 
         // Stop all connections
         while (true) {
@@ -1280,11 +1310,8 @@ const TunnelClient = struct {
     }
 
     fn destroy(self: *TunnelClient) void {
-        if (self.udp_forwarder) |forwarder| {
-            forwarder.stop();
-            forwarder.destroy();
-            self.udp_forwarder = null;
-        }
+        // udp_forwarder is non-owning — main owns it (see UdpAttachment).
+        self.udp_forwarder = null;
         // Channel.deinit only frees its internal buffers — it does not close
         // the underlying stream (the caller owns it).
         self.channel.deinit();
@@ -1425,6 +1452,11 @@ const TunnelConnectionParams = struct {
     tunnel_client_slot: *?*TunnelClient, // Pointer to store the created client
     tunnel_clients_mutex: *std.Io.Mutex,
     cpu_index: ?usize,
+    /// Pointer to a list of UDP forwarder attachments owned by main. Read
+    /// under `tunnel_clients_mutex` on each (re)connect so the tunnel picks
+    /// up forwarders added after threads spawned. Null for tunnel indices
+    /// that don't own UDP forwarding (i.e., everything except tunnel 0).
+    udp_attachments: ?*std.ArrayListUnmanaged(*UdpAttachment) = null,
 };
 
 /// Tunnel connection thread with auto-reconnection
@@ -1512,11 +1544,35 @@ fn tunnelThreadWithReconnection(params_ptr: *TunnelConnectionParams) void {
         params.tunnel_client_slot.* = tunnel_client;
         params.tunnel_clients_mutex.unlock(global_io);
 
+        // (Re)attach UDP forwarders to this fresh tunnel client. Outbound
+        // routing reads `att.tunnel` atomically per-packet; inbound dispatch
+        // uses `tunnel_client.udp_forwarder` (set here, cleared on cleanup).
+        // The attachment list is owned by main and can grow over the
+        // process's lifetime — re-read it on every reconnect.
+        if (params.udp_attachments) |attachments_ptr| {
+            params.tunnel_clients_mutex.lockUncancelable(global_io);
+            for (attachments_ptr.items) |att| {
+                tunnel_client.udp_forwarder = att.forwarder;
+                att.tunnel.store(tunnel_client, .release);
+            }
+            params.tunnel_clients_mutex.unlock(global_io);
+        }
+
         // Reset retry delay on successful connection
         retry_delay_ms = params.cfg.advanced.reconnect_initial_delay_ms;
 
         // Run client (blocks until disconnection)
         tunnel_client.run();
+
+        // Detach UDP forwarders before tearing down the tunnel client. The
+        // forwarders themselves stay alive — main owns them.
+        if (params.udp_attachments) |attachments_ptr| {
+            params.tunnel_clients_mutex.lockUncancelable(global_io);
+            for (attachments_ptr.items) |att| {
+                att.tunnel.store(null, .release);
+            }
+            params.tunnel_clients_mutex.unlock(global_io);
+        }
 
         // Cleanup after disconnection
         params.tunnel_clients_mutex.lockUncancelable(global_io);
@@ -1762,6 +1818,23 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // UDP forwarder attachments shared across reconnects. Owned by main;
+    // tunnel-0's reconnection thread reads this list under
+    // `tunnel_clients_mutex` on every (re)connect to (re-)bind UDP routing
+    // (audit fix A-1 / plan P3-1).
+    var udp_attachments = std.ArrayListUnmanaged(*UdpAttachment).empty;
+    defer {
+        // Stop and free every forwarder + attachment we own. Tunnel threads
+        // have already exited at this point (their joins are above this
+        // defer in the cleanup ordering, see joinTunnelThreads paths).
+        for (udp_attachments.items) |att| {
+            att.forwarder.stop();
+            att.forwarder.destroy();
+            allocator.destroy(att);
+        }
+        udp_attachments.deinit(allocator);
+    }
+
     // Create connection parameters for each tunnel
     const tunnel_params = try allocator.alloc(TunnelConnectionParams, num_tunnels);
     defer allocator.free(tunnel_params);
@@ -1779,6 +1852,8 @@ pub fn main(init: std.process.Init) !void {
             .tunnel_client_slot = &tunnel_clients[i],
             .tunnel_clients_mutex = &tunnel_clients_mutex,
             .cpu_index = cpu_index,
+            // Only tunnel 0 owns UDP forwarding today.
+            .udp_attachments = if (i == 0) &udp_attachments else null,
         };
 
         // Spawn tunnel handler thread with reconnection
@@ -1790,6 +1865,12 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("[CLIENT] All tunnel threads started (reconnection: {})\n", .{cfg.advanced.reconnect_enabled});
     var shutdown_notice_printed = false;
+
+    // Track UDP forwarders created in multi-service mode so we can periodically
+    // prune expired sessions (otherwise UdpSessionManager grows unbounded under
+    // long-lived processes with churn).
+    var multi_service_udp_forwarders = std.ArrayListUnmanaged(*udp_client.UdpForwarder).empty;
+    defer multi_service_udp_forwarders.deinit(allocator);
 
     // Check if multi-service mode is enabled
     if (cfg.services.count() > 0) {
@@ -1845,20 +1926,35 @@ pub fn main(init: std.process.Init) !void {
 
                 if (loadTunnelClient(tunnel_clients, &tunnel_clients_mutex, 0)) |first_client| {
                     const effective_token = if (service.token.len > 0) service.token else cfg.token;
-                    // Create UDP forwarder for this service
+                    // Allocate attachment first; the forwarder needs its
+                    // address (used as opaque pointer in send_fn) at create.
+                    const att = try allocator.create(UdpAttachment);
+                    errdefer allocator.destroy(att);
+                    att.* = UdpAttachment.init(undefined);
+
                     const forwarder = try udp_client.UdpForwarder.create(
                         allocator,
                         global_io,
                         service.id,
                         service.address,
                         service.port,
-                        @ptrCast(first_client),
+                        @ptrCast(att),
                         sendTunnelPayload,
                         cfg.advanced.udp_timeout_seconds,
                     );
+                    att.forwarder = forwarder;
+                    att.tunnel.store(first_client, .release);
 
-                    // Store forwarder reference (for cleanup)
+                    // Register attachment so the tunnel-0 reconnection thread
+                    // re-binds it on every reconnect (audit fix A-1).
+                    tunnel_clients_mutex.lockUncancelable(global_io);
+                    udp_attachments.append(allocator, att) catch {};
+                    tunnel_clients_mutex.unlock(global_io);
+
+                    // Inbound dispatch on the current tunnel client.
                     first_client.udp_forwarder = forwarder;
+                    // Tracked separately for periodic session eviction.
+                    multi_service_udp_forwarders.append(allocator, forwarder) catch {};
 
                     // Send initial CONNECT message for UDP service
                     const stream_id = first_client.next_stream_id.fetchAdd(1, .acq_rel);
@@ -1879,12 +1975,22 @@ pub fn main(init: std.process.Init) !void {
 
         std.debug.print("\n[READY] All services ready. Press Ctrl+C to stop.\n\n", .{});
 
-        // Wait for shutdown signal
+        // Wait for shutdown signal. Tick every 250ms; once per second we run
+        // UDP session eviction across all forwarders (matches the legacy
+        // single-service path's behavior).
+        var udp_evict_counter: u8 = 0;
         while (!shutdown_flag.load(.acquire)) {
             processSignalNotifications(&shutdown_notice_printed);
             {
                 const ns = 250 * std.time.ns_per_ms;
                 Io.sleep(global_io, .fromNanoseconds(@intCast(ns)), .awake) catch {};
+            }
+            udp_evict_counter +%= 1;
+            if (udp_evict_counter >= 4) { // ~1s
+                udp_evict_counter = 0;
+                for (multi_service_udp_forwarders.items) |fwd| {
+                    fwd.cleanupExpiredSessions() catch {};
+                }
             }
         }
     } else if (default_transport == .udp) {
@@ -1902,18 +2008,30 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (loadTunnelClient(tunnel_clients, &tunnel_clients_mutex, 0)) |first_client| {
-            // Create one UDP forwarder per tunnel (each on same local port needs SO_REUSEPORT,
-            // but for simplicity, create just one forwarder for the first tunnel)
+            // Allocate attachment first; the forwarder needs its address as
+            // the opaque pointer used by send_fn at create time.
+            const att = try allocator.create(UdpAttachment);
+            errdefer allocator.destroy(att);
+            att.* = UdpAttachment.init(undefined);
+
             const forwarder = try udp_client.UdpForwarder.create(
                 allocator,
                 global_io,
                 default_service_id,
                 local_host,
                 local_port,
-                @ptrCast(first_client),
+                @ptrCast(att),
                 sendTunnelPayload,
                 cfg.advanced.udp_timeout_seconds,
             );
+            att.forwarder = forwarder;
+            att.tunnel.store(first_client, .release);
+
+            // Register attachment so the tunnel-0 reconnection thread re-binds
+            // it on every reconnect (audit fix A-1).
+            tunnel_clients_mutex.lockUncancelable(global_io);
+            udp_attachments.append(allocator, att) catch {};
+            tunnel_clients_mutex.unlock(global_io);
 
             first_client.udp_forwarder = forwarder;
 

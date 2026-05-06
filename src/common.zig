@@ -146,6 +146,27 @@ pub fn applyTcpOptions(handle: posix.fd_t, opts: TcpOptions) void {
     }
 }
 
+/// Apply a per-syscall send/recv timeout to a TCP fd. Used during proxy
+/// negotiation so a stalled proxy doesn't block the calling tunnel thread
+/// indefinitely (audit B-7). After the negotiation completes, the caller
+/// can clear the timeout (or leave it; the data plane uses poll-driven
+/// reads that don't trigger SO_RCVTIMEO until the kernel buffer is empty).
+pub fn applySocketTimeout(handle: posix.fd_t, timeout_seconds: u32) void {
+    const tv = std.c.timeval{
+        .sec = @intCast(timeout_seconds),
+        .usec = 0,
+    };
+    posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
+/// Clear per-syscall timeouts on a TCP fd (sets RCVTIMEO/SNDTIMEO to 0).
+pub fn clearSocketTimeout(handle: posix.fd_t) void {
+    const tv = std.c.timeval{ .sec = 0, .usec = 0 };
+    posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
 /// Tune socket buffers for high throughput.
 pub fn tuneSocketBuffers(handle: posix.fd_t, buffer_size: u32) void {
     const size: c_int = @intCast(buffer_size);

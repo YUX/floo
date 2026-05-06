@@ -104,18 +104,21 @@ pub const UdpSessionManager = struct {
         self.scratch_keys.deinit(self.allocator);
     }
 
-    /// Get or create session for a source address
+    /// Get or create session for a source address.
+    ///
+    /// Hot path on every inbound UDP datagram. The previous implementation did
+    /// `get(value-copy) → touch copy → put(re-hash)`, paying a full hash +
+    /// chain-walk + entry-replace on every packet. Now we mutate via `getPtr`
+    /// so the existing-session fast path is a single hash lookup.
     pub fn getOrCreate(self: *UdpSessionManager, source_addr: Io.net.IpAddress) !UdpSession {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         const key = SessionKey.initFromAddress(source_addr);
 
-        if (self.sessions.get(key)) |*session| {
-            var updated = session.*;
-            updated.touch();
-            try self.sessions.put(key, updated);
-            return updated;
+        if (self.sessions.getPtr(key)) |session_ptr| {
+            session_ptr.touch();
+            return session_ptr.*;
         }
 
         const stream_id = self.next_stream_id.fetchAdd(1, .monotonic);
@@ -127,13 +130,19 @@ pub const UdpSessionManager = struct {
         return session;
     }
 
-    /// Look up session by stream_id (for reverse lookup)
-    pub fn getByStreamId(self: *UdpSessionManager, stream_id: tunnel.StreamId) ?UdpSession {
+    /// Look up the source address for a stream_id. Returns the address by
+    /// value so the caller can take its address without aliasing into a
+    /// stack-local of *this* function (the previous `getByStreamId(...)
+    /// → ?UdpSession` shape encouraged callers to write
+    /// `&session.source_addr`, which silently aliased a copy of the
+    /// session's stack value here — fragile across refactors).
+    pub fn lookupSourceAddr(self: *UdpSessionManager, stream_id: tunnel.StreamId) ?Io.net.IpAddress {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
         const key = self.reverse_map.get(stream_id) orelse return null;
-        return self.sessions.get(key);
+        if (self.sessions.get(key)) |session| return session.source_addr;
+        return null;
     }
 
     /// Remove expired sessions
@@ -215,9 +224,10 @@ test "UdpSessionManager basic operations" {
     const session1_again = try manager.getOrCreate(addr1);
     try std.testing.expectEqual(session1.stream_id, session1_again.stream_id);
 
-    const found = manager.getByStreamId(session1.stream_id);
+    const found = manager.lookupSourceAddr(session1.stream_id);
     try std.testing.expect(found != null);
-    try std.testing.expectEqual(session1.stream_id, found.?.stream_id);
+    // Round-trip: the address we get back must be the one we registered.
+    try std.testing.expectEqual(@as(u16, 12345), found.?.ip4.port);
 
     try std.testing.expectEqual(@as(usize, 2), manager.count());
 }

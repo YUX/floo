@@ -490,6 +490,113 @@ fn stopAllReverseListeners(list: *std.ArrayListUnmanaged(*ReverseListener)) void
     list.clearRetainingCapacity();
 }
 
+/// Consolidated heartbeat ticker — one thread for the whole process, not one
+/// per active tunnel connection. Audit P1-4: with N concurrent clients on a
+/// 30s heartbeat interval, the previous design woke (N × 10) times/second
+/// (each thread sleeping in 100ms increments to honor shutdown) just to send
+/// 0.033 × N heartbeats/second. Now: one thread, one wakeup per 100ms,
+/// regardless of N.
+///
+/// Lifecycle: register on TunnelConnection.create when heartbeat is enabled;
+/// unregister on TunnelConnection.cleanup. The ticker thread is spawned
+/// lazily on the first registration and joined once at process shutdown
+/// (heartbeat_ticker.shutdown in main).
+///
+/// Concurrency: register / unregister / iteration all hold the same mutex.
+/// During iteration the ticker calls conn.channel.sendCopy under the lock,
+/// which prevents an unregister-and-destroy race (a conn unregistering
+/// blocks until any in-flight iteration that observed it completes). Cost:
+/// register / unregister are paused for the duration of one heartbeat
+/// dispatch round (microseconds in the common case, bounded by per-conn
+/// send_mutex contention in the worst case).
+const HeartbeatEntry = struct {
+    conn: *TunnelConnection,
+    elapsed_ms: u32,
+};
+
+const HeartbeatTicker = struct {
+    mutex: std.Io.Mutex = .init,
+    entries: std.ArrayListUnmanaged(HeartbeatEntry) = .empty,
+    thread: ?std.Thread = null,
+
+    fn ensureRunning(self: *HeartbeatTicker) !void {
+        // Caller holds mutex.
+        if (self.thread != null) return;
+        self.thread = try std.Thread.spawn(
+            .{ .stack_size = common.DEFAULT_THREAD_STACK },
+            tickerMain,
+            .{self},
+        );
+        std.debug.print("[HEARTBEAT] Ticker started\n", .{});
+    }
+
+    pub fn register(self: *HeartbeatTicker, conn: *TunnelConnection) !void {
+        self.mutex.lockUncancelable(global_io);
+        defer self.mutex.unlock(global_io);
+        try self.entries.append(global_allocator, .{ .conn = conn, .elapsed_ms = 0 });
+        try self.ensureRunning();
+    }
+
+    pub fn unregister(self: *HeartbeatTicker, conn: *TunnelConnection) void {
+        self.mutex.lockUncancelable(global_io);
+        defer self.mutex.unlock(global_io);
+        var i: usize = 0;
+        while (i < self.entries.items.len) : (i += 1) {
+            if (self.entries.items[i].conn == conn) {
+                _ = self.entries.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Join the ticker thread and free entry storage. Called once at
+    /// process shutdown after all TunnelConnections have been unregistered.
+    pub fn shutdownAndJoin(self: *HeartbeatTicker) void {
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        self.mutex.lockUncancelable(global_io);
+        defer self.mutex.unlock(global_io);
+        self.entries.deinit(global_allocator);
+    }
+
+    fn tickerMain(self: *HeartbeatTicker) void {
+        const tick_ms: u32 = 100;
+        while (!shutdown_flag.load(.acquire)) {
+            const ns = @as(u64, tick_ms) * std.time.ns_per_ms;
+            Io.sleep(global_io, .fromNanoseconds(@intCast(ns)), .awake) catch {};
+
+            // Iterate under lock so unregister can't pull the rug out
+            // mid-dispatch. sendCopy is held in the critical section,
+            // bounded by the per-conn channel send_mutex.
+            self.mutex.lockUncancelable(global_io);
+            for (self.entries.items) |*entry| {
+                entry.elapsed_ms +%= tick_ms;
+                if (entry.elapsed_ms >= entry.conn.heartbeat_interval_ms) {
+                    entry.elapsed_ms = 0;
+                    if (!entry.conn.running.load(.acquire)) continue;
+                    sendHeartbeatTo(entry.conn);
+                }
+            }
+            self.mutex.unlock(global_io);
+        }
+        std.debug.print("[HEARTBEAT] Ticker exiting\n", .{});
+    }
+};
+
+fn sendHeartbeatTo(conn: *TunnelConnection) void {
+    const timestamp = common.milliTimestamp();
+    const heartbeat_msg = tunnel.HeartbeatMsg{ .timestamp = timestamp };
+    var encode_buf: [16]u8 = undefined; // Heartbeat is 9 bytes
+    const encoded_len = heartbeat_msg.encodeInto(&encode_buf) catch return;
+    conn.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
+        std.debug.print("[HEARTBEAT] Send error to conn: {}\n", .{err});
+    };
+}
+
+var heartbeat_ticker: HeartbeatTicker = .{};
+
 /// Represents a forwarding stream (tunnel -> target)
 const Stream = struct {
     service_id: tunnel.ServiceId,
@@ -571,55 +678,12 @@ const TunnelConnection = struct {
 
     // Heartbeat support
     heartbeat_interval_ms: u32, // Heartbeat interval in milliseconds (0 = disabled)
-    heartbeat_thread: ?std.Thread, // Heartbeat sender thread
 
     // Stream ID allocation for reverse services
     next_stream_id: std.atomic.Value(u32),
 
     // Config reference for TCP tuning
     cfg: *const config.ServerConfig,
-
-    /// Heartbeat thread: periodically sends heartbeat messages to client
-    fn heartbeatThreadMain(self: *TunnelConnection) void {
-        std.debug.print("[HEARTBEAT] Thread started (interval: {}ms)\n", .{self.heartbeat_interval_ms});
-
-        while (self.running.load(.acquire)) {
-            // Sleep in 100ms increments to allow quick shutdown
-            const total_sleep_ms = self.heartbeat_interval_ms;
-            const sleep_increment_ms = 100;
-            var slept_ms: u32 = 0;
-
-            while (slept_ms < total_sleep_ms and self.running.load(.acquire)) {
-                const remaining_ms = total_sleep_ms - slept_ms;
-                const this_sleep_ms = @min(sleep_increment_ms, remaining_ms);
-                const ns = @as(u64, this_sleep_ms) * std.time.ns_per_ms;
-                Io.sleep(global_io, .fromNanoseconds(@intCast(ns)), .awake) catch {};
-                slept_ms += this_sleep_ms;
-            }
-
-            // Check if still running (may have been stopped during sleep)
-            if (!self.running.load(.acquire)) break;
-
-            // Send heartbeat message
-            const timestamp = common.milliTimestamp();
-            const heartbeat_msg = tunnel.HeartbeatMsg{ .timestamp = timestamp };
-
-            var encode_buf: [16]u8 = undefined; // Heartbeat is 9 bytes
-            const encoded_len = heartbeat_msg.encodeInto(&encode_buf) catch {
-                std.debug.print("[HEARTBEAT] Encode error\n", .{});
-                continue;
-            };
-
-            self.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
-                std.debug.print("[HEARTBEAT] Send error: {}\n", .{err});
-                // Continue trying even if send fails
-            };
-
-            tracePrint(enable_tunnel_trace, "[HEARTBEAT] Sent at timestamp {}\n", .{timestamp});
-        }
-
-        std.debug.print("[HEARTBEAT] Thread exiting\n", .{});
-    }
 
     fn create(allocator: std.mem.Allocator, tunnel_stream: Io.net.Stream, cfg: *const config.ServerConfig, static_keypair: std.crypto.dh.X25519.KeyPair) !*TunnelConnection {
         setSockOpts(tunnel_stream.socket.handle, cfg);
@@ -646,7 +710,6 @@ const TunnelConnection = struct {
             .udp_forwarder = null,
             .udp_service_id = null,
             .heartbeat_interval_ms = cfg.advanced.heartbeat_interval_seconds * 1000,
-            .heartbeat_thread = null,
             .next_stream_id = std.atomic.Value(u32).init(1),
             .cfg = cfg,
         };
@@ -679,16 +742,14 @@ const TunnelConnection = struct {
 
         stream_owned = false;
 
-        // Spawn heartbeat thread if enabled. On failure, fall back through the
-        // existing errdefers (channel_guard cleans up the channel, stream_owned
-        // is already false so we close the stream explicitly here, and the
-        // allocator.destroy(conn) errdefer cleans up the alloc).
+        // Register with the consolidated heartbeat ticker (P1-4). On
+        // failure, fall back through the existing errdefers (channel_guard,
+        // allocator.destroy(conn)).
         if (conn.heartbeat_interval_ms > 0) {
-            conn.heartbeat_thread = std.Thread.spawn(.{}, heartbeatThreadMain, .{conn}) catch |err| {
+            heartbeat_ticker.register(conn) catch |err| {
                 tunnel_stream.close(global_io);
                 return err;
             };
-            std.debug.print("[TUNNEL] Heartbeat enabled: sending every {} seconds\n", .{cfg.advanced.heartbeat_interval_seconds});
         }
 
         channel_guard = false;
@@ -708,7 +769,8 @@ const TunnelConnection = struct {
     }
 
     fn run(self: *TunnelConnection) void {
-        var buf: [256 * 1024]u8 align(64) = undefined; // 256KB for better batching
+        // Recv hot path reads directly into the decoder buffer via
+        // pendingTail/commitWrite — no intermediate stack buffer + memcpy.
         var decoder = protocol.FrameDecoder.init(global_allocator);
         defer decoder.deinit();
 
@@ -784,7 +846,15 @@ const TunnelConnection = struct {
                     .tunnel => {
                         if ((fd_info.revents & posix.POLL.IN) == 0) continue;
 
-                        const n = posix.read(self.tunnel_stream.socket.handle, &buf) catch |err| {
+                        // Zero-copy recv: read straight into the decoder's
+                        // internal buffer.
+                        const dst = decoder.pendingTail();
+                        if (dst.len == 0) {
+                            std.debug.print("[TUNNEL] Decoder buffer full; framing stalled\n", .{});
+                            fatal_error = true;
+                            break :loop;
+                        }
+                        const n = posix.read(self.tunnel_stream.socket.handle, dst) catch |err| {
                             std.debug.print("[TUNNEL] Recv error: {}\n", .{err});
                             fatal_error = true;
                             break :loop;
@@ -797,14 +867,9 @@ const TunnelConnection = struct {
                         }
 
                         tracePrint(enable_tunnel_trace, "[TUNNEL] Received {} bytes from client\n", .{n});
+                        decoder.commitWrite(n);
 
-                        decoder.feed(buf[0..n]) catch |err| {
-                            std.debug.print("[TUNNEL] Decoder feed error: {}\n", .{err});
-                            fatal_error = true;
-                            break :loop;
-                        };
-
-                        while (decoder.decode() catch null) |frame_payload| {
+                        while (decoder.decodeMut() catch null) |frame_payload| {
                             self.handleMessage(frame_payload) catch |err| {
                                 std.debug.print("[TUNNEL] Handle message error: {}\n", .{err});
                                 self.running.store(false, .release);
@@ -845,10 +910,10 @@ const TunnelConnection = struct {
         self.running.store(false, .release);
     }
 
-    fn handleMessage(self: *TunnelConnection, payload: []const u8) !void {
+    fn handleMessage(self: *TunnelConnection, payload: []u8) !void {
         if (payload.len == 0) return;
 
-        const message_slice = try self.channel.decryptFrame(payload);
+        const message_slice = try self.channel.decryptFrameInPlace(payload);
         if (message_slice.len == 0) return;
 
         const msg_type: tunnel.MessageType = @enumFromInt(message_slice[0]);
@@ -861,8 +926,10 @@ const TunnelConnection = struct {
                 // Connection established, stream thread will start forwarding
             },
             .connect => {
-                const connect_msg = try tunnel.ConnectMsg.decode(message_slice, global_allocator);
-                defer global_allocator.free(connect_msg.token);
+                // Hot-ish path (per accepted stream): zero-alloc decodeRef
+                // — handleConnect consumes the token synchronously
+                // (constant-time-compares against the configured token).
+                const connect_msg = try tunnel.ConnectMsg.decodeRef(message_slice);
 
                 tracePrint(enable_tunnel_trace, "[TUNNEL] CONNECT request: service_id={} stream_id={}\n", .{
                     connect_msg.service_id,
@@ -938,8 +1005,11 @@ const TunnelConnection = struct {
                 }
             },
             .udp_data => {
-                const udp_msg = try tunnel.UdpDataMsg.decode(message_slice, global_allocator);
-                defer global_allocator.free(udp_msg.source_addr);
+                // Hot path: decodeRef avoids the per-packet alloc+memcpy of
+                // source_addr. Slices are valid until the next decoder feed,
+                // and handleUdpData consumes synchronously (copies into the
+                // session's [16]u8 source_addr field on insert).
+                const udp_msg = try tunnel.UdpDataMsg.decodeRef(message_slice);
 
                 if (self.udp_forwarder) |forwarder| {
                     forwarder.handleUdpData(udp_msg) catch |err| {
@@ -951,8 +1021,7 @@ const TunnelConnection = struct {
             },
             .connect_error => {
                 // REVERSE MODE: Client failed to connect to local target
-                const err_msg = try tunnel.ConnectErrorMsg.decode(message_slice, global_allocator);
-                defer global_allocator.free(err_msg.error_msg);
+                const err_msg = try tunnel.ConnectErrorMsg.decodeRef(message_slice);
                 std.debug.print("[TUNNEL-REVERSE] CONNECT_ERROR from client: stream_id={} error={s}\n", .{ err_msg.stream_id, err_msg.error_msg });
 
                 const key = StreamKey{ .service_id = err_msg.service_id, .stream_id = err_msg.stream_id };
@@ -1180,14 +1249,24 @@ const TunnelConnection = struct {
     }
 
     fn cleanup(self: *TunnelConnection) void {
-        // Stop heartbeat thread first
-        if (self.heartbeat_thread) |thread| {
-            self.running.store(false, .release); // Signal thread to stop
-            thread.join();
-            self.heartbeat_thread = null;
+        // Detach from the consolidated heartbeat ticker. Blocks briefly if a
+        // dispatch round is in flight; once unregister returns, no future
+        // tick will dispatch to this conn (audit P1-4).
+        if (self.heartbeat_interval_ms > 0) {
+            heartbeat_ticker.unregister(self);
         }
 
-        // Stop and release all streams without holding the mutex during blocking calls
+        // Drain the streams map one entry at a time: pop under the lock, then
+        // call blocking stop()+releaseRef without holding it.
+        //
+        // Invariant (B-14): once `running == false`, no thread inserts new
+        // streams. The producers of `self.streams.put` are:
+        //   - handleConnect / handleMessage on the run() loop (exits when
+        //     running == false)
+        //   - ReverseListener.acceptorThread (checks running every loop)
+        //   - reverseServiceListener (checks running every loop)
+        // All check `running` before insert. So the iterative pop here
+        // converges; concurrent inserts during teardown are not observed.
         while (true) {
             self.streams_mutex.lockUncancelable(global_io);
             var iter = self.streams.iterator();
@@ -1416,6 +1495,13 @@ pub fn main(init: std.process.Init) !void {
             entry.conn.destroy();
         }
         connections.deinit(allocator);
+
+        // Now that every TunnelConnection has been destroyed (and therefore
+        // unregistered from the ticker via cleanup()), join the ticker
+        // thread so it isn't holding any conn pointers when main exits.
+        // shutdown_flag has already been set by the signal handler — the
+        // ticker observes it on its next 100ms tick and exits.
+        heartbeat_ticker.shutdownAndJoin();
     }
 
     // Accept loop with rate limiting to prevent connection flood attacks

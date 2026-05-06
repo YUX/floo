@@ -6,7 +6,7 @@
 
 bind = "0.0.0.0"
 port = 8443
-cipher = "aes256gcm"
+cipher = "aegis128l"
 psk = "REPLACE_ME"      # ⚠️ Replace or server will refuse to start!
 token = "REPLACE_ME"    # ⚠️ Replace or server will refuse to start!
 

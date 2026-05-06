@@ -70,18 +70,28 @@ pub const UdpForwarder = struct {
 
     pub fn stop(self: *UdpForwarder) void {
         self.running.store(false, .release);
-        var to_close = std.ArrayListUnmanaged(tunnel.StreamId).empty;
-        defer to_close.deinit(self.allocator);
 
-        self.sessions_mutex.lockUncancelable(self.io);
-        var iter = self.sessions.keyIterator();
-        while (iter.next()) |key_ptr| {
-            if (to_close.append(self.allocator, key_ptr.*)) |_| {} else |_| break;
-        }
-        self.sessions_mutex.unlock(self.io);
+        // Pop one session at a time under the lock. This avoids:
+        //   - The audit's B-5 leak: previously an OOM in the snapshot
+        //     ArrayList.append broke the loop and abandoned the
+        //     remaining sessions' threads + sockets.
+        //   - The B-4 race: any session created between the old
+        //     snapshot-collect and remove-loop was missed; now sessions
+        //     created concurrently are observed on the next iteration.
+        // The cost is one mutex acquire per session instead of one for
+        // the whole snapshot — fine for shutdown.
+        while (true) {
+            self.sessions_mutex.lockUncancelable(self.io);
+            var iter = self.sessions.keyIterator();
+            const next_key = iter.next();
+            const stream_id_opt = if (next_key) |k| k.* else null;
+            self.sessions_mutex.unlock(self.io);
 
-        for (to_close.items) |stream_id| {
-            self.removeSession(stream_id, false);
+            if (stream_id_opt) |stream_id| {
+                self.removeSession(stream_id, false);
+            } else {
+                break;
+            }
         }
     }
 
@@ -110,28 +120,36 @@ pub const UdpForwarder = struct {
         source_port: u16,
         now: i64,
     ) !*Session {
-        self.sessions_mutex.lockUncancelable(self.io);
-        if (self.sessions.get(stream_id)) |session| {
+        // Fast path: session already exists.
+        {
+            self.sessions_mutex.lockUncancelable(self.io);
             defer self.sessions_mutex.unlock(self.io);
-            if (session.source_addr_len != source_addr.len or
-                session.source_port != source_port or
-                !std.mem.eql(u8, session.source_addr[0..session.source_addr_len], source_addr))
-            {
-                return error.UdpForwarderBusy;
+            if (self.sessions.get(stream_id)) |session| {
+                if (session.source_addr_len != source_addr.len or
+                    session.source_port != source_port or
+                    !std.mem.eql(u8, session.source_addr[0..session.source_addr_len], source_addr))
+                {
+                    return error.UdpForwarderBusy;
+                }
+                return session;
             }
-            return session;
         }
-        self.sessions_mutex.unlock(self.io);
 
-        // Bind an ephemeral local UDP socket on the same address family as the target.
+        // Slow path: bind + spawn outside the lock (these can take µs–ms each).
+        // Two callers with the same stream_id can both reach this point and
+        // both create a session; the late-arriver detects the race below and
+        // tears its duplicate down. AutoHashMap.put would otherwise silently
+        // overwrite the loser, leaking its socket and recv thread.
         const ephemeral: Io.net.IpAddress = switch (self.target_addr) {
             .ip4 => .{ .ip4 = Io.net.Ip4Address.unspecified(0) },
             .ip6 => .{ .ip6 = Io.net.Ip6Address.unspecified(0) },
         };
         const sock = try ephemeral.bind(self.io, .{ .mode = .dgram });
-        errdefer sock.close(self.io);
 
-        const session = try self.allocator.create(Session);
+        const session = self.allocator.create(Session) catch |err| {
+            sock.close(self.io);
+            return err;
+        };
         session.* = .{
             .stream_id = stream_id,
             .socket = sock,
@@ -153,7 +171,24 @@ pub const UdpForwarder = struct {
             return err;
         };
 
+        // Race-safe insert: re-check under the lock, install if free, otherwise
+        // tear down our duplicate and return the winner (or error on mismatch).
         self.sessions_mutex.lockUncancelable(self.io);
+        if (self.sessions.get(stream_id)) |existing| {
+            self.sessions_mutex.unlock(self.io);
+            session.running.store(false, .release);
+            _ = posix.system.shutdown(session.socket.handle, posix.SHUT.RD);
+            session.thread.join();
+            session.socket.close(self.io);
+            self.allocator.destroy(session);
+            if (existing.source_addr_len != source_addr.len or
+                existing.source_port != source_port or
+                !std.mem.eql(u8, existing.source_addr[0..existing.source_addr_len], source_addr))
+            {
+                return error.UdpForwarderBusy;
+            }
+            return existing;
+        }
         self.sessions.put(stream_id, session) catch |err| {
             self.sessions_mutex.unlock(self.io);
             session.running.store(false, .release);

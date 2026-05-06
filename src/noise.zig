@@ -117,6 +117,52 @@ test "CipherType.fromString parses AEGIS-256 variants" {
     try std.testing.expectEqual(@as(usize, 32), CipherType.aegis256x4.nonceLen());
 }
 
+// In-place decryption: pass the same buffer as both ciphertext source and
+// plaintext destination (sliced to drop the tag). Verifies that the
+// std.crypto AEAD implementation reads each ciphertext byte before
+// overwriting it. If this test ever fails for a cipher, the channel
+// layer's decrypt-in-place hot path must NOT be used for that cipher.
+test "AEAD decrypt is safe in-place across all cipher types" {
+    const types = [_]CipherType{
+        .chacha20poly1305,
+        .aes256gcm,
+        .aes128gcm,
+        .aegis128l,
+        .aegis128x2,
+        .aegis128x4,
+        .aegis256,
+        .aegis256x2,
+        .aegis256x4,
+    };
+
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x42);
+
+    const plaintext_in = "in-place AEAD decryption regression vector — abcdefghijklmnopqrstuvwxyz0123456789";
+
+    inline for (types) |ct_type| {
+        var cipher_enc = TransportCipher.init(key, ct_type);
+        var cipher_dec_oop = TransportCipher.init(key, ct_type); // out-of-place decryptor
+        var cipher_dec_in = TransportCipher.init(key, ct_type); // in-place decryptor
+
+        // Encrypt into a fresh buffer so we know the ciphertext.
+        const ct_len = plaintext_in.len + TAG_LEN;
+        var ct_buf: [200]u8 = undefined;
+        try cipher_enc.encrypt(plaintext_in, ct_buf[0..ct_len]);
+
+        // Out-of-place decrypt as the reference.
+        var pt_oop: [plaintext_in.len]u8 = undefined;
+        try cipher_dec_oop.decrypt(ct_buf[0..ct_len], &pt_oop);
+        try std.testing.expectEqualSlices(u8, plaintext_in, &pt_oop);
+
+        // In-place decrypt: source and dest alias the same backing storage.
+        var ct_alias: [200]u8 = undefined;
+        @memcpy(ct_alias[0..ct_len], ct_buf[0..ct_len]);
+        try cipher_dec_in.decrypt(ct_alias[0..ct_len], ct_alias[0..plaintext_in.len]);
+        try std.testing.expectEqualSlices(u8, plaintext_in, ct_alias[0..plaintext_in.len]);
+    }
+}
+
 /// Cipher type for Noise transport
 pub const CipherType = enum {
     chacha20poly1305,
@@ -153,6 +199,24 @@ pub const CipherType = enum {
 
 pub const KEY_LEN = 32;
 pub const TAG_LEN = 16;
+
+// Compile-time guarantee that every AEAD we wire into TransportCipher emits a
+// 16-byte authentication tag. The encrypt/decrypt paths slice off exactly
+// `TAG_LEN` bytes of tag from the ciphertext layout; if std.crypto ever ships
+// a variant where `tag_length` differs, this build-time check fails before
+// silent truncation can leak ciphertext bytes into the tag region.
+comptime {
+    const aead = crypto.aead;
+    if (aead.chacha_poly.ChaCha20Poly1305.tag_length != TAG_LEN) @compileError("ChaCha20Poly1305 tag_length != TAG_LEN");
+    if (aead.aes_gcm.Aes256Gcm.tag_length != TAG_LEN) @compileError("Aes256Gcm tag_length != TAG_LEN");
+    if (aead.aes_gcm.Aes128Gcm.tag_length != TAG_LEN) @compileError("Aes128Gcm tag_length != TAG_LEN");
+    if (aead.aegis.Aegis128L.tag_length != TAG_LEN) @compileError("Aegis128L tag_length != TAG_LEN");
+    if (aead.aegis.Aegis128X2.tag_length != TAG_LEN) @compileError("Aegis128X2 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis128X4.tag_length != TAG_LEN) @compileError("Aegis128X4 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis256.tag_length != TAG_LEN) @compileError("Aegis256 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis256X2.tag_length != TAG_LEN) @compileError("Aegis256X2 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis256X4.tag_length != TAG_LEN) @compileError("Aegis256X4 tag_length != TAG_LEN");
+}
 // Force reconnection before theoretical nonce limit to prevent wraparound
 // 2^40 (~1.1 trillion messages) provides 256x safety margin before 2^48 limit
 pub const MAX_NONCE = 0xFFFFFFFFFF; // 2^40 - 1
@@ -741,10 +805,15 @@ pub fn noiseXXHandshake(
 
     // Generate ephemeral keypair (static keypair is provided)
     const e_keypair = X25519.KeyPair.generate(io);
+    // Zeroize ephemeral private key on every exit path. Stack frames
+    // otherwise persist after return until overwritten by later calls,
+    // leaving session-key material in memory across the channel's lifetime.
+    defer crypto.secureZero(u8, @constCast(&e_keypair.secret_key));
     const s_keypair = static_keypair;
 
     // Initialize Noise state
     var chaining_key: [HASH_LEN]u8 = undefined;
+    defer crypto.secureZero(u8, &chaining_key);
     var h: [HASH_LEN]u8 = undefined;
 
     // h = HASH(protocol_name) - build based on actual cipher
@@ -792,9 +861,11 @@ pub fn noiseXXHandshake(
 
         // ee - MixKey(dh_ee): Updates ck and derives temp_k from DH output
         const dh_ee = X25519.scalarmult(e_keypair.secret_key, re.*) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_ee));
 
         // Decrypt rs
         var temp_k: [KEY_LEN]u8 = undefined;
+        defer crypto.secureZero(u8, &temp_k);
         var rs: [DH_LEN]u8 = undefined;
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_ee);
 
@@ -818,6 +889,7 @@ pub fn noiseXXHandshake(
 
         // es - MixKey(dh_es): Updates ck and derives temp_k from DH output
         const dh_es = X25519.scalarmult(e_keypair.secret_key, rs) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_es));
 
         // Verify empty payload tag from msg2
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_es);
@@ -858,6 +930,7 @@ pub fn noiseXXHandshake(
 
         // se - MixKey(dh_se): Updates ck and derives temp_k from DH output
         const dh_se = X25519.scalarmult(s_keypair.secret_key, re.*) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_se));
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_se);
 
         // Encrypt empty payload (using temp_k from se operation)
@@ -887,6 +960,10 @@ pub fn noiseXXHandshake(
             .send_cipher = TransportCipher.init(key1, cipher_type),
             .recv_cipher = TransportCipher.init(key2, cipher_type),
         };
+        // TransportCipher.init copied the keys into its own state — wipe
+        // local copies before continuing into the PSK auth exchange.
+        crypto.secureZero(u8, &key1);
+        crypto.secureZero(u8, &key2);
 
         const handshake_hash: []const u8 = h[0..];
         const local_tag = computeAuthTag(psk, handshake_hash, 'I');
@@ -928,7 +1005,9 @@ pub fn noiseXXHandshake(
 
         // ee - MixKey(dh_ee): Updates ck and derives temp_k from DH output
         const dh_ee = X25519.scalarmult(e_keypair.secret_key, re) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_ee));
         var temp_k: [KEY_LEN]u8 = undefined;
+        defer crypto.secureZero(u8, &temp_k);
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_ee);
 
         // Encrypt s (using temp_k from ee operation)
@@ -952,6 +1031,7 @@ pub fn noiseXXHandshake(
 
         // es - MixKey(dh_es): Updates ck and derives temp_k from DH output
         const dh_es = X25519.scalarmult(s_keypair.secret_key, re) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_es));
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_es);
 
         // Encrypt empty payload (using temp_k from es operation)
@@ -1007,6 +1087,7 @@ pub fn noiseXXHandshake(
 
         // se - MixKey(dh_se): Updates ck and derives temp_k from DH output
         const dh_se = X25519.scalarmult(e_keypair.secret_key, rs) catch return error.DHFailed;
+        defer crypto.secureZero(u8, @constCast(&dh_se));
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_se);
 
         // Decrypt empty payload (verify tag using temp_k from se operation)
@@ -1031,6 +1112,10 @@ pub fn noiseXXHandshake(
             .send_cipher = TransportCipher.init(key2, cipher_type),
             .recv_cipher = TransportCipher.init(key1, cipher_type),
         };
+        // TransportCipher.init copied the keys into its own state — wipe
+        // local copies before continuing into the PSK auth exchange.
+        crypto.secureZero(u8, &key1);
+        crypto.secureZero(u8, &key2);
 
         const handshake_hash: []const u8 = h[0..];
         var peer_tag_buf: [HASH_LEN]u8 = undefined;

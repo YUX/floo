@@ -32,10 +32,10 @@ server = "your-vps-hostname.com:8443"
 # ----------------------------------------------------------------------------
 
 # Cipher: MUST match the server's cipher setting
-#   - aes256gcm (recommended): Fast on modern CPUs with AES-NI
-#   - aegis128l: Fastest on ARMv8+ and modern x86 (22+ Gbps)
+#   - aegis128l (default, recommended): Fastest on ARMv8+ and modern x86 (22+ Gbps)
+#   - aes256gcm: Compatible default with AES-NI hardware
 #   - chacha20poly1305: Best for older CPUs without AES-NI
-cipher = "aes256gcm"
+cipher = "aegis128l"
 
 # PSK (Pre-Shared Key): MUST match server exactly!
 # Get this from your server administrator
