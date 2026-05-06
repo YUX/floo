@@ -205,6 +205,32 @@ pub fn recvAll(reader: *Io.Reader, buffer: []u8) !void {
     return reader.readSliceAll(buffer);
 }
 
+/// Write all bytes to a raw socket handle, looping over partial writes.
+///
+/// Used on the data-forwarding hot path where we hold a Stream's underlying
+/// fd and don't want to set up a per-send Writer just to issue one syscall.
+/// libc's write() is the consistent cross-platform path since the project
+/// links libc (see build.zig). Returns error.ConnectionClosed on EOF/EPIPE.
+pub fn writeAllToHandle(handle: posix.fd_t, data: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const remaining = data[offset..];
+        const n = std.c.write(handle, remaining.ptr, remaining.len);
+        if (n < 0) {
+            const errno = std.posix.errno(n);
+            switch (errno) {
+                .INTR => continue,
+                .AGAIN => continue,
+                .PIPE => return error.ConnectionClosed,
+                .CONNRESET => return error.ConnectionClosed,
+                else => return error.WriteFailed,
+            }
+        }
+        if (n == 0) return error.ConnectionClosed;
+        offset += @intCast(n);
+    }
+}
+
 // ============================================================================
 // Connection Rate Limiting
 // ============================================================================
