@@ -37,43 +37,17 @@ var tunnel_tx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var tunnel_rx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var flush_stats_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var sighup_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-var signal_pipe_read_fd: std.atomic.Value(posix.fd_t) = std.atomic.Value(posix.fd_t).init(-1);
-var signal_pipe_write_fd: std.atomic.Value(posix.fd_t) = std.atomic.Value(posix.fd_t).init(-1);
 var tunnel_cpu_assigner: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var tunnel_cpu_cache: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
-fn setupSignalPipe() !void {
-    // Zig 0.16: posix.pipe2 was removed. The signal pipe was a self-pipe
-    // optimization to wake the main accept loop's poll() promptly on signal.
-    // Without it, signals still set shutdown_flag and the next poll iteration
-    // (1s timeout) picks it up — acceptable shutdown latency for a tunnel.
-    if (builtin.target.os.tag == .windows) return;
-}
-
-fn cleanupSignalPipe() void {
-    if (builtin.target.os.tag == .windows) return;
-    const rd = signal_pipe_read_fd.swap(-1, .acq_rel);
-    if (rd != -1) _ = posix.system.close(rd);
-    const wr = signal_pipe_write_fd.swap(-1, .acq_rel);
-    if (wr != -1) _ = posix.system.close(wr);
-}
-
-fn drainSignalPipe() void {
-    const rd = signal_pipe_read_fd.load(.acquire);
-    if (rd == -1) return;
-
-    var buf: [32]u8 = undefined;
-    while (true) {
-        const result = posix.read(rd, buf[0..]) catch return;
-        if (result == 0) return;
-    }
-}
-
+// Signal-pipe stubs (kept as no-ops so call sites in main don't have to gate).
+// Zig 0.16 removed posix.pipe2; the self-pipe optimization is gone. Signals
+// now just set atomic flags that the next 1s poll iteration picks up.
+fn setupSignalPipe() !void {}
+fn cleanupSignalPipe() void {}
+fn drainSignalPipe() void {}
 fn notifySignalPipe(sig: c_int) void {
-    const wr = signal_pipe_write_fd.load(.acquire);
-    if (wr == -1) return;
-    var byte = [_]u8{@intCast(@as(u8, @intCast(sig & 0xFF)))};
-    _ = posix.system.write(wr, &byte, 1);
+    _ = sig;
 }
 
 fn clientCpuCountCached() usize {

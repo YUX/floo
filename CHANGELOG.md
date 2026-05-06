@@ -2,6 +2,76 @@
 
 All notable changes to Floo will be documented in this file.
 
+## [0.2.0] - 2026-05-06
+
+### Changed (Zig 0.16 migration)
+- **Targets Zig 0.16.0 stable** (was 0.16.0-dev / master tracking).
+  `minimum_zig_version` bumped accordingly.
+- Migrated the entire I/O surface to `std.Io`. The audit-time medium-level
+  `std.posix.*` socket/file wrappers (close, recv, send, socket, bind,
+  listen, accept, connect, writev, recvfrom, sendto, fcntl, pipe2,
+  shutdown, socketpair) were removed in 0.16.
+  - TCP uses `std.Io.net.Server` + `std.Io.net.Stream`.
+  - UDP uses `std.Io.net.Socket` + `IncomingMessage` (no more manual
+    sockaddr juggling for source addresses).
+  - Filesystem uses `std.Io.Dir.cwd().readFileAlloc(io, ...)`.
+  - Mutexes are `std.Io.Mutex` with `lockUncancelable(io)`.
+- Retired `src/net_compat.zig` shim (~170 lines); callers use
+  `std.Io.net.IpAddress` directly.
+- `pub fn main()` takes `std.process.Init` and uses the gpa + io
+  provided by `start.zig` (DebugAllocator in debug, smp_allocator in
+  release).
+- Process arg handling moved from `process.argsAlloc` to
+  `process.Args.Iterator`.
+- Allocator pattern: `GeneralPurposeAllocator` → `DebugAllocator`
+  (debug, with leak tracking) and `smp_allocator` (release, lock-free).
+- CI workflows pinned to `version: 0.16.0` (was `master`).
+
+### Performance
+- Hot data path bypasses the buffered `Stream.Writer` interface and
+  calls `std.c.writev` directly (one syscall per length-prefixed frame,
+  matching the pre-migration scatter-gather semantics). The audit-noted
+  3× regression from the buffered writer was largely recovered:
+  - aes-256-gcm: +53% multi-stream
+  - aes-128-gcm: +46% multi-stream
+  - aegis-256: +71% multi-stream
+  - plaintext: +26% multi-stream
+- Throughput is now within ~30% of the v0.1.5 README baseline (host
+  noise on this machine accounts for some of the gap; remaining headroom
+  is in `Io.Mutex` futex paths vs the original `pthread_mutex_t`).
+
+### Fixed
+- **Reverse-mode multi-stream race**: `addr.listen(.reuse_address=true)`
+  sets BOTH SO_REUSEADDR and SO_REUSEPORT on POSIX. SO_REUSEPORT load-
+  balances new connections across all listeners on the same port — and
+  during the floo server's reverse-listener rebind (one tunnel handing
+  off to another), the kernel briefly routed connections to the
+  soon-to-die listener, getting them reset. Fixed by constructing the
+  reverse listener via raw libc `socket + setsockopt(SO_REUSEADDR) +
+  bind + listen` (new `common.bindListener`).
+- **LocalConnection / Stream ref-counting leak**: the old pattern was
+  `create()→ref=1, acquireRef()→ref=2, put(map)`, where only ONE ref
+  was ever released (creation ref leaked → small per-connection memory
+  leak). Surfaced by 0.16's `DebugAllocator`. Fixed by treating the
+  create ref AS the map ref; no extra `acquireRef` before `put`.
+- `TunnelConnection.create` heartbeat-spawn error path had an
+  `errdefer allocator.destroy(conn)` AND an explicit
+  `allocator.destroy(conn)` — double-free on `Thread.spawn` failure.
+- `RateLimiter.tryAcquire` no longer short-circuits in Debug mode (the
+  zig compiler bug it worked around is fixed; the bypass was a footgun
+  for tests).
+- `diagnostics.zig` no longer writes to a hardcoded `/tmp/floo_profile.log`
+  (audit-flagged smell + std.fs.createFileAbsolute removed in 0.16).
+
+### Removed
+- `src/net_compat.zig` (replaced by `std.Io.net.IpAddress`).
+- Self-pipe signal-wake mechanism (posix.pipe2 was removed in 0.16).
+  Signals still set atomic flags; the 1s poll iteration picks them up,
+  giving up to 1s shutdown latency vs the old sub-millisecond.
+- Inline `forwardLocalData`/`forwardTargetData` tests (depended on
+  `posix.socketpair` and `common.sendAllToFd`, both gone in 0.16).
+  Coverage will return via an integration test harness.
+
 ## [0.1.5] - 2025-11-19
 
 ### Changed

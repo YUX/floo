@@ -34,31 +34,16 @@ var tunnel_tx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var tunnel_rx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var flush_stats_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var sighup_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-var signal_pipe_read_fd: std.atomic.Value(posix.fd_t) = std.atomic.Value(posix.fd_t).init(-1);
-var signal_pipe_write_fd: std.atomic.Value(posix.fd_t) = std.atomic.Value(posix.fd_t).init(-1);
 var cpu_assigner: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var cached_cpu_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
-fn setupSignalPipe() !void {
-    // Zig 0.16: posix.pipe2 was removed. The signal pipe was a self-pipe
-    // optimization to wake the main accept loop's poll() promptly on signal.
-    // Without it, signals still set shutdown_flag and the next poll iteration
-    // (1s timeout) picks it up — acceptable shutdown latency for a tunnel.
-    // Kept the FD-state globals as -1 sentinels so the rest of the code can
-    // remain unchanged.
-    if (builtin.target.os.tag == .windows) return;
-}
-
-fn cleanupSignalPipe() void {
-    // No-op: signal pipe was dropped during 0.16 migration. See setupSignalPipe.
-}
-
-fn drainSignalPipe() void {
-    // No-op: signal pipe was dropped during 0.16 migration. See setupSignalPipe.
-}
-
+// Signal-pipe stubs (kept as no-ops so call sites in main don't have to gate).
+// Zig 0.16 removed posix.pipe2; the self-pipe optimization is gone. Signals
+// now just set atomic flags that the next 1s poll iteration picks up.
+fn setupSignalPipe() !void {}
+fn cleanupSignalPipe() void {}
+fn drainSignalPipe() void {}
 fn notifySignalPipe(sig: c_int) void {
-    // No-op: signal pipe was dropped during 0.16 migration. See setupSignalPipe.
     _ = sig;
 }
 
@@ -1473,25 +1458,10 @@ pub fn main(init: std.process.Init) !void {
         // The Io.net.Server doesn't expose a poll-then-accept pattern, so we
         // poll on the underlying handle and then call Server.accept which
         // returns immediately because data is ready.
-        var poll_buf: [2]posix.pollfd = undefined;
-        var poll_count: usize = 1;
+        var poll_buf: [1]posix.pollfd = undefined;
         poll_buf[0] = .{ .fd = server.socket.handle, .events = posix.POLL.IN, .revents = 0 };
-        const signal_fd = signal_pipe_read_fd.load(.acquire);
-        if (signal_fd != -1) {
-            poll_count = 2;
-            poll_buf[1] = .{ .fd = signal_fd, .events = posix.POLL.IN, .revents = 0 };
-        } else {
-            poll_count = 1;
-        }
 
-        const ready = posix.poll(poll_buf[0..poll_count], 1000) catch continue; // 1s timeout
-
-        if (signal_fd != -1) {
-            const signal_events = poll_buf[1].revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR);
-            if (signal_events != 0) {
-                drainSignalPipe();
-            }
-        }
+        const ready = posix.poll(&poll_buf, 1000) catch continue; // 1s timeout
 
         if (ready == 0) continue; // Timeout, check flags
         if ((poll_buf[0].revents & posix.POLL.IN) == 0) continue;
