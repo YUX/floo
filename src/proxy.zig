@@ -132,6 +132,11 @@ const SOCKS5_ADDR_IPV4: u8 = 0x01;
 const SOCKS5_ADDR_DOMAIN: u8 = 0x03;
 const SOCKS5_ADDR_IPV6: u8 = 0x04;
 
+/// Per-syscall timeout applied during proxy negotiation. A misbehaving
+/// proxy that accepts the TCP connect but never replies would otherwise
+/// block the calling tunnel thread until the kernel TCP timeout (minutes).
+const PROXY_NEGOTIATION_TIMEOUT_SEC: u32 = 30;
+
 /// Connect to target through SOCKS5 proxy. Returns a connected Stream
 /// that has finished its negotiation; caller wraps it in their own
 /// Reader/Writer for subsequent traffic.
@@ -148,6 +153,11 @@ pub fn connectViaSocks5(
     const proxy_addr = try common.resolveHostPort(io, proxy_host, proxy_port);
     var stream = try proxy_addr.connect(io, .{ .mode = .stream });
     errdefer stream.close(io);
+
+    // Bound every read/write during negotiation; cleared before return so
+    // the data plane runs without per-syscall timeouts (audit B-7).
+    common.applySocketTimeout(stream.socket.handle, PROXY_NEGOTIATION_TIMEOUT_SEC);
+    defer common.clearSocketTimeout(stream.socket.handle);
 
     // Build temporary buffered reader/writer for the negotiation. Sized for the
     // maximum negotiation message (SOCKS5 auth = 515 bytes).
@@ -320,6 +330,11 @@ pub fn connectViaHttpConnect(
     const proxy_addr = try common.resolveHostPort(io, proxy_host, proxy_port);
     var stream = try proxy_addr.connect(io, .{ .mode = .stream });
     errdefer stream.close(io);
+
+    // Bound every read/write during negotiation; cleared before return so
+    // the data plane runs without per-syscall timeouts (audit B-7).
+    common.applySocketTimeout(stream.socket.handle, PROXY_NEGOTIATION_TIMEOUT_SEC);
+    defer common.clearSocketTimeout(stream.socket.handle);
 
     // Note: we do NOT use a buffered reader for the response. A buffered
     // reader can over-read past `\r\n\r\n` into bytes that belong to the
