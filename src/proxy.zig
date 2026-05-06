@@ -1,10 +1,6 @@
 const std = @import("std");
-const posix = std.posix;
-const net = @import("net_compat.zig");
+const Io = std.Io;
 const common = @import("common.zig");
-
-const sendAllToFd = common.sendAllToFd;
-const recvAllFromFd = common.recvAllFromFd;
 
 /// Proxy type for client connections
 pub const ProxyType = enum {
@@ -114,9 +110,11 @@ const SOCKS5_ADDR_IPV4: u8 = 0x01;
 const SOCKS5_ADDR_DOMAIN: u8 = 0x03;
 const SOCKS5_ADDR_IPV6: u8 = 0x04;
 
-/// Connect to target through SOCKS5 proxy
-/// Returns a connected file descriptor
+/// Connect to target through SOCKS5 proxy. Returns a connected Stream
+/// that has finished its negotiation; caller wraps it in their own
+/// Reader/Writer for subsequent traffic.
 pub fn connectViaSocks5(
+    io: Io,
     _: std.mem.Allocator,
     proxy_host: []const u8,
     proxy_port: u16,
@@ -124,13 +122,19 @@ pub fn connectViaSocks5(
     proxy_password: []const u8,
     target_host: []const u8,
     target_port: u16,
-) !posix.fd_t {
-    // Connect to proxy server
-    const proxy_addr = try net.Address.resolveIp(proxy_host, proxy_port);
-    const fd = try posix.socket(proxy_addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(fd);
+) !Io.net.Stream {
+    const proxy_addr = try common.resolveHostPort(io, proxy_host, proxy_port);
+    var stream = try proxy_addr.connect(io, .{});
+    errdefer stream.close(io);
 
-    try posix.connect(fd, &proxy_addr.any, proxy_addr.getOsSockLen());
+    // Build temporary buffered reader/writer for the negotiation. Sized for the
+    // maximum negotiation message (SOCKS5 auth = 515 bytes).
+    var rbuf: [1024]u8 = undefined;
+    var wbuf: [1024]u8 = undefined;
+    var rdr = stream.reader(io, &rbuf);
+    var wtr = stream.writer(io, &wbuf);
+    const reader = &rdr.interface;
+    const writer = &wtr.interface;
 
     // SOCKS5 greeting - negotiate authentication method
     const has_auth = proxy_username.len > 0;
@@ -148,11 +152,12 @@ pub fn connectViaSocks5(
         break :blk greeting_buf[0..3];
     };
 
-    try sendAllToFd(fd, greeting);
+    try writer.writeAll(greeting);
+    try writer.flush();
 
     // Read authentication method choice
     var method_response: [2]u8 = undefined;
-    try recvAllFromFd(fd, &method_response);
+    try reader.readSliceAll(&method_response);
 
     if (method_response[0] != 0x05) return error.InvalidSocks5Response;
     const chosen_method = method_response[1];
@@ -180,11 +185,12 @@ pub fn connectViaSocks5(
         @memcpy(auth_buf[offset .. offset + proxy_password.len], proxy_password);
         offset += proxy_password.len;
 
-        try sendAllToFd(fd, auth_buf[0..offset]);
+        try writer.writeAll(auth_buf[0..offset]);
+        try writer.flush();
 
         // Read auth response
         var auth_response: [2]u8 = undefined;
-        try recvAllFromFd(fd, &auth_response);
+        try reader.readSliceAll(&auth_response);
 
         if (auth_response[0] != 0x01 or auth_response[1] != 0x00) {
             return error.Socks5AuthFailed;
@@ -207,16 +213,17 @@ pub fn connectViaSocks5(
 
     // Address type and address
     // Try to parse as IP first, otherwise use domain name
-    if (net.Address.parseIp4(target_host, 0)) |addr| {
+    if (Io.net.Ip4Address.parse(target_host, 0)) |addr| {
         request_buf[req_offset] = SOCKS5_ADDR_IPV4;
         req_offset += 1;
-        @memcpy(request_buf[req_offset .. req_offset + 4], std.mem.asBytes(&addr.in.addr));
+        const bytes = std.mem.asBytes(&addr.bytes);
+        @memcpy(request_buf[req_offset .. req_offset + 4], bytes[0..4]);
         req_offset += 4;
     } else |_| {
-        if (net.Address.parseIp6(target_host, 0)) |addr| {
+        if (Io.net.Ip6Address.parse(target_host, 0)) |addr| {
             request_buf[req_offset] = SOCKS5_ADDR_IPV6;
             req_offset += 1;
-            @memcpy(request_buf[req_offset .. req_offset + 16], &addr.in6.addr);
+            @memcpy(request_buf[req_offset .. req_offset + 16], &addr.bytes);
             req_offset += 16;
         } else |_| {
             // Use domain name
@@ -234,11 +241,12 @@ pub fn connectViaSocks5(
     std.mem.writeInt(u16, request_buf[req_offset..][0..2], target_port, .big);
     req_offset += 2;
 
-    try sendAllToFd(fd, request_buf[0..req_offset]);
+    try writer.writeAll(request_buf[0..req_offset]);
+    try writer.flush();
 
     // Read CONNECT response
     var response_header: [4]u8 = undefined;
-    try recvAllFromFd(fd, &response_header);
+    try reader.readSliceAll(&response_header);
 
     if (response_header[0] != 0x05) return error.InvalidSocks5Response;
     if (response_header[1] != 0x00) {
@@ -263,22 +271,22 @@ pub fn connectViaSocks5(
         SOCKS5_ADDR_IPV6 => 16,
         SOCKS5_ADDR_DOMAIN => blk: {
             var len_buf: [1]u8 = undefined;
-            try recvAllFromFd(fd, &len_buf);
+            try reader.readSliceAll(&len_buf);
             break :blk len_buf[0];
         },
         else => return error.InvalidSocks5Response,
     };
 
-    try recvAllFromFd(fd, discard_buf[0..addr_len]);
-    try recvAllFromFd(fd, discard_buf[0..2]); // Port
+    try reader.readSliceAll(discard_buf[0..addr_len]);
+    try reader.readSliceAll(discard_buf[0..2]); // Port
 
     // Connection established through proxy
-    return fd;
+    return stream;
 }
 
-/// Connect to target through HTTP CONNECT proxy
-/// Returns a connected file descriptor
+/// Connect to target through HTTP CONNECT proxy. Returns a connected Stream.
 pub fn connectViaHttpConnect(
+    io: Io,
     _: std.mem.Allocator,
     proxy_host: []const u8,
     proxy_port: u16,
@@ -286,13 +294,17 @@ pub fn connectViaHttpConnect(
     proxy_password: []const u8,
     target_host: []const u8,
     target_port: u16,
-) !posix.fd_t {
-    // Connect to proxy server
-    const proxy_addr = try net.Address.resolveIp(proxy_host, proxy_port);
-    const fd = try posix.socket(proxy_addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(fd);
+) !Io.net.Stream {
+    const proxy_addr = try common.resolveHostPort(io, proxy_host, proxy_port);
+    var stream = try proxy_addr.connect(io, .{});
+    errdefer stream.close(io);
 
-    try posix.connect(fd, &proxy_addr.any, proxy_addr.getOsSockLen());
+    var rbuf: [4096]u8 = undefined;
+    var wbuf: [2048]u8 = undefined;
+    var rdr = stream.reader(io, &rbuf);
+    var wtr = stream.writer(io, &wbuf);
+    const reader = &rdr.interface;
+    const writer = &wtr.interface;
 
     // Build CONNECT request
     var request_buf: [2048]u8 = undefined;
@@ -343,19 +355,17 @@ pub fn connectViaHttpConnect(
     offset += 2;
 
     // Send CONNECT request
-    try sendAllToFd(fd, request_buf[0..offset]);
+    try writer.writeAll(request_buf[0..offset]);
+    try writer.flush();
 
-    // Read response
+    // Read response until \r\n\r\n
     var response_buf: [4096]u8 = undefined;
     var response_len: usize = 0;
-
-    // Read until we get \r\n\r\n (end of headers)
     while (response_len < response_buf.len) {
-        const n = posix.recv(fd, response_buf[response_len..], 0) catch |err| return err;
+        const n = try reader.readSliceShort(response_buf[response_len..]);
         if (n == 0) return error.ProxyConnectionClosed;
         response_len += n;
 
-        // Check if we have complete headers
         if (response_len >= 4) {
             if (std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n")) |_| {
                 break;
@@ -388,29 +398,26 @@ pub fn connectViaHttpConnect(
         };
     }
 
-    // Connection established through proxy
-    return fd;
+    return stream;
 }
 
-/// Connect to target, optionally through a proxy
+/// Connect to target, optionally through a proxy. Returns a Stream.
 pub fn connectWithProxy(
+    io: Io,
     allocator: std.mem.Allocator,
     proxy_config: ?ProxyConfig,
     target_host: []const u8,
     target_port: u16,
-) !posix.fd_t {
+) !Io.net.Stream {
     if (proxy_config) |proxy| {
         if (proxy.proxy_type == .none) {
-            // No proxy, direct connection
-            const addr = try net.Address.resolveIp(target_host, target_port);
-            const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-            errdefer posix.close(fd);
-            try posix.connect(fd, &addr.any, addr.getOsSockLen());
-            return fd;
+            const addr = try common.resolveHostPort(io, target_host, target_port);
+            return try addr.connect(io, .{});
         }
 
         return switch (proxy.proxy_type) {
             .socks5 => try connectViaSocks5(
+                io,
                 allocator,
                 proxy.host,
                 proxy.port,
@@ -420,6 +427,7 @@ pub fn connectWithProxy(
                 target_port,
             ),
             .http => try connectViaHttpConnect(
+                io,
                 allocator,
                 proxy.host,
                 proxy.port,
@@ -433,11 +441,8 @@ pub fn connectWithProxy(
     }
 
     // No proxy config provided, direct connection
-    const addr = try net.Address.resolveIp(target_host, target_port);
-    const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(fd);
-    try posix.connect(fd, &addr.any, addr.getOsSockLen());
-    return fd;
+    const addr = try common.resolveHostPort(io, target_host, target_port);
+    return try addr.connect(io, .{});
 }
 
 // Tests
