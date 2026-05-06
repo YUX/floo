@@ -354,7 +354,12 @@ pub fn connectViaHttpConnect(
 
     // Proxy-Authorization header (if credentials provided)
     if (proxy_username.len > 0) {
-        // Basic auth: base64(username:password)
+        // Basic auth: base64(username:password). The local auth_str buffer
+        // is 512 bytes; pre-check so a long username/password yields a
+        // helpful error rather than the bare NoSpaceLeft from bufPrint.
+        if (proxy_username.len + 1 + proxy_password.len + 1 > 512) {
+            return error.ProxyCredentialsTooLong;
+        }
         var auth_str: [512]u8 = undefined;
         const auth_len = try std.fmt.bufPrint(&auth_str, "{s}:{s}", .{ proxy_username, proxy_password });
 

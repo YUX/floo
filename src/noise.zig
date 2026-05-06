@@ -199,6 +199,24 @@ pub const CipherType = enum {
 
 pub const KEY_LEN = 32;
 pub const TAG_LEN = 16;
+
+// Compile-time guarantee that every AEAD we wire into TransportCipher emits a
+// 16-byte authentication tag. The encrypt/decrypt paths slice off exactly
+// `TAG_LEN` bytes of tag from the ciphertext layout; if std.crypto ever ships
+// a variant where `tag_length` differs, this build-time check fails before
+// silent truncation can leak ciphertext bytes into the tag region.
+comptime {
+    const aead = crypto.aead;
+    if (aead.chacha_poly.ChaCha20Poly1305.tag_length != TAG_LEN) @compileError("ChaCha20Poly1305 tag_length != TAG_LEN");
+    if (aead.aes_gcm.Aes256Gcm.tag_length != TAG_LEN) @compileError("Aes256Gcm tag_length != TAG_LEN");
+    if (aead.aes_gcm.Aes128Gcm.tag_length != TAG_LEN) @compileError("Aes128Gcm tag_length != TAG_LEN");
+    if (aead.aegis.Aegis128L.tag_length != TAG_LEN) @compileError("Aegis128L tag_length != TAG_LEN");
+    if (aead.aegis.Aegis128X2.tag_length != TAG_LEN) @compileError("Aegis128X2 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis128X4.tag_length != TAG_LEN) @compileError("Aegis128X4 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis256.tag_length != TAG_LEN) @compileError("Aegis256 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis256X2.tag_length != TAG_LEN) @compileError("Aegis256X2 tag_length != TAG_LEN");
+    if (aead.aegis.Aegis256X4.tag_length != TAG_LEN) @compileError("Aegis256X4 tag_length != TAG_LEN");
+}
 // Force reconnection before theoretical nonce limit to prevent wraparound
 // 2^40 (~1.1 trillion messages) provides 256x safety margin before 2^48 limit
 pub const MAX_NONCE = 0xFFFFFFFFFF; // 2^40 - 1

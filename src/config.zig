@@ -643,6 +643,12 @@ pub const ClientConfig = struct {
                         config.advanced.tcp_keepalive_interval = std.fmt.parseInt(u32, value, 10) catch config.advanced.tcp_keepalive_interval;
                     } else if (std.mem.eql(u8, key, "tcp_keepalive_count")) {
                         config.advanced.tcp_keepalive_count = std.fmt.parseInt(u32, value, 10) catch config.advanced.tcp_keepalive_count;
+                    } else if (std.mem.eql(u8, key, "heartbeat_interval_seconds")) {
+                        // Server heartbeat sender uses this; client carries it for
+                        // symmetry / round-trip when configs are diff'd. Parser
+                        // previously only honored heartbeat_timeout_seconds on the
+                        // client side — fixed for B-11.
+                        config.advanced.heartbeat_interval_seconds = std.fmt.parseInt(u32, value, 10) catch config.advanced.heartbeat_interval_seconds;
                     } else if (std.mem.eql(u8, key, "heartbeat_timeout_seconds")) {
                         config.advanced.heartbeat_timeout_seconds = std.fmt.parseInt(u32, value, 10) catch config.advanced.heartbeat_timeout_seconds;
                     } else if (std.mem.eql(u8, key, "num_tunnels")) {
