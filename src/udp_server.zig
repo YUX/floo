@@ -63,7 +63,7 @@ pub const UdpForwarder = struct {
 
     pub fn stop(self: *UdpForwarder) void {
         self.running.store(false, .release);
-        var to_close = std.ArrayListUnmanaged(tunnel.StreamId){};
+        var to_close = std.ArrayListUnmanaged(tunnel.StreamId).empty;
         defer to_close.deinit(self.allocator);
 
         self.sessions_mutex.lock();
@@ -196,7 +196,7 @@ pub const UdpForwarder = struct {
 
         // Workaround for Zig compiler bug in Debug mode on some platforms
         // Split into smaller parts to avoid genSetReg error
-        var expired_items = std.ArrayListUnmanaged(tunnel.StreamId){};
+        var expired_items = std.ArrayListUnmanaged(tunnel.StreamId).empty;
         defer expired_items.deinit(self.allocator);
 
         {

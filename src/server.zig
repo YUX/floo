@@ -161,7 +161,7 @@ fn setMode(opts: *CliOptions, new_mode: CliMode, ctx: *ParseContext, arg: []cons
     opts.mode = new_mode;
 }
 
-fn parseServerArgs(args_list: [][:0]u8, ctx: *ParseContext) ParseError!CliOptions {
+fn parseServerArgs(args_list: []const [:0]const u8, ctx: *ParseContext) ParseError!CliOptions {
     var opts = CliOptions{};
     var idx: usize = 1;
     while (idx < args_list.len) : (idx += 1) {
@@ -755,9 +755,9 @@ const TunnelConnection = struct {
             tunnel,
             stream: *Stream,
         };
-        var poll_fds = std.ArrayListUnmanaged(posix.pollfd){};
+        var poll_fds = std.ArrayListUnmanaged(posix.pollfd).empty;
         defer poll_fds.deinit(global_allocator);
-        var poll_entries = std.ArrayListUnmanaged(PollEntry){};
+        var poll_entries = std.ArrayListUnmanaged(PollEntry).empty;
         defer poll_entries.deinit(global_allocator);
         const poll_timeout_ms: i32 = 1000;
 
@@ -1335,10 +1335,17 @@ test "forwardTargetData sends plaintext frames" {
     try std.testing.expectEqualStrings("pong", payload[7..]);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init.Minimal) !void {
+    // Zig 0.16: GeneralPurposeAllocator was renamed to DebugAllocator and gained
+    // a thread-safe `smp_allocator` for release builds.
+    var debug_allocator: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
+    const allocator, const is_debug = if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe)
+        .{ debug_allocator.allocator(), true }
+    else
+        .{ std.heap.smp_allocator, false };
+    defer if (is_debug) {
+        _ = debug_allocator.deinit();
+    };
     global_allocator = allocator;
     defer diagnostics.flushEncryptStats("server", &encrypt_total_ns, &encrypt_calls);
     defer diagnostics.flushThroughputStats("server", &tunnel_tx_bytes, &tunnel_rx_bytes);
@@ -1355,10 +1362,17 @@ pub fn main() !void {
     }
 
     var exit_code: u8 = 0;
-    defer if (exit_code != 0) posix.exit(exit_code);
+    defer if (exit_code != 0) std.process.exit(exit_code);
 
-    const args_list = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args_list);
+    // Zig 0.16: process.argsAlloc removed; use process.Args.Iterator instead.
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.args, allocator);
+    defer args_iter.deinit();
+    var args_list_arr: std.ArrayListUnmanaged([:0]const u8) = .empty;
+    defer args_list_arr.deinit(allocator);
+    while (args_iter.next()) |arg| {
+        try args_list_arr.append(allocator, arg);
+    }
+    const args_list = args_list_arr.items;
 
     var parse_ctx = ParseContext{};
     var cli_opts = parseServerArgs(args_list, &parse_ctx) catch |err| {
@@ -1490,8 +1504,8 @@ pub fn main() !void {
         conn: *TunnelConnection,
         thread: std.Thread,
     };
-    var connections = std.ArrayListUnmanaged(ConnectionEntry){};
-    var reverse_listeners = std.ArrayListUnmanaged(*ReverseListener){};
+    var connections = std.ArrayListUnmanaged(ConnectionEntry).empty;
+    var reverse_listeners = std.ArrayListUnmanaged(*ReverseListener).empty;
     var reverse_listeners_conn: ?*TunnelConnection = null;
     defer {
         stopAllReverseListeners(&reverse_listeners);

@@ -246,7 +246,7 @@ fn parseHostPortOption(
     try setStringOverride(host_slot, allocator, value);
 }
 
-fn parseClientArgs(allocator: std.mem.Allocator, args_list: [][:0]u8, ctx: *ParseContext) ParseError!CliOptions {
+fn parseClientArgs(allocator: std.mem.Allocator, args_list: []const [:0]const u8, ctx: *ParseContext) ParseError!CliOptions {
     var opts = CliOptions{};
     errdefer opts.deinit(allocator);
     var idx: usize = 1;
@@ -739,9 +739,9 @@ const TunnelClient = struct {
             tunnel,
             local: *LocalConnection,
         };
-        var poll_fds = std.ArrayListUnmanaged(posix.pollfd){};
+        var poll_fds = std.ArrayListUnmanaged(posix.pollfd).empty;
         defer poll_fds.deinit(global_allocator);
-        var poll_entries = std.ArrayListUnmanaged(PollEntry){};
+        var poll_entries = std.ArrayListUnmanaged(PollEntry).empty;
         defer poll_entries.deinit(global_allocator);
 
         while (self.running.load(.acquire) and !shutdown_flag.load(.acquire)) {
@@ -1650,10 +1650,17 @@ test "forwardLocalData sends plaintext frames" {
     try std.testing.expectEqualStrings("ping", payload[7..]);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init.Minimal) !void {
+    // Zig 0.16: GeneralPurposeAllocator was renamed to DebugAllocator and gained
+    // a thread-safe `smp_allocator` for release builds.
+    var debug_allocator: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
+    const allocator, const is_debug = if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe)
+        .{ debug_allocator.allocator(), true }
+    else
+        .{ std.heap.smp_allocator, false };
+    defer if (is_debug) {
+        _ = debug_allocator.deinit();
+    };
     global_allocator = allocator;
     defer diagnostics.flushEncryptStats("client", &encrypt_total_ns, &encrypt_calls);
     defer diagnostics.flushThroughputStats("client", &tunnel_tx_bytes, &tunnel_rx_bytes);
@@ -1670,10 +1677,17 @@ pub fn main() !void {
     }
 
     var exit_code: u8 = 0;
-    defer if (exit_code != 0) posix.exit(exit_code);
+    defer if (exit_code != 0) std.process.exit(exit_code);
 
-    const args_list = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args_list);
+    // Zig 0.16: process.argsAlloc removed; use process.Args.Iterator instead.
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.args, allocator);
+    defer args_iter.deinit();
+    var args_list_arr: std.ArrayListUnmanaged([:0]const u8) = .empty;
+    defer args_list_arr.deinit(allocator);
+    while (args_iter.next()) |arg| {
+        try args_list_arr.append(allocator, arg);
+    }
+    const args_list = args_list_arr.items;
 
     var parse_ctx = ParseContext{};
     var cli_opts = parseClientArgs(allocator, args_list, &parse_ctx) catch |err| {
@@ -1845,7 +1859,7 @@ pub fn main() !void {
         thread_slot.* = null;
     }
 
-    var service_threads = std.ArrayListUnmanaged(std.Thread){};
+    var service_threads = std.ArrayListUnmanaged(std.Thread).empty;
     defer service_threads.deinit(allocator);
     try service_threads.ensureTotalCapacity(allocator, cfg.services.count());
 

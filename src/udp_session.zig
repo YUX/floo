@@ -91,7 +91,7 @@ pub const UdpSessionManager = struct {
             .reverse_map = std.AutoHashMap(tunnel.StreamId, SessionKey).init(allocator),
             .mutex = std.Thread.Mutex{},
             .next_stream_id = std.atomic.Value(u32).init(1),
-            .scratch_keys = .{},
+            .scratch_keys = .empty,
         };
     }
 
