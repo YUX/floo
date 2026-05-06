@@ -20,7 +20,6 @@ pub fn flushEncryptStats(prefix: []const u8, total: *std.atomic.Value(u64), call
 
     const avg = total_ns / call_count;
     std.debug.print("[PROFILE] {s} encryption total={} ns calls={} avg={} ns\n", .{ prefix, total_ns, call_count, avg });
-    appendProfileLine(prefix, total_ns, call_count, avg);
 }
 
 pub fn flushThroughputStats(
@@ -42,18 +41,4 @@ pub fn flushThroughputStats(
 
 fn asDecimalMB(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
-}
-
-fn appendProfileLine(prefix: []const u8, total: u64, calls: u64, avg: u64) void {
-    const path = "/tmp/floo_profile.log";
-    _ = std.fs.createFileAbsolute(path, .{ .truncate = false, .read = false }) catch {};
-
-    var file = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch return;
-    defer file.close();
-
-    _ = file.seekFromEnd(0) catch {};
-
-    var buf: [128]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "{s}\ttotal_ns={}\tcalls={}\tavg_ns={}\n", .{ prefix, total, calls, avg }) catch return;
-    file.writeAll(line) catch {};
 }

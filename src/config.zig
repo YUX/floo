@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const tunnel = @import("tunnel.zig");
 
 // Simple defaults that users can understand
@@ -173,8 +174,11 @@ pub const ServerConfig = struct {
         }
     }
 
-    pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !ServerConfig {
-        const content = std.fs.cwd().readFileAlloc(path, allocator, @enumFromInt(1024 * 1024)) catch |err| {
+    pub fn loadFromFile(allocator: std.mem.Allocator, io: Io, path: []const u8) !ServerConfig {
+        // Zig 0.16: std.fs.cwd() is gone; readFileAlloc moved to Io.Dir with
+        // signature (io, sub_path, gpa, limit).
+        const cwd = Io.Dir.cwd();
+        const content = cwd.readFileAlloc(io, path, allocator, @enumFromInt(1024 * 1024)) catch |err| {
             if (err == error.FileNotFound) {
                 std.debug.print("[CONFIG] File not found: {s}. Create it using examples/ templates.\n", .{path});
                 var cfg = try ServerConfig.init(allocator);
@@ -482,8 +486,11 @@ pub const ClientConfig = struct {
         }
     }
 
-    pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !ClientConfig {
-        const content = std.fs.cwd().readFileAlloc(path, allocator, @enumFromInt(1024 * 1024)) catch |err| {
+    pub fn loadFromFile(allocator: std.mem.Allocator, io: Io, path: []const u8) !ClientConfig {
+        // Zig 0.16: std.fs.cwd() is gone; readFileAlloc moved to Io.Dir with
+        // signature (io, sub_path, gpa, limit).
+        const cwd = Io.Dir.cwd();
+        const content = cwd.readFileAlloc(io, path, allocator, @enumFromInt(1024 * 1024)) catch |err| {
             if (err == error.FileNotFound) {
                 std.debug.print("[CONFIG] File not found: {s}. Create it using examples/ templates.\n", .{path});
                 var cfg = try ClientConfig.init(allocator);
