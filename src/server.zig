@@ -690,13 +690,13 @@ const TunnelConnection = struct {
 
         stream_owned = false;
 
-        // Spawn heartbeat thread if enabled
+        // Spawn heartbeat thread if enabled. On failure, fall back through the
+        // existing errdefers (channel_guard cleans up the channel, stream_owned
+        // is already false so we close the stream explicitly here, and the
+        // allocator.destroy(conn) errdefer cleans up the alloc).
         if (conn.heartbeat_interval_ms > 0) {
             conn.heartbeat_thread = std.Thread.spawn(.{}, heartbeatThreadMain, .{conn}) catch |err| {
-                conn.channel.deinit();
-                channel_guard = false;
                 tunnel_stream.close(global_io);
-                allocator.destroy(conn);
                 return err;
             };
             std.debug.print("[TUNNEL] Heartbeat enabled: sending every {} seconds\n", .{cfg.advanced.heartbeat_interval_seconds});
