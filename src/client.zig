@@ -635,8 +635,14 @@ const TunnelClient = struct {
     next_stream_id: std.atomic.Value(u32),
     running: std.atomic.Value(bool),
 
-    // UDP support
-    udp_forwarder: ?*udp_client.UdpForwarder,
+    // UDP support — per-service-id inbound dispatch table (audit B-1).
+    // Previously a single `?*UdpForwarder` field meant that with multiple
+    // UDP services configured, only the LAST registered forwarder
+    // received inbound .udp_data frames; earlier ones silently dropped
+    // their replies. The map is non-owning: forwarders are owned by main
+    // (via UdpAttachment), tunnel-client lifecycle just sets/clears
+    // routes here on (re)connect.
+    udp_forwarders: std.AutoHashMap(tunnel.ServiceId, *udp_client.UdpForwarder),
     transport: config.Transport,
 
     // Heartbeat support
@@ -672,7 +678,7 @@ const TunnelClient = struct {
             .channel = undefined,
             .next_stream_id = std.atomic.Value(u32).init(1),
             .running = std.atomic.Value(bool).init(true),
-            .udp_forwarder = null,
+            .udp_forwarders = std.AutoHashMap(tunnel.ServiceId, *udp_client.UdpForwarder).init(allocator),
             .transport = .tcp,
             .heartbeat_timeout_ms = cfg.advanced.heartbeat_timeout_seconds * 1000,
             .last_heartbeat_time = std.atomic.Value(i64).init(common.milliTimestamp()),
@@ -979,10 +985,15 @@ const TunnelClient = struct {
                 // lifetime is trivially safe.
                 const udp_msg = try tunnel.UdpDataMsg.decodeRef(message_slice);
 
-                if (self.udp_forwarder) |forwarder| {
+                // Per-service-id routing (audit B-1). Map is read-only on
+                // this thread once populated by tunnelThreadWithReconnection
+                // before run() starts; no mutex needed.
+                if (self.udp_forwarders.get(udp_msg.service_id)) |forwarder| {
                     forwarder.handleUdpData(udp_msg) catch |err| {
-                        std.debug.print("[UDP-CLIENT] Failed to forward UDP data: {}\n", .{err});
+                        std.debug.print("[UDP-CLIENT] Failed to forward UDP data (service_id={}): {}\n", .{ udp_msg.service_id, err });
                     };
+                } else {
+                    tracePrint(enable_tunnel_trace, "[UDP-CLIENT] No forwarder for service_id={}, dropping {} bytes\n", .{ udp_msg.service_id, udp_msg.data.len });
                 }
             },
             .heartbeat => {
@@ -1284,10 +1295,10 @@ const TunnelClient = struct {
     }
 
     fn cleanup(self: *TunnelClient) void {
-        // The udp_forwarder field is a non-owning dispatch route maintained
-        // by main via UdpAttachment. Just clear it — main owns the forwarder
-        // lifecycle and reattaches it to the next TunnelClient on reconnect.
-        self.udp_forwarder = null;
+        // The udp_forwarders map is non-owning. Forwarders are owned by main
+        // via UdpAttachment; clear the routing table here, the next
+        // TunnelClient will be repopulated by tunnelThreadWithReconnection.
+        self.udp_forwarders.clearRetainingCapacity();
 
         // Stop all connections
         while (true) {
@@ -1310,8 +1321,9 @@ const TunnelClient = struct {
     }
 
     fn destroy(self: *TunnelClient) void {
-        // udp_forwarder is non-owning — main owns it (see UdpAttachment).
-        self.udp_forwarder = null;
+        // udp_forwarders map is non-owning — main owns the forwarders (see
+        // UdpAttachment). Free only the map's internal storage.
+        self.udp_forwarders.deinit();
         // Channel.deinit only frees its internal buffers — it does not close
         // the underlying stream (the caller owns it).
         self.channel.deinit();
@@ -1545,14 +1557,17 @@ fn tunnelThreadWithReconnection(params_ptr: *TunnelConnectionParams) void {
         params.tunnel_clients_mutex.unlock(global_io);
 
         // (Re)attach UDP forwarders to this fresh tunnel client. Outbound
-        // routing reads `att.tunnel` atomically per-packet; inbound dispatch
-        // uses `tunnel_client.udp_forwarder` (set here, cleared on cleanup).
-        // The attachment list is owned by main and can grow over the
-        // process's lifetime — re-read it on every reconnect.
+        // routing reads `att.tunnel` atomically per-packet; inbound
+        // dispatch uses `tunnel_client.udp_forwarders[service_id]`,
+        // populated here. The attachment list is owned by main and can
+        // grow over the process's lifetime — re-read on every reconnect.
         if (params.udp_attachments) |attachments_ptr| {
             params.tunnel_clients_mutex.lockUncancelable(global_io);
             for (attachments_ptr.items) |att| {
-                tunnel_client.udp_forwarder = att.forwarder;
+                tunnel_client.udp_forwarders.put(att.forwarder.service_id, att.forwarder) catch |err| {
+                    std.debug.print("[CLIENT] Failed to register UDP route service_id={}: {}\n", .{ att.forwarder.service_id, err });
+                    continue;
+                };
                 att.tunnel.store(tunnel_client, .release);
             }
             params.tunnel_clients_mutex.unlock(global_io);
@@ -1951,8 +1966,9 @@ pub fn main(init: std.process.Init) !void {
                     udp_attachments.append(allocator, att) catch {};
                     tunnel_clients_mutex.unlock(global_io);
 
-                    // Inbound dispatch on the current tunnel client.
-                    first_client.udp_forwarder = forwarder;
+                    // Inbound dispatch on the current tunnel client (B-1:
+                    // multiple UDP services route by service_id).
+                    try first_client.udp_forwarders.put(service.id, forwarder);
                     // Tracked separately for periodic session eviction.
                     multi_service_udp_forwarders.append(allocator, forwarder) catch {};
 
@@ -2033,7 +2049,7 @@ pub fn main(init: std.process.Init) !void {
             udp_attachments.append(allocator, att) catch {};
             tunnel_clients_mutex.unlock(global_io);
 
-            first_client.udp_forwarder = forwarder;
+            try first_client.udp_forwarders.put(default_service_id, forwarder);
 
             // Send CONNECT message to server to initialize UDP forwarder
             const stream_id = first_client.next_stream_id.fetchAdd(1, .acq_rel);
