@@ -74,10 +74,32 @@ pub const ProxyConfig = struct {
             if (password_buf) |buf| password = buf;
         }
 
-        // Parse host:port
-        const colon_idx = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse return error.InvalidProxyUrl;
-        host_buf = try allocator.dupe(u8, host_port[0..colon_idx]);
-        const port_str = host_port[colon_idx + 1 ..];
+        // Parse host:port. Bracketed IPv6 form (`[::1]:8080`) is supported:
+        // the closing `]` separates host from `:port`. Without bracket
+        // handling, lastIndexOfScalar(':') would land inside the IPv6
+        // address itself for unbracketed forms — which we reject by
+        // requiring brackets when the host contains multiple colons.
+        var host_text: []const u8 = undefined;
+        var port_str: []const u8 = undefined;
+        if (host_port.len > 0 and host_port[0] == '[') {
+            const close_idx = std.mem.indexOfScalar(u8, host_port, ']') orelse return error.InvalidProxyUrl;
+            host_text = host_port[1..close_idx];
+            // Expect `]:port` after the bracket.
+            if (host_port.len <= close_idx + 2 or host_port[close_idx + 1] != ':') {
+                return error.InvalidProxyUrl;
+            }
+            port_str = host_port[close_idx + 2 ..];
+        } else {
+            const colon_idx = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse return error.InvalidProxyUrl;
+            host_text = host_port[0..colon_idx];
+            port_str = host_port[colon_idx + 1 ..];
+            // An unbracketed bare IPv6 like `::1:8080` is ambiguous and
+            // unsafe to parse — require brackets for IPv6 literals.
+            if (std.mem.indexOfScalar(u8, host_text, ':') != null) {
+                return error.InvalidProxyUrl;
+            }
+        }
+        host_buf = try allocator.dupe(u8, host_text);
         const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidProxyUrl;
         const host = host_buf.?;
 
@@ -299,11 +321,15 @@ pub fn connectViaHttpConnect(
     var stream = try proxy_addr.connect(io, .{ .mode = .stream });
     errdefer stream.close(io);
 
-    var rbuf: [4096]u8 = undefined;
+    // Note: we do NOT use a buffered reader for the response. A buffered
+    // reader can over-read past `\r\n\r\n` into bytes that belong to the
+    // next protocol layer (the Noise handshake immediately following);
+    // when this function returns, those over-read bytes vanish with the
+    // local stack buffer and the next reader desyncs. Instead we read
+    // byte-by-byte directly via std.c.read on the raw fd, leaving any
+    // post-header bytes in the kernel TCP buffer for the channel layer.
     var wbuf: [2048]u8 = undefined;
-    var rdr = stream.reader(io, &rbuf);
     var wtr = stream.writer(io, &wbuf);
-    const reader = &rdr.interface;
     const writer = &wtr.interface;
 
     // Build CONNECT request
@@ -358,18 +384,27 @@ pub fn connectViaHttpConnect(
     try writer.writeAll(request_buf[0..offset]);
     try writer.flush();
 
-    // Read response until \r\n\r\n
+    // Read response byte-by-byte until \r\n\r\n. Slow but only at handshake
+    // time, and ensures any data the proxy pipelined after the headers
+    // remains in the kernel TCP buffer for the next layer to consume.
     var response_buf: [4096]u8 = undefined;
     var response_len: usize = 0;
+    const fd = stream.socket.handle;
     while (response_len < response_buf.len) {
-        const n = try reader.readSliceShort(response_buf[response_len..]);
-        if (n == 0) return error.ProxyConnectionClosed;
-        response_len += n;
-
-        if (response_len >= 4) {
-            if (std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n")) |_| {
-                break;
+        const n = std.c.read(fd, response_buf[response_len..].ptr, 1);
+        if (n < 0) {
+            const errno = std.posix.errno(n);
+            switch (errno) {
+                .INTR, .AGAIN => continue,
+                else => return error.ProxyReadFailed,
             }
+        }
+        if (n == 0) return error.ProxyConnectionClosed;
+        response_len += @intCast(n);
+        if (response_len >= 4 and
+            std.mem.endsWith(u8, response_buf[0..response_len], "\r\n\r\n"))
+        {
+            break;
         }
     }
 
@@ -489,4 +524,48 @@ test "parse empty proxy url" {
     defer config.deinit(allocator);
 
     try std.testing.expectEqual(ProxyType.none, config.proxy_type);
+}
+
+test "parse bracketed IPv6 proxy url" {
+    const allocator = std.testing.allocator;
+
+    var config = try ProxyConfig.parseUrl(allocator, "socks5://[::1]:1080");
+    defer config.deinit(allocator);
+    try std.testing.expectEqual(ProxyType.socks5, config.proxy_type);
+    try std.testing.expectEqualStrings("::1", config.host);
+    try std.testing.expectEqual(@as(u16, 1080), config.port);
+}
+
+test "parse bracketed IPv6 proxy url with auth" {
+    const allocator = std.testing.allocator;
+
+    var config = try ProxyConfig.parseUrl(allocator, "http://user:pw@[2001:db8::1]:8080");
+    defer config.deinit(allocator);
+    try std.testing.expectEqual(ProxyType.http, config.proxy_type);
+    try std.testing.expectEqualStrings("2001:db8::1", config.host);
+    try std.testing.expectEqual(@as(u16, 8080), config.port);
+    try std.testing.expectEqualStrings("user", config.username);
+    try std.testing.expectEqualStrings("pw", config.password);
+}
+
+test "reject unbracketed IPv6 proxy url (ambiguous)" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidProxyUrl,
+        ProxyConfig.parseUrl(allocator, "socks5://::1:1080"),
+    );
+}
+
+test "reject malformed bracketed proxy url" {
+    const allocator = std.testing.allocator;
+    // Missing closing bracket
+    try std.testing.expectError(
+        error.InvalidProxyUrl,
+        ProxyConfig.parseUrl(allocator, "socks5://[::1:1080"),
+    );
+    // Missing port after bracket
+    try std.testing.expectError(
+        error.InvalidProxyUrl,
+        ProxyConfig.parseUrl(allocator, "socks5://[::1]"),
+    );
 }
