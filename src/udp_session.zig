@@ -1,33 +1,36 @@
 const std = @import("std");
-const posix = std.posix;
-const net = @import("net_compat.zig");
+const Io = std.Io;
 const tunnel = @import("tunnel.zig");
 const common = @import("common.zig");
 
-/// UDP session key - identifies a unique UDP "connection" by source address
-/// We store the raw sockaddr to avoid issues with Address union
+/// UDP session key — identifies a unique UDP "client" by source address.
+///
+/// Stored as a flat byte array so it's a value-typed HashMap key. IPv4 uses
+/// the first 4 bytes; IPv6 uses all 16. `family` distinguishes the two so
+/// that `0.0.0.0:N` and `::N` don't collide.
 pub const SessionKey = struct {
-    family: u8, // AF.INET or AF.INET6
-    addr_bytes: [16]u8, // IPv4 uses first 4 bytes, IPv6 uses all 16
-    port: u16, // Network byte order
+    family: u8, // 4 or 6
+    addr_bytes: [16]u8,
+    port: u16, // native endian
 
-    pub fn initFromAddress(addr: net.Address) SessionKey {
-        var key: SessionKey = undefined;
-        key.family = @intCast(addr.any.family);
-        key.addr_bytes = [_]u8{0} ** 16;
+    pub fn initFromAddress(addr: Io.net.IpAddress) SessionKey {
+        var key: SessionKey = .{
+            .family = 0,
+            .addr_bytes = [_]u8{0} ** 16,
+            .port = 0,
+        };
 
-        switch (addr.any.family) {
-            posix.AF.INET => {
-                const ipv4 = addr.in;
-                @memcpy(key.addr_bytes[0..4], std.mem.asBytes(&ipv4.addr));
-                key.port = ipv4.port;
+        switch (addr) {
+            .ip4 => |v4| {
+                key.family = 4;
+                @memcpy(key.addr_bytes[0..4], &v4.bytes);
+                key.port = v4.port;
             },
-            posix.AF.INET6 => {
-                const ipv6 = addr.in6;
-                @memcpy(&key.addr_bytes, &ipv6.addr);
-                key.port = ipv6.port;
+            .ip6 => |v6| {
+                key.family = 6;
+                @memcpy(&key.addr_bytes, &v6.bytes);
+                key.port = v6.port;
             },
-            else => unreachable,
         }
 
         return key;
@@ -51,10 +54,10 @@ pub const SessionKey = struct {
 /// UDP session context
 pub const UdpSession = struct {
     stream_id: tunnel.StreamId,
-    source_addr: net.Address,
+    source_addr: Io.net.IpAddress,
     last_activity_ns: i128, // Nanoseconds since epoch
 
-    pub fn init(stream_id: tunnel.StreamId, source_addr: net.Address) UdpSession {
+    pub fn init(stream_id: tunnel.StreamId, source_addr: Io.net.IpAddress) UdpSession {
         return .{
             .stream_id = stream_id,
             .source_addr = source_addr,
@@ -76,9 +79,7 @@ pub const UdpSession = struct {
 /// Context for managing UDP sessions
 pub const UdpSessionManager = struct {
     allocator: std.mem.Allocator,
-    // Map: SessionKey -> UdpSession
     sessions: std.AutoHashMap(SessionKey, UdpSession),
-    // Reverse map: stream_id -> SessionKey (for tunnel -> local forwarding)
     reverse_map: std.AutoHashMap(tunnel.StreamId, SessionKey),
     mutex: std.Thread.Mutex,
     next_stream_id: std.atomic.Value(u32),
@@ -102,21 +103,19 @@ pub const UdpSessionManager = struct {
     }
 
     /// Get or create session for a source address
-    pub fn getOrCreate(self: *UdpSessionManager, source_addr: net.Address) !UdpSession {
+    pub fn getOrCreate(self: *UdpSessionManager, source_addr: Io.net.IpAddress) !UdpSession {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const key = SessionKey.initFromAddress(source_addr);
 
         if (self.sessions.get(key)) |*session| {
-            // Existing session - update activity time
             var updated = session.*;
             updated.touch();
             try self.sessions.put(key, updated);
             return updated;
         }
 
-        // New session - allocate stream ID
         const stream_id = self.next_stream_id.fetchAdd(1, .monotonic);
         const session = UdpSession.init(stream_id, source_addr);
 
@@ -149,7 +148,6 @@ pub const UdpSessionManager = struct {
             }
         }
 
-        // Remove expired sessions
         for (self.scratch_keys.items) |key| {
             if (self.sessions.fetchRemove(key)) |removed| {
                 _ = self.reverse_map.remove(removed.value.stream_id);
@@ -169,9 +167,11 @@ pub const UdpSessionManager = struct {
 
 // Tests
 test "SessionKey equality and hashing" {
-    const addr1 = try net.Address.parseIp4("127.0.0.1", 8080);
-    const addr2 = try net.Address.parseIp4("127.0.0.1", 8080);
-    const addr3 = try net.Address.parseIp4("127.0.0.1", 8081);
+    const v4 = try Io.net.Ip4Address.parse("127.0.0.1", 8080);
+    const addr1: Io.net.IpAddress = .{ .ip4 = v4 };
+    const addr2: Io.net.IpAddress = .{ .ip4 = v4 };
+    const v4b = try Io.net.Ip4Address.parse("127.0.0.1", 8081);
+    const addr3: Io.net.IpAddress = .{ .ip4 = v4b };
 
     const key1 = SessionKey.initFromAddress(addr1);
     const key2 = SessionKey.initFromAddress(addr2);
@@ -183,16 +183,14 @@ test "SessionKey equality and hashing" {
 }
 
 test "UdpSession expiration" {
-    const addr = try net.Address.parseIp4("127.0.0.1", 8080);
+    const v4 = try Io.net.Ip4Address.parse("127.0.0.1", 8080);
+    const addr: Io.net.IpAddress = .{ .ip4 = v4 };
     var session = UdpSession.init(123, addr);
 
-    // Fresh session should not be expired
     try std.testing.expect(!session.isExpired(60));
 
-    // Simulate old session by setting past timestamp
     session.last_activity_ns = common.nanoTimestamp() - (61 * std.time.ns_per_s);
 
-    // Should now be expired with 60 second timeout
     try std.testing.expect(session.isExpired(60));
 }
 
@@ -201,26 +199,23 @@ test "UdpSessionManager basic operations" {
     var manager = UdpSessionManager.init(allocator);
     defer manager.deinit();
 
-    const addr1 = try net.Address.parseIp4("192.168.1.1", 12345);
-    const addr2 = try net.Address.parseIp4("192.168.1.2", 12346);
+    const v4_a = try Io.net.Ip4Address.parse("192.168.1.1", 12345);
+    const v4_b = try Io.net.Ip4Address.parse("192.168.1.2", 12346);
+    const addr1: Io.net.IpAddress = .{ .ip4 = v4_a };
+    const addr2: Io.net.IpAddress = .{ .ip4 = v4_b };
 
-    // Create first session
     const session1 = try manager.getOrCreate(addr1);
     try std.testing.expectEqual(@as(u32, 1), session1.stream_id);
 
-    // Create second session
     const session2 = try manager.getOrCreate(addr2);
     try std.testing.expectEqual(@as(u32, 2), session2.stream_id);
 
-    // Get existing session (should return same stream_id)
     const session1_again = try manager.getOrCreate(addr1);
     try std.testing.expectEqual(session1.stream_id, session1_again.stream_id);
 
-    // Reverse lookup
     const found = manager.getByStreamId(session1.stream_id);
     try std.testing.expect(found != null);
     try std.testing.expectEqual(session1.stream_id, found.?.stream_id);
 
-    // Count
     try std.testing.expectEqual(@as(usize, 2), manager.count());
 }
