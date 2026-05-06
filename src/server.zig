@@ -865,8 +865,10 @@ const TunnelConnection = struct {
                 // Connection established, stream thread will start forwarding
             },
             .connect => {
-                const connect_msg = try tunnel.ConnectMsg.decode(message_slice, global_allocator);
-                defer global_allocator.free(connect_msg.token);
+                // Hot-ish path (per accepted stream): zero-alloc decodeRef
+                // — handleConnect consumes the token synchronously
+                // (constant-time-compares against the configured token).
+                const connect_msg = try tunnel.ConnectMsg.decodeRef(message_slice);
 
                 tracePrint(enable_tunnel_trace, "[TUNNEL] CONNECT request: service_id={} stream_id={}\n", .{
                     connect_msg.service_id,
@@ -958,8 +960,7 @@ const TunnelConnection = struct {
             },
             .connect_error => {
                 // REVERSE MODE: Client failed to connect to local target
-                const err_msg = try tunnel.ConnectErrorMsg.decode(message_slice, global_allocator);
-                defer global_allocator.free(err_msg.error_msg);
+                const err_msg = try tunnel.ConnectErrorMsg.decodeRef(message_slice);
                 std.debug.print("[TUNNEL-REVERSE] CONNECT_ERROR from client: stream_id={} error={s}\n", .{ err_msg.stream_id, err_msg.error_msg });
 
                 const key = StreamKey{ .service_id = err_msg.service_id, .stream_id = err_msg.stream_id };
@@ -1194,7 +1195,17 @@ const TunnelConnection = struct {
             self.heartbeat_thread = null;
         }
 
-        // Stop and release all streams without holding the mutex during blocking calls
+        // Drain the streams map one entry at a time: pop under the lock, then
+        // call blocking stop()+releaseRef without holding it.
+        //
+        // Invariant (B-14): once `running == false`, no thread inserts new
+        // streams. The producers of `self.streams.put` are:
+        //   - handleConnect / handleMessage on the run() loop (exits when
+        //     running == false)
+        //   - ReverseListener.acceptorThread (checks running every loop)
+        //   - reverseServiceListener (checks running every loop)
+        // All check `running` before insert. So the iterative pop here
+        // converges; concurrent inserts during teardown are not observed.
         while (true) {
             self.streams_mutex.lockUncancelable(global_io);
             var iter = self.streams.iterator();

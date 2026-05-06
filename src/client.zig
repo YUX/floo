@@ -923,8 +923,7 @@ const TunnelClient = struct {
                 // Connection established, local thread will start sending
             },
             .connect_error => {
-                const err_msg = try tunnel.ConnectErrorMsg.decode(message_slice, global_allocator);
-                defer global_allocator.free(err_msg.error_msg);
+                const err_msg = try tunnel.ConnectErrorMsg.decodeRef(message_slice);
                 std.debug.print("[CLIENT] CONNECT_ERROR stream_id={} code={s} error={s}\n", .{ err_msg.stream_id, @tagName(err_msg.error_code), err_msg.error_msg });
 
                 self.connections_mutex.lockUncancelable(global_io);

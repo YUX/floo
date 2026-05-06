@@ -801,13 +801,24 @@ fn parseServiceDefinition(allocator: std.mem.Allocator, name: []const u8, value:
         return error.InvalidPort;
     };
 
+    // Audit B-15: build dupes step-by-step with errdefer so a late OOM
+    // doesn't leak earlier dupes. The previous struct-literal `try` chain
+    // dropped name+address allocations if `try dupString(allocator, "")`
+    // for the empty token failed.
+    const name_dup = try dupString(allocator, name);
+    errdefer allocator.free(name_dup);
+    const address_dup = try dupString(allocator, address);
+    errdefer allocator.free(address_dup);
+    const token_dup = try dupString(allocator, "");
+    errdefer allocator.free(token_dup);
+
     return Service{
-        .name = try dupString(allocator, name),
+        .name = name_dup,
         .id = 0, // Will be set later
-        .address = try dupString(allocator, address),
+        .address = address_dup,
         .port = port,
         .transport = transport,
-        .token = try dupString(allocator, ""),
+        .token = token_dup,
     };
 }
 
@@ -815,13 +826,20 @@ fn parseServiceDefinition(allocator: std.mem.Allocator, name: []const u8, value:
 fn parseClientServiceDefinition(allocator: std.mem.Allocator, name: []const u8, value: []const u8) !Service {
     // Simple case: just a port number
     if (std.fmt.parseInt(u16, value, 10)) |port| {
+        // Same B-15 errdefer discipline as parseServiceDefinition.
+        const name_dup = try dupString(allocator, name);
+        errdefer allocator.free(name_dup);
+        const address_dup = try dupString(allocator, "127.0.0.1");
+        errdefer allocator.free(address_dup);
+        const token_dup = try dupString(allocator, "");
+        errdefer allocator.free(token_dup);
         return Service{
-            .name = try dupString(allocator, name),
+            .name = name_dup,
             .id = 0, // Will be set later
-            .address = try dupString(allocator, "127.0.0.1"),
+            .address = address_dup,
             .port = port,
             .transport = .tcp,
-            .token = try dupString(allocator, ""),
+            .token = token_dup,
         };
     } else |_| {
         // Complex case: address:port[/transport]
@@ -848,8 +866,12 @@ fn applyServiceProperty(
     };
 
     if (std.mem.eql(u8, field, "token")) {
+        // Allocate first; if it fails the existing token is preserved
+        // (audit B-15: previous `free → try dup` left the field
+        // dangling on dupString OOM, then deinit would double-free).
+        const new_token = try dupString(allocator, value);
         allocator.free(service.token);
-        service.token = try dupString(allocator, value);
+        service.token = new_token;
         return true;
     }
 
