@@ -1,5 +1,5 @@
 const std = @import("std");
-const posix = std.posix;
+const Io = std.Io;
 const noise = @import("../noise.zig");
 const tunnel = @import("../tunnel.zig");
 const protocol = @import("../protocol.zig");
@@ -40,9 +40,16 @@ pub const ThroughputStats = struct {
 };
 
 /// Parameters required to establish a tunnel transport.
+///
+/// The caller owns `stream`, `reader`, and `writer` (and the buffers backing
+/// reader/writer). The Channel borrows them for its lifetime; on close the
+/// caller is responsible for closing the underlying stream.
 pub const ChannelInit = struct {
     allocator: std.mem.Allocator,
-    fd: posix.fd_t,
+    io: Io,
+    stream: Io.net.Stream,
+    reader: *Io.Reader,
+    writer: *Io.Writer,
     cipher: []const u8,
     psk: []const u8,
     static_keypair: std.crypto.dh.X25519.KeyPair,
@@ -53,17 +60,25 @@ pub const ChannelInit = struct {
     handshake_metrics: ?*HandshakeMetrics = null,
 };
 
-/// Bidirectional transport that knows how to frame, encrypt, and decrypt messages.
+/// Bidirectional encrypted transport over a TCP Stream.
+///
+/// Wraps a Stream + buffered Reader/Writer pair with Noise XX handshake
+/// and AEAD framing. The send path serializes encryption + write under a
+/// mutex; the receive path is single-threaded by convention (the caller's
+/// poll loop).
 pub const Channel = struct {
     allocator: std.mem.Allocator,
-    fd: posix.fd_t,
+    io: Io,
+    stream: Io.net.Stream,
+    reader: *Io.Reader,
+    writer: *Io.Writer,
     encryption_enabled: bool,
     send_cipher: ?noise.TransportCipher,
     recv_cipher: ?noise.TransportCipher,
     decrypt_buffer: []u8,
     control_buffer: []u8,
     large_send_buffer: []u8,
-    send_mutex: std.Thread.Mutex,
+    send_mutex: std.Io.Mutex,
     stats: ?EncryptionStats,
     throughput: ?ThroughputStats,
 
@@ -85,7 +100,9 @@ pub const Channel = struct {
             }
 
             const handshake = noise.noiseXXHandshake(
-                params.fd,
+                params.io,
+                params.reader,
+                params.writer,
                 cipher_type,
                 params.role == .client,
                 params.static_keypair,
@@ -103,7 +120,15 @@ pub const Channel = struct {
             send_cipher = handshake.send_cipher;
             recv_cipher = handshake.recv_cipher;
 
-            try exchangeVersions(params.fd, params.role, &send_cipher.?, &recv_cipher.?, params.version, params.allocator);
+            try exchangeVersions(
+                params.reader,
+                params.writer,
+                params.role,
+                &send_cipher.?,
+                &recv_cipher.?,
+                params.version,
+                params.allocator,
+            );
 
             decrypt_buffer = try params.allocator.alloc(u8, protocol.MAX_FRAME_SIZE);
             control_buffer = try params.allocator.alloc(u8, common.CONTROL_MSG_BUFFER_SIZE + noise.TAG_LEN);
@@ -113,14 +138,17 @@ pub const Channel = struct {
 
         return Channel{
             .allocator = params.allocator,
-            .fd = params.fd,
+            .io = params.io,
+            .stream = params.stream,
+            .reader = params.reader,
+            .writer = params.writer,
             .encryption_enabled = encryption_enabled,
             .send_cipher = send_cipher,
             .recv_cipher = recv_cipher,
             .decrypt_buffer = decrypt_buffer,
             .control_buffer = control_buffer,
             .large_send_buffer = large_send_buffer,
-            .send_mutex = .{},
+            .send_mutex = .init,
             .stats = params.stats,
             .throughput = params.throughput,
         };
@@ -145,12 +173,19 @@ pub const Channel = struct {
 
     /// Send an immutable payload by copying it into an internal scratch buffer.
     /// Used for small control-plane messages and any caller that only has const data.
+    ///
+    /// Hot path: bypasses self.writer's Io.Writer interface and writes directly
+    /// via posix writev so we get one syscall per frame (matches the original
+    /// pre-migration writev semantics; the buffered Stream.Writer was costing
+    /// roughly 3x throughput due to per-call vtable dispatch + flush overhead).
     pub fn sendCopy(self: *Channel, payload: []const u8) !void {
-        self.send_mutex.lock();
-        defer self.send_mutex.unlock();
+        self.send_mutex.lockUncancelable(self.io);
+        defer self.send_mutex.unlock(self.io);
+
+        const fd = self.stream.socket.handle;
 
         if (!self.encryption_enabled) {
-            try common.writeFrameLocked(self.fd, payload);
+            try common.writeFrameDirect(fd, payload);
             self.recordTx(payload.len);
             return;
         }
@@ -163,18 +198,20 @@ pub const Channel = struct {
 
         @memcpy(target_buf[0..payload.len], payload);
         const encrypted_slice = try self.encryptInPlace(target_buf, payload.len);
-        try common.writeFrameLocked(self.fd, encrypted_slice);
+        try common.writeFrameDirect(fd, encrypted_slice);
         self.recordTx(payload.len);
     }
 
     /// Encrypt (when necessary) and send a mutable payload in-place.
     /// `buffer.len` must include enough capacity for the ciphertext/tag.
+    ///
+    /// Hot path: same direct-writev rationale as sendCopy.
     pub fn sendDataInPlace(self: *Channel, buffer: []u8, payload_len: usize) !void {
-        self.send_mutex.lock();
-        defer self.send_mutex.unlock();
+        self.send_mutex.lockUncancelable(self.io);
+        defer self.send_mutex.unlock(self.io);
 
         const slice = try self.prepareSendSlice(buffer, payload_len);
-        try common.writeFrameLocked(self.fd, slice);
+        try common.writeFrameDirect(self.stream.socket.handle, slice);
         self.recordTx(payload_len);
     }
 
@@ -258,7 +295,8 @@ pub const Channel = struct {
 };
 
 fn exchangeVersions(
-    fd: posix.fd_t,
+    reader: *Io.Reader,
+    writer: *Io.Writer,
     role: Role,
     send_cipher: *noise.TransportCipher,
     recv_cipher: *noise.TransportCipher,
@@ -270,27 +308,27 @@ fn exchangeVersions(
 
     switch (role) {
         .server => {
-            const frame = try receiveFrameInto(fd, &encrypted_buf);
+            const frame = try receiveFrameInto(reader, &encrypted_buf);
             const plaintext = try decryptVersionFrameInto(recv_cipher, frame, &plaintext_buf);
             try validateVersion(allocator, plaintext, local_version);
-            try sendVersionFrame(fd, send_cipher, local_version, &plaintext_buf, &encrypted_buf);
+            try sendVersionFrame(writer, send_cipher, local_version, &plaintext_buf, &encrypted_buf);
         },
         .client => {
-            try sendVersionFrame(fd, send_cipher, local_version, &plaintext_buf, &encrypted_buf);
-            const frame = try receiveFrameInto(fd, &encrypted_buf);
+            try sendVersionFrame(writer, send_cipher, local_version, &plaintext_buf, &encrypted_buf);
+            const frame = try receiveFrameInto(reader, &encrypted_buf);
             const plaintext = try decryptVersionFrameInto(recv_cipher, frame, &plaintext_buf);
             try validateVersion(allocator, plaintext, local_version);
         },
     }
 }
 
-fn receiveFrameInto(fd: posix.fd_t, buffer: []u8) ![]u8 {
+fn receiveFrameInto(reader: *Io.Reader, buffer: []u8) ![]u8 {
     var header: [4]u8 = undefined;
-    try common.recvAllFromFd(fd, &header);
+    try common.recvAll(reader, &header);
     const frame_len = std.mem.readInt(u32, &header, .big);
     if (frame_len > buffer.len) return error.FrameTooLarge;
     const payload = buffer[0..frame_len];
-    try common.recvAllFromFd(fd, payload);
+    try common.recvAll(reader, payload);
     return payload;
 }
 
@@ -307,7 +345,7 @@ fn decryptVersionFrameInto(
 }
 
 fn sendVersionFrame(
-    fd: posix.fd_t,
+    writer: *Io.Writer,
     cipher: *noise.TransportCipher,
     version: []const u8,
     plain_buf: []u8,
@@ -320,10 +358,8 @@ fn sendVersionFrame(
     if (encrypted_len > encrypted_buf.len) return error.FrameTooLarge;
     try cipher.encrypt(plain_buf[0..plain_len], encrypted_buf[0..encrypted_len]);
 
-    var header: [4]u8 = undefined;
-    std.mem.writeInt(u32, &header, @intCast(encrypted_len), .big);
-    try common.sendAllToFd(fd, &header);
-    try common.sendAllToFd(fd, encrypted_buf[0..encrypted_len]);
+    try common.writeFrame(writer, encrypted_buf[0..encrypted_len]);
+    try writer.flush();
 }
 
 fn validateVersion(allocator: std.mem.Allocator, payload: []const u8, expected: []const u8) !void {

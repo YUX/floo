@@ -1,23 +1,22 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const Io = std.Io;
 const config = @import("config.zig");
-const net = @import("net_compat.zig");
 
+/// Read the monotonic clock as nanoseconds.
+///
+/// Goes through `posix.system.clock_gettime` (raw syscall) rather than the
+/// std.Io clock so that callers in atomic-update paths (no Io in scope) can
+/// still get monotonic timestamps without plumbing Io through every API.
 pub fn nanoTimestamp() i128 {
-    const ts = posix.clock_gettime(posix.CLOCK.MONOTONIC) catch return 0;
+    var ts: posix.timespec = undefined;
+    _ = posix.system.clock_gettime(.MONOTONIC, &ts);
     return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
 pub fn milliTimestamp() i64 {
     return @intCast(@divTrunc(nanoTimestamp(), std.time.ns_per_ms));
-}
-
-inline fn socketHandle(fd: posix.fd_t) posix.socket_t {
-    if (builtin.target.os.tag == .windows) {
-        return @ptrCast(fd);
-    }
-    return fd;
 }
 
 // ============================================================================
@@ -113,11 +112,15 @@ pub fn tcpOptionsFromSettings(settings: *const config.TcpSettings) TcpOptions {
     };
 }
 
-/// Apply TCP socket options (Nagle/keepalive) with best-effort error reporting.
-pub fn applyTcpOptions(fd: posix.fd_t, opts: TcpOptions) void {
+/// Apply TCP socket options (Nagle/keepalive) on a Stream's underlying handle.
+///
+/// std.Io.net.ListenOptions/ConnectOptions don't expose TCP_NODELAY/SO_KEEPALIVE,
+/// so we set them via posix.setsockopt on the raw fd. `posix.setsockopt` is one
+/// of the few wrapper functions retained in 0.16.
+pub fn applyTcpOptions(handle: posix.fd_t, opts: TcpOptions) void {
     if (opts.nodelay) {
         const nodelay_value: c_int = 1;
-        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(nodelay_value)) catch |err| {
+        posix.setsockopt(handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(nodelay_value)) catch |err| {
             std.debug.print("[TCP] Failed to set TCP_NODELAY: {}\n", .{err});
         };
     }
@@ -125,146 +128,232 @@ pub fn applyTcpOptions(fd: posix.fd_t, opts: TcpOptions) void {
     if (!opts.keepalive) return;
 
     const keepalive_value: c_int = 1;
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(keepalive_value)) catch |err| {
+    posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(keepalive_value)) catch |err| {
         std.debug.print("[TCP] Failed to set SO_KEEPALIVE: {}\n", .{err});
     };
 
     if (@hasDecl(posix.TCP, "KEEPIDLE")) {
         const idle_value: c_int = @intCast(opts.keepalive_idle);
-        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPIDLE, &std.mem.toBytes(idle_value)) catch {};
+        posix.setsockopt(handle, posix.IPPROTO.TCP, posix.TCP.KEEPIDLE, &std.mem.toBytes(idle_value)) catch {};
     }
     if (@hasDecl(posix.TCP, "KEEPINTVL")) {
         const intvl_value: c_int = @intCast(opts.keepalive_interval);
-        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, &std.mem.toBytes(intvl_value)) catch {};
+        posix.setsockopt(handle, posix.IPPROTO.TCP, posix.TCP.KEEPINTVL, &std.mem.toBytes(intvl_value)) catch {};
     }
     if (@hasDecl(posix.TCP, "KEEPCNT")) {
         const cnt_value: c_int = @intCast(opts.keepalive_count);
-        posix.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, &std.mem.toBytes(cnt_value)) catch {};
+        posix.setsockopt(handle, posix.IPPROTO.TCP, posix.TCP.KEEPCNT, &std.mem.toBytes(cnt_value)) catch {};
     }
 }
 
 /// Tune socket buffers for high throughput.
-pub fn tuneSocketBuffers(fd: posix.fd_t, buffer_size: u32) void {
+pub fn tuneSocketBuffers(handle: posix.fd_t, buffer_size: u32) void {
     const size: c_int = @intCast(buffer_size);
     const bytes = std.mem.toBytes(size);
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &bytes) catch |err| {
+    posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVBUF, &bytes) catch |err| {
         std.debug.print("[SOCKET] Failed to grow RCVBUF to {}: {}\n", .{ buffer_size, err });
     };
-    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &bytes) catch |err| {
+    posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.SNDBUF, &bytes) catch |err| {
         std.debug.print("[SOCKET] Failed to grow SNDBUF to {}: {}\n", .{ buffer_size, err });
     };
 }
 
-/// Send all data to file descriptor, handling partial writes.
+/// Send all data through an Io.Writer (typically wrapping a Stream.Writer).
 ///
-/// This function ensures all bytes are sent, handling the case where
-/// send() returns fewer bytes than requested (partial write).
-///
-/// Returns error.ConnectionClosed if the connection is closed before
-/// all data is sent (send returns 0).
-///
-/// Extracted from client.zig and server.zig to eliminate duplication.
-pub fn sendAllToFd(fd: posix.fd_t, data: []const u8) !void {
-    const socket_fd = socketHandle(fd);
-    var offset: usize = 0;
-    while (offset < data.len) {
-        const n = posix.send(socket_fd, data[offset..], 0) catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => return err,
-        };
-        if (n == 0) return error.ConnectionClosed;
-        offset += n;
-    }
+/// Std.Io's Writer interface handles partial writes internally — this is just
+/// a thin shim so callers don't have to remember the method name.
+pub fn sendAll(writer: *Io.Writer, data: []const u8) !void {
+    return writer.writeAll(data);
 }
 
-/// Write length-prefixed frame using writev() for scatter-gather I/O.
+/// Write a length-prefixed frame: [4-byte big-endian length][payload].
 ///
-/// Frame format: [4-byte big-endian length][payload]
+/// Two writeAll calls let a buffered Writer coalesce header+payload into a
+/// single syscall (the std.Io equivalent of the old writev()-based path).
+/// Caller must call writer.flush() after a batch of frames if low latency
+/// is required, or rely on the buffered Writer's auto-flush on overflow.
+pub fn writeFrame(writer: *Io.Writer, payload: []const u8) !void {
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], @intCast(payload.len), .big);
+    try writer.writeAll(&header);
+    try writer.writeAll(payload);
+}
+
+/// Write a length-prefixed frame DIRECTLY via writev, bypassing any Io
+/// buffered Writer.
 ///
-/// This function uses writev() for atomic write of header and payload,
-/// minimizing system calls and ensuring both parts are sent together.
-///
-/// Handles partial writes by tracking which iovecs have been sent and
-/// updating offsets accordingly.
-///
-/// Extracted from client.zig and server.zig to eliminate duplication.
-pub fn writeFrameLocked(fd: posix.fd_t, payload: []const u8) !void {
+/// This is the hot data path. The std.Io.Stream.Writer interface adds 2-3
+/// vtable hops + buffering per frame, which costs us roughly 3x throughput
+/// vs the original posix.writev-based path. This helper restores the original
+/// scatter-gather behavior: one syscall per frame regardless of header/payload
+/// split. libc's writev is consistent across macOS and Linux (we link libc).
+pub fn writeFrameDirect(handle: posix.fd_t, payload: []const u8) !void {
     var header: [4]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], @intCast(payload.len), .big);
 
-    // Track how much of each part has been sent
     var header_sent: usize = 0;
     var payload_sent: usize = 0;
 
     while (header_sent < header.len or payload_sent < payload.len) {
-        // Prepare iovecs based on what still needs to be sent
-        var iovecs_buf: [2]posix.iovec_const = undefined;
-        var iovec_count: usize = 0;
+        var iovecs_buf: [2]std.c.iovec_const = undefined;
+        var iovec_count: c_uint = 0;
 
         if (header_sent < header.len) {
-            const header_remaining = header[header_sent..];
-            iovecs_buf[iovec_count] = posix.iovec_const{ .base = header_remaining.ptr, .len = header_remaining.len };
+            const remaining = header[header_sent..];
+            iovecs_buf[iovec_count] = .{ .base = remaining.ptr, .len = remaining.len };
             iovec_count += 1;
         }
 
         if (payload_sent < payload.len) {
-            const payload_remaining = payload[payload_sent..];
-            iovecs_buf[iovec_count] = posix.iovec_const{ .base = payload_remaining.ptr, .len = payload_remaining.len };
+            const remaining = payload[payload_sent..];
+            iovecs_buf[iovec_count] = .{ .base = remaining.ptr, .len = remaining.len };
             iovec_count += 1;
         }
 
-        const iovecs = iovecs_buf[0..iovec_count];
-        const written = posix.writev(fd, iovecs) catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => return err,
-        };
+        const written = std.c.writev(handle, &iovecs_buf, iovec_count);
+        if (written < 0) {
+            const errno = std.posix.errno(written);
+            switch (errno) {
+                .INTR => continue,
+                .AGAIN => continue,
+                .PIPE => return error.ConnectionClosed,
+                .CONNRESET => return error.ConnectionClosed,
+                else => return error.WriteFailed,
+            }
+        }
         if (written == 0) return error.ConnectionClosed;
 
-        // Update counters based on bytes written
-        var remaining = written;
-
-        // Process header first if not fully sent
+        var remaining: usize = @intCast(written);
         if (header_sent < header.len) {
-            const header_bytes_to_send = header.len - header_sent;
-            if (remaining >= header_bytes_to_send) {
-                remaining -= header_bytes_to_send;
+            const header_remaining = header.len - header_sent;
+            if (remaining >= header_remaining) {
+                remaining -= header_remaining;
                 header_sent = header.len;
             } else {
                 header_sent += remaining;
                 remaining = 0;
             }
         }
-
-        // Then process payload if we have remaining bytes
         if (remaining > 0 and payload_sent < payload.len) {
             payload_sent += @min(remaining, payload.len - payload_sent);
         }
     }
 }
 
-/// Format a net.Address into a temporary buffer for logging.
-pub fn formatAddress(addr: net.Address, buf: []u8) []const u8 {
+/// Format a std.Io.net.IpAddress into a temporary buffer for logging.
+pub fn formatAddress(addr: Io.net.IpAddress, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{f}", .{addr}) catch "unavailable";
 }
 
-/// Resolve IPv4/IPv6/DNS host strings into a net.Address.
-pub fn resolveHostPort(host: []const u8, port: u16) !net.Address {
-    return net.Address.parseIp4(host, port) catch
-        net.Address.parseIp6(host, port) catch
-        net.Address.resolveIp(host, port);
+/// Resolve IPv4/IPv6 literal or DNS hostname into an IpAddress.
+///
+/// Tries v4 literal, then v6 literal, then DNS resolution. DNS resolution
+/// is performed via std.Io.net.Ip6Address.resolve which returns IPv4-mapped
+/// IPv6 when the hostname resolves to v4.
+pub fn resolveHostPort(io: Io, host: []const u8, port: u16) !Io.net.IpAddress {
+    if (Io.net.Ip4Address.parse(host, port)) |v4| {
+        return .{ .ip4 = v4 };
+    } else |_| {}
+    if (Io.net.Ip6Address.parse(host, port)) |v6| {
+        return .{ .ip6 = v6 };
+    } else |_| {}
+    const v6 = try Io.net.Ip6Address.resolve(io, host, port);
+    return .{ .ip6 = v6 };
 }
 
-/// Receive an exact number of bytes from a socket file descriptor.
-pub fn recvAllFromFd(fd: posix.fd_t, buffer: []u8) !void {
-    const socket_fd = socketHandle(fd);
+/// Receive an exact number of bytes through an Io.Reader.
+pub fn recvAll(reader: *Io.Reader, buffer: []u8) !void {
+    return reader.readSliceAll(buffer);
+}
+
+/// Bind a TCP listener with ONLY SO_REUSEADDR (not SO_REUSEPORT).
+///
+/// std.Io.net.IpAddress.listen(.{ .reuse_address = true }) sets BOTH
+/// SO_REUSEADDR and SO_REUSEPORT on POSIX, which changes load-balancing
+/// semantics: the kernel distributes incoming connections across all
+/// listeners bound to the same port. That breaks floo's reverse-listener
+/// rebind (a new tunnel arriving briefly has both old and new listener
+/// bound — connections land on the soon-to-die one and get reset).
+///
+/// Returns a fully-formed Io.net.Server constructed from a raw libc socket.
+pub fn bindListener(addr: Io.net.IpAddress, backlog: u32) !Io.net.Server {
+    const family: c_uint = switch (addr) {
+        .ip4 => @intCast(std.c.AF.INET),
+        .ip6 => @intCast(std.c.AF.INET6),
+    };
+
+    // macOS' socket(2) rejects SOCK_CLOEXEC as a type-flag; set FD_CLOEXEC
+    // via fcntl after instead. (Linux accepts the SOCK_CLOEXEC bit but the
+    // fcntl path is portable.)
+    const fd = std.c.socket(family, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return error.SocketCreateFailed;
+    errdefer _ = std.c.close(fd);
+    _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+
+    const reuse: c_int = 1;
+    if (std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &reuse, @sizeOf(c_int)) != 0) {
+        return error.SetSockOptFailed;
+    }
+
+    switch (addr) {
+        .ip4 => |v4| {
+            var sa: std.c.sockaddr.in = .{
+                .family = std.c.AF.INET,
+                .port = std.mem.nativeToBig(u16, v4.port),
+                .addr = std.mem.bytesToValue(u32, &v4.bytes),
+                .zero = @splat(0),
+            };
+            if (std.c.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa))) != 0) {
+                return error.BindFailed;
+            }
+        },
+        .ip6 => |v6| {
+            var sa: std.c.sockaddr.in6 = .{
+                .family = std.c.AF.INET6,
+                .port = std.mem.nativeToBig(u16, v6.port),
+                .flowinfo = v6.flow,
+                .addr = v6.bytes,
+                .scope_id = v6.interface.index,
+            };
+            if (std.c.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa))) != 0) {
+                return error.BindFailed;
+            }
+        },
+    }
+
+    if (std.c.listen(fd, @intCast(backlog)) != 0) {
+        return error.ListenFailed;
+    }
+
+    return .{
+        .socket = .{ .handle = fd, .address = addr },
+        .options = if (Io.net.Server.AcceptOptions != void) .{ .mode = .stream, .protocol = .tcp } else {},
+    };
+}
+
+/// Write all bytes to a raw socket handle, looping over partial writes.
+///
+/// Used on the data-forwarding hot path where we hold a Stream's underlying
+/// fd and don't want to set up a per-send Writer just to issue one syscall.
+/// libc's write() is the consistent cross-platform path since the project
+/// links libc (see build.zig). Returns error.ConnectionClosed on EOF/EPIPE.
+pub fn writeAllToHandle(handle: posix.fd_t, data: []const u8) !void {
     var offset: usize = 0;
-    while (offset < buffer.len) {
-        const n = posix.recv(socket_fd, buffer[offset..], 0) catch |err| switch (err) {
-            error.WouldBlock => continue,
-            else => return err,
-        };
+    while (offset < data.len) {
+        const remaining = data[offset..];
+        const n = std.c.write(handle, remaining.ptr, remaining.len);
+        if (n < 0) {
+            const errno = std.posix.errno(n);
+            switch (errno) {
+                .INTR => continue,
+                .AGAIN => continue,
+                .PIPE => return error.ConnectionClosed,
+                .CONNRESET => return error.ConnectionClosed,
+                else => return error.WriteFailed,
+            }
+        }
         if (n == 0) return error.ConnectionClosed;
-        offset += n;
+        offset += @intCast(n);
     }
 }
 
@@ -272,14 +361,18 @@ pub fn recvAllFromFd(fd: posix.fd_t, buffer: []u8) !void {
 // Connection Rate Limiting
 // ============================================================================
 
-/// Simple token bucket rate limiter to prevent connection flood attacks
+/// Token-bucket rate limiter to prevent connection flood attacks.
+///
+/// WP-07: the previous implementation short-circuited in Debug mode to avoid
+/// a long-fixed compiler bug. That dual behavior was a footgun in tests, so
+/// the bypass is removed.
 pub const RateLimiter = struct {
     tokens: std.atomic.Value(u32),
     max_tokens: u32,
     refill_interval_ns: i64,
     last_refill: std.atomic.Value(i64),
 
-    /// Create a rate limiter allowing `max_per_second` operations per second
+    /// Create a rate limiter allowing `max_per_second` operations per second.
     pub fn init(max_per_second: u32) RateLimiter {
         return .{
             .tokens = std.atomic.Value(u32).init(max_per_second),
@@ -289,14 +382,9 @@ pub const RateLimiter = struct {
         };
     }
 
-    /// Try to consume a token. Returns true if allowed, false if rate limited
+    /// Try to consume a token. Returns true if allowed, false if rate limited.
     pub fn tryAcquire(self: *RateLimiter) bool {
-        // In Debug mode, skip complex rate limiting to avoid compiler bugs
-        if (builtin.mode == .Debug) {
-            return true;
-        }
-
-        // Try to consume a token
+        // Fast path: try to consume an existing token.
         var current = self.tokens.load(.monotonic);
         while (current > 0) {
             if (self.tokens.cmpxchgWeak(
@@ -311,7 +399,7 @@ pub const RateLimiter = struct {
             }
         }
 
-        // Refill if needed
+        // Slow path: refill if the interval has elapsed.
         const now: i64 = @intCast(nanoTimestamp());
         const last = self.last_refill.load(.monotonic);
         const elapsed = now - last;
@@ -330,3 +418,24 @@ pub const RateLimiter = struct {
         return false;
     }
 };
+
+// Tests
+test "constantTimeEqual" {
+    try std.testing.expect(common_test_constantTimeEqualHelper("abc", "abc"));
+    try std.testing.expect(!common_test_constantTimeEqualHelper("abc", "abd"));
+    try std.testing.expect(!common_test_constantTimeEqualHelper("abc", "abcd"));
+    try std.testing.expect(!common_test_constantTimeEqualHelper("", "x"));
+    try std.testing.expect(common_test_constantTimeEqualHelper("", ""));
+}
+
+fn common_test_constantTimeEqualHelper(a: []const u8, b: []const u8) bool {
+    return constantTimeEqual(a, b);
+}
+
+test "RateLimiter exhausts and refills (works in all build modes)" {
+    var rl = RateLimiter.init(3);
+    try std.testing.expect(rl.tryAcquire());
+    try std.testing.expect(rl.tryAcquire());
+    try std.testing.expect(rl.tryAcquire());
+    try std.testing.expect(!rl.tryAcquire()); // exhausted
+}

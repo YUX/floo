@@ -34,3 +34,6 @@ test-*.toml
 # Build artifacts
 build-deb/
 .DS_Store
+
+# Claude Code runtime lock
+.claude/scheduled_tasks.lock

@@ -1,9 +1,7 @@
 const std = @import("std");
 const crypto = std.crypto;
-const posix = std.posix;
+const Io = std.Io;
 const common = @import("common.zig");
-const sendAllToFd = common.sendAllToFd;
-const recvAllFromFd = common.recvAllFromFd;
 
 /// Debug logging for Noise protocol (disable in production for performance)
 const enable_noise_debug = false;
@@ -730,7 +728,9 @@ fn computeAuthTag(psk: []const u8, handshake_hash: []const u8, role: u8) [HASH_L
 ///   <- e, ee, s, es
 ///   -> s, se
 pub fn noiseXXHandshake(
-    fd: posix.fd_t,
+    io: Io,
+    reader: *Io.Reader,
+    writer: *Io.Writer,
     cipher_type: CipherType,
     is_initiator: bool,
     static_keypair: crypto.dh.X25519.KeyPair,
@@ -740,7 +740,7 @@ pub fn noiseXXHandshake(
     const X25519 = crypto.dh.X25519;
 
     // Generate ephemeral keypair (static keypair is provided)
-    const e_keypair = X25519.KeyPair.generate();
+    const e_keypair = X25519.KeyPair.generate(io);
     const s_keypair = static_keypair;
 
     // Initialize Noise state
@@ -765,7 +765,8 @@ pub fn noiseXXHandshake(
     if (is_initiator) {
         debugPrint("[NOISE] Initiator: sending ephemeral key ({} bytes)\n", .{e_keypair.public_key.len});
         // -> e
-        try sendAllToFd(fd, &e_keypair.public_key);
+        try writer.writeAll(&e_keypair.public_key);
+        try writer.flush();
         debugPrint("[NOISE] Initiator: ephemeral key sent\n", .{});
 
         // Mix e into handshake hash
@@ -777,7 +778,7 @@ pub fn noiseXXHandshake(
         // <- e, ee, s, es
         debugPrint("[NOISE] Initiator: receiving msg2 ({} bytes)\n", .{DH_LEN + DH_LEN + TAG_LEN + TAG_LEN});
         var msg2: [DH_LEN + DH_LEN + TAG_LEN + TAG_LEN]u8 = undefined;
-        try recvAllFromFd(fd, &msg2);
+        try reader.readSliceAll(&msg2);
         debugPrint("[NOISE] Initiator: msg2 received\n", .{});
 
         const re = msg2[0..DH_LEN];
@@ -873,7 +874,8 @@ pub fn noiseXXHandshake(
         @memcpy(msg3[DH_LEN + TAG_LEN ..], &payload_tag);
 
         debugPrint("[NOISE] Initiator: sending msg3 ({} bytes)\n", .{msg3.len});
-        try sendAllToFd(fd, &msg3);
+        try writer.writeAll(&msg3);
+        try writer.flush();
         debugPrint("[NOISE] Initiator: msg3 sent\n", .{});
 
         // Split into transport keys
@@ -889,11 +891,12 @@ pub fn noiseXXHandshake(
         const handshake_hash: []const u8 = h[0..];
         const local_tag = computeAuthTag(psk, handshake_hash, 'I');
         debugPrint("[NOISE] Initiator: sending PSK auth tag ({} bytes)\n", .{local_tag.len});
-        try sendAllToFd(fd, local_tag[0..]);
+        try writer.writeAll(local_tag[0..]);
+        try writer.flush();
         debugPrint("[NOISE] Initiator: PSK auth tag sent\n", .{});
         var peer_tag_buf: [HASH_LEN]u8 = undefined;
         debugPrint("[NOISE] Initiator: waiting for server PSK auth tag ({} bytes)\n", .{peer_tag_buf.len});
-        try recvAllFromFd(fd, peer_tag_buf[0..]);
+        try reader.readSliceAll(peer_tag_buf[0..]);
         debugPrint("[NOISE] Initiator: received server PSK auth tag\n", .{});
         const expected_peer = computeAuthTag(psk, handshake_hash, 'R');
         // Use constant-time comparison to prevent timing attacks on PSK authentication
@@ -904,7 +907,7 @@ pub fn noiseXXHandshake(
         debugPrint("[NOISE] Responder: waiting for ephemeral key ({} bytes)\n", .{DH_LEN});
         // <- e
         var re: [DH_LEN]u8 = undefined;
-        try recvAllFromFd(fd, &re);
+        try reader.readSliceAll(&re);
         debugPrint("[NOISE] Responder: ephemeral key received\n", .{});
 
         // Mix re into h
@@ -965,13 +968,14 @@ pub fn noiseXXHandshake(
         @memcpy(msg2[DH_LEN + DH_LEN + TAG_LEN ..], &payload_tag);
 
         debugPrint("[NOISE] Responder: sending msg2 ({} bytes)\n", .{msg2.len});
-        try sendAllToFd(fd, &msg2);
+        try writer.writeAll(&msg2);
+        try writer.flush();
         debugPrint("[NOISE] Responder: msg2 sent\n", .{});
 
         // <- s, se
         debugPrint("[NOISE] Responder: waiting for msg3 ({} bytes)\n", .{DH_LEN + TAG_LEN + TAG_LEN});
         var msg3: [DH_LEN + TAG_LEN + TAG_LEN]u8 = undefined;
-        try recvAllFromFd(fd, &msg3);
+        try reader.readSliceAll(&msg3);
         debugPrint("[NOISE] Responder: msg3 received\n", .{});
 
         // Decrypt s (using temp_k from previous es operation)
@@ -1031,7 +1035,7 @@ pub fn noiseXXHandshake(
         const handshake_hash: []const u8 = h[0..];
         var peer_tag_buf: [HASH_LEN]u8 = undefined;
         debugPrint("[NOISE] Responder: waiting for client PSK auth tag ({} bytes)\n", .{peer_tag_buf.len});
-        try recvAllFromFd(fd, peer_tag_buf[0..]);
+        try reader.readSliceAll(peer_tag_buf[0..]);
         debugPrint("[NOISE] Responder: received client PSK auth tag\n", .{});
         const expected_peer = computeAuthTag(psk, handshake_hash, 'I');
         // Use constant-time comparison to prevent timing attacks on PSK authentication
@@ -1039,7 +1043,8 @@ pub fn noiseXXHandshake(
 
         const local_tag = computeAuthTag(psk, handshake_hash, 'R');
         debugPrint("[NOISE] Responder: sending PSK auth tag ({} bytes)\n", .{local_tag.len});
-        try sendAllToFd(fd, local_tag[0..]);
+        try writer.writeAll(local_tag[0..]);
+        try writer.flush();
         debugPrint("[NOISE] Responder: PSK auth tag sent\n", .{});
 
         return result;
