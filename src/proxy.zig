@@ -124,7 +124,7 @@ pub fn connectViaSocks5(
     target_port: u16,
 ) !Io.net.Stream {
     const proxy_addr = try common.resolveHostPort(io, proxy_host, proxy_port);
-    var stream = try proxy_addr.connect(io, .{});
+    var stream = try proxy_addr.connect(io, .{ .mode = .stream });
     errdefer stream.close(io);
 
     // Build temporary buffered reader/writer for the negotiation. Sized for the
@@ -296,7 +296,7 @@ pub fn connectViaHttpConnect(
     target_port: u16,
 ) !Io.net.Stream {
     const proxy_addr = try common.resolveHostPort(io, proxy_host, proxy_port);
-    var stream = try proxy_addr.connect(io, .{});
+    var stream = try proxy_addr.connect(io, .{ .mode = .stream });
     errdefer stream.close(io);
 
     var rbuf: [4096]u8 = undefined;
@@ -412,7 +412,7 @@ pub fn connectWithProxy(
     if (proxy_config) |proxy| {
         if (proxy.proxy_type == .none) {
             const addr = try common.resolveHostPort(io, target_host, target_port);
-            return try addr.connect(io, .{});
+            return try addr.connect(io, .{ .mode = .stream });
         }
 
         return switch (proxy.proxy_type) {
@@ -442,7 +442,7 @@ pub fn connectWithProxy(
 
     // No proxy config provided, direct connection
     const addr = try common.resolveHostPort(io, target_host, target_port);
-    return try addr.connect(io, .{});
+    return try addr.connect(io, .{ .mode = .stream });
 }
 
 // Tests

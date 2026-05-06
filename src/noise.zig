@@ -728,6 +728,7 @@ fn computeAuthTag(psk: []const u8, handshake_hash: []const u8, role: u8) [HASH_L
 ///   <- e, ee, s, es
 ///   -> s, se
 pub fn noiseXXHandshake(
+    io: Io,
     reader: *Io.Reader,
     writer: *Io.Writer,
     cipher_type: CipherType,
@@ -739,7 +740,7 @@ pub fn noiseXXHandshake(
     const X25519 = crypto.dh.X25519;
 
     // Generate ephemeral keypair (static keypair is provided)
-    const e_keypair = X25519.KeyPair.generate();
+    const e_keypair = X25519.KeyPair.generate(io);
     const s_keypair = static_keypair;
 
     // Initialize Noise state

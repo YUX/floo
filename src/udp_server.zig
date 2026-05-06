@@ -22,7 +22,7 @@ pub const UdpForwarder = struct {
     running: std.atomic.Value(bool),
     timeout_ns: i64,
     sessions: std.AutoHashMap(tunnel.StreamId, *Session),
-    sessions_mutex: std.Thread.Mutex,
+    sessions_mutex: std.Io.Mutex,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -46,7 +46,7 @@ pub const UdpForwarder = struct {
             .running = std.atomic.Value(bool).init(true),
             .timeout_ns = @as(i64, @intCast(timeout_seconds * std.time.ns_per_s)),
             .sessions = std.AutoHashMap(tunnel.StreamId, *Session).init(allocator),
-            .sessions_mutex = .{},
+            .sessions_mutex = .init,
         };
         return forwarder;
     }
@@ -73,12 +73,12 @@ pub const UdpForwarder = struct {
         var to_close = std.ArrayListUnmanaged(tunnel.StreamId).empty;
         defer to_close.deinit(self.allocator);
 
-        self.sessions_mutex.lock();
+        self.sessions_mutex.lockUncancelable(self.io);
         var iter = self.sessions.keyIterator();
         while (iter.next()) |key_ptr| {
             if (to_close.append(self.allocator, key_ptr.*)) |_| {} else |_| break;
         }
-        self.sessions_mutex.unlock();
+        self.sessions_mutex.unlock(self.io);
 
         for (to_close.items) |stream_id| {
             self.removeSession(stream_id, false);
@@ -110,9 +110,9 @@ pub const UdpForwarder = struct {
         source_port: u16,
         now: i64,
     ) !*Session {
-        self.sessions_mutex.lock();
+        self.sessions_mutex.lockUncancelable(self.io);
         if (self.sessions.get(stream_id)) |session| {
-            defer self.sessions_mutex.unlock();
+            defer self.sessions_mutex.unlock(self.io);
             if (session.source_addr_len != source_addr.len or
                 session.source_port != source_port or
                 !std.mem.eql(u8, session.source_addr[0..session.source_addr_len], source_addr))
@@ -121,7 +121,7 @@ pub const UdpForwarder = struct {
             }
             return session;
         }
-        self.sessions_mutex.unlock();
+        self.sessions_mutex.unlock(self.io);
 
         // Bind an ephemeral local UDP socket on the same address family as the target.
         const ephemeral: Io.net.IpAddress = switch (self.target_addr) {
@@ -153,9 +153,9 @@ pub const UdpForwarder = struct {
             return err;
         };
 
-        self.sessions_mutex.lock();
+        self.sessions_mutex.lockUncancelable(self.io);
         self.sessions.put(stream_id, session) catch |err| {
-            self.sessions_mutex.unlock();
+            self.sessions_mutex.unlock(self.io);
             session.running.store(false, .release);
             _ = posix.system.shutdown(session.socket.handle, posix.SHUT.RD);
             session.thread.join();
@@ -163,7 +163,7 @@ pub const UdpForwarder = struct {
             self.allocator.destroy(session);
             return err;
         };
-        self.sessions_mutex.unlock();
+        self.sessions_mutex.unlock(self.io);
 
         return session;
     }
@@ -209,8 +209,8 @@ pub const UdpForwarder = struct {
         defer expired_items.deinit(self.allocator);
 
         {
-            self.sessions_mutex.lock();
-            defer self.sessions_mutex.unlock();
+            self.sessions_mutex.lockUncancelable(self.io);
+            defer self.sessions_mutex.unlock(self.io);
 
             var iter = self.sessions.iterator();
             while (iter.next()) |entry| {
@@ -231,9 +231,9 @@ pub const UdpForwarder = struct {
     }
 
     fn removeSession(self: *UdpForwarder, stream_id: tunnel.StreamId, caller_is_thread: bool) void {
-        self.sessions_mutex.lock();
+        self.sessions_mutex.lockUncancelable(self.io);
         const entry = self.sessions.fetchRemove(stream_id);
-        self.sessions_mutex.unlock();
+        self.sessions_mutex.unlock(self.io);
 
         if (entry) |removed| {
             const session = removed.value;

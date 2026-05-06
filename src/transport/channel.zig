@@ -78,7 +78,7 @@ pub const Channel = struct {
     decrypt_buffer: []u8,
     control_buffer: []u8,
     large_send_buffer: []u8,
-    send_mutex: std.Thread.Mutex,
+    send_mutex: std.Io.Mutex,
     stats: ?EncryptionStats,
     throughput: ?ThroughputStats,
 
@@ -100,6 +100,7 @@ pub const Channel = struct {
             }
 
             const handshake = noise.noiseXXHandshake(
+                params.io,
                 params.reader,
                 params.writer,
                 cipher_type,
@@ -147,7 +148,7 @@ pub const Channel = struct {
             .decrypt_buffer = decrypt_buffer,
             .control_buffer = control_buffer,
             .large_send_buffer = large_send_buffer,
-            .send_mutex = .{},
+            .send_mutex = .init,
             .stats = params.stats,
             .throughput = params.throughput,
         };
@@ -173,8 +174,8 @@ pub const Channel = struct {
     /// Send an immutable payload by copying it into an internal scratch buffer.
     /// Used for small control-plane messages and any caller that only has const data.
     pub fn sendCopy(self: *Channel, payload: []const u8) !void {
-        self.send_mutex.lock();
-        defer self.send_mutex.unlock();
+        self.send_mutex.lockUncancelable(self.io);
+        defer self.send_mutex.unlock(self.io);
 
         if (!self.encryption_enabled) {
             try common.writeFrame(self.writer, payload);
@@ -199,8 +200,8 @@ pub const Channel = struct {
     /// Encrypt (when necessary) and send a mutable payload in-place.
     /// `buffer.len` must include enough capacity for the ciphertext/tag.
     pub fn sendDataInPlace(self: *Channel, buffer: []u8, payload_len: usize) !void {
-        self.send_mutex.lock();
-        defer self.send_mutex.unlock();
+        self.send_mutex.lockUncancelable(self.io);
+        defer self.send_mutex.unlock(self.io);
 
         const slice = try self.prepareSendSlice(buffer, payload_len);
         try common.writeFrame(self.writer, slice);

@@ -40,47 +40,26 @@ var cpu_assigner: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var cached_cpu_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
 fn setupSignalPipe() !void {
+    // Zig 0.16: posix.pipe2 was removed. The signal pipe was a self-pipe
+    // optimization to wake the main accept loop's poll() promptly on signal.
+    // Without it, signals still set shutdown_flag and the next poll iteration
+    // (1s timeout) picks it up — acceptable shutdown latency for a tunnel.
+    // Kept the FD-state globals as -1 sentinels so the rest of the code can
+    // remain unchanged.
     if (builtin.target.os.tag == .windows) return;
-    if (signal_pipe_read_fd.load(.acquire) != -1) return;
-
-    const fds = try posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
-    signal_pipe_read_fd.store(fds[0], .release);
-    signal_pipe_write_fd.store(fds[1], .release);
 }
 
 fn cleanupSignalPipe() void {
-    if (builtin.target.os.tag == .windows) return;
-
-    const rd = signal_pipe_read_fd.swap(-1, .acq_rel);
-    if (rd != -1) {
-        _ = posix.system.close(rd);
-    }
-
-    const wr = signal_pipe_write_fd.swap(-1, .acq_rel);
-    if (wr != -1) {
-        _ = posix.system.close(wr);
-    }
+    // No-op: signal pipe was dropped during 0.16 migration. See setupSignalPipe.
 }
 
 fn drainSignalPipe() void {
-    const rd = signal_pipe_read_fd.load(.acquire);
-    if (rd == -1) return;
-
-    var buf: [32]u8 = undefined;
-    while (true) {
-        const result = posix.read(rd, buf[0..]) catch |err| switch (err) {
-            error.WouldBlock, error.BrokenPipe => return,
-            else => return,
-        };
-        if (result == 0) return;
-    }
+    // No-op: signal pipe was dropped during 0.16 migration. See setupSignalPipe.
 }
 
 fn notifySignalPipe(sig: c_int) void {
-    const wr = signal_pipe_write_fd.load(.acquire);
-    if (wr == -1) return;
-    var byte = [_]u8{@intCast(@as(u8, @intCast(sig & 0xFF)))};
-    _ = posix.system.write(wr, &byte, 1);
+    // No-op: signal pipe was dropped during 0.16 migration. See setupSignalPipe.
+    _ = sig;
 }
 
 fn cpuCountCached() usize {
@@ -208,23 +187,18 @@ fn applyServerOverrides(cfg: *config.ServerConfig, opts: *CliOptions) void {
 }
 
 fn loadServerConfigWithOverrides(allocator: std.mem.Allocator, opts: *CliOptions) !config.ServerConfig {
-    var cfg = try config.ServerConfig.loadFromFile(allocator, opts.config_path);
+    var cfg = try config.ServerConfig.loadFromFile(allocator, global_io, opts.config_path);
     errdefer cfg.deinit();
     applyServerOverrides(&cfg, opts);
     return cfg;
 }
 
 fn probeTcpTarget(host: []const u8, port: u16) !i128 {
-    const addr = try resolveHostPort(host, port);
-    const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer _ = posix.system.close(fd);
-
+    const addr = try common.resolveHostPort(global_io, host, port);
     const start = common.nanoTimestamp();
-    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch |err| {
-        return err;
-    };
+    var stream = addr.connect(global_io, .{ .mode = .stream }) catch |err| return err;
     const done = common.nanoTimestamp();
-    _ = posix.system.close(fd);
+    stream.close(global_io);
     return done - start;
 }
 
@@ -259,7 +233,7 @@ fn runServerPing(allocator: std.mem.Allocator, opts: *CliOptions) !bool {
                 ms,
             });
         } else {
-            _ = net.Address.resolveIp(service.address, service.port) catch |err| {
+            _ = common.resolveHostPort(global_io, service.address, service.port) catch |err| {
                 diagnostics.reportCheck(.fail, "Service '{s}' ({}) UDP target {s}:{d} not resolvable: {}", .{
                     service.name,
                     service.id,
@@ -290,7 +264,7 @@ fn runServerDoctor(allocator: std.mem.Allocator, opts: *CliOptions) !bool {
     std.debug.print("Floo Server Doctor\n===================\n", .{});
 
     var config_exists = true;
-    std.fs.cwd().access(opts.config_path, .{}) catch {
+    Io.Dir.cwd().access(global_io, opts.config_path, .{}) catch {
         config_exists = false;
     };
     if (config_exists) {
@@ -333,31 +307,24 @@ fn runServerDoctor(allocator: std.mem.Allocator, opts: *CliOptions) !bool {
         diagnostics.reportCheck(.warn, "Default token uses placeholder value; update to a secret", .{});
     }
 
-    const listen_addr = resolveHostPort(cfg.bind, cfg.port) catch |err| {
+    const listen_addr = common.resolveHostPort(global_io, cfg.bind, cfg.port) catch |err| {
         diagnostics.reportCheck(.fail, "Invalid listen address {s}:{d}: {}", .{ cfg.bind, cfg.port, err });
         return false;
     };
 
-    const listen_fd = posix.socket(listen_addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    if (listen_fd) |fd| {
-        defer _ = posix.system.close(fd);
-        const reuse: c_int = 1;
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(reuse)) catch {};
-        const bind_result = posix.bind(fd, &listen_addr.any, listen_addr.getOsSockLen());
-        if (bind_result) |_| {
-            diagnostics.reportCheck(.ok, "Bind check succeeded on {s}:{d}", .{ cfg.bind, cfg.port });
-        } else |err| {
-            if (err == error.AddressInUse) {
-                diagnostics.reportCheck(.warn, "Port {d} already in use on {s}", .{ cfg.port, cfg.bind });
-                had_fail = true;
-            } else {
-                diagnostics.reportCheck(.fail, "Failed to bind {s}:{d}: {}", .{ cfg.bind, cfg.port, err });
-                return false;
-            }
-        }
+    const probe_listen = listen_addr.listen(global_io, .{ .reuse_address = true });
+    if (probe_listen) |srv| {
+        var srv_mut = srv;
+        defer srv_mut.deinit(global_io);
+        diagnostics.reportCheck(.ok, "Bind check succeeded on {s}:{d}", .{ cfg.bind, cfg.port });
     } else |err| {
-        diagnostics.reportCheck(.fail, "Unable to create socket for bind check: {}", .{err});
-        return false;
+        if (err == error.AddressInUse) {
+            diagnostics.reportCheck(.warn, "Port {d} already in use on {s}", .{ cfg.port, cfg.bind });
+            had_fail = true;
+        } else {
+            diagnostics.reportCheck(.fail, "Failed to bind {s}:{d}: {}", .{ cfg.bind, cfg.port, err });
+            return false;
+        }
     }
 
     // Probe configured services (reuse ping logic)
@@ -495,8 +462,8 @@ const ReverseListener = struct {
 
             // Add stream to tunnel's streams map (CRITICAL for reverse routing)
             const key = StreamKey{ .service_id = self.service.id, .stream_id = stream_id };
-            self.tunnel_conn.streams_mutex.lock();
-            defer self.tunnel_conn.streams_mutex.unlock();
+            self.tunnel_conn.streams_mutex.lockUncancelable(global_io);
+            defer self.tunnel_conn.streams_mutex.unlock(global_io);
 
             stream.acquireRef(); // map reference
             self.tunnel_conn.streams.put(key, stream) catch |err| {
@@ -605,7 +572,7 @@ const TunnelConnection = struct {
     tunnel_reader: Io.net.Stream.Reader,
     tunnel_writer: Io.net.Stream.Writer,
     streams: std.HashMap(StreamKey, *Stream, StreamKeyContext, 80),
-    streams_mutex: std.Thread.Mutex,
+    streams_mutex: std.Io.Mutex,
     channel: transport.Channel,
     running: std.atomic.Value(bool),
 
@@ -637,7 +604,7 @@ const TunnelConnection = struct {
                 const remaining_ms = total_sleep_ms - slept_ms;
                 const this_sleep_ms = @min(sleep_increment_ms, remaining_ms);
                 const ns = @as(u64, this_sleep_ms) * std.time.ns_per_ms;
-                posix.nanosleep(ns / std.time.ns_per_s, ns % std.time.ns_per_s);
+                Io.sleep(global_io, .fromNanoseconds(@intCast(ns)), .awake) catch {};
                 slept_ms += this_sleep_ms;
             }
 
@@ -684,7 +651,7 @@ const TunnelConnection = struct {
             .tunnel_reader = undefined,
             .tunnel_writer = undefined,
             .streams = std.HashMap(StreamKey, *Stream, StreamKeyContext, 80).init(allocator),
-            .streams_mutex = .{},
+            .streams_mutex = .init,
             .channel = undefined,
             .running = std.atomic.Value(bool).init(true),
             .udp_forwarder = null,
@@ -787,7 +754,7 @@ const TunnelConnection = struct {
             }) catch unreachable;
             poll_entries.append(global_allocator, .{ .tunnel = {} }) catch unreachable;
 
-            self.streams_mutex.lock();
+            self.streams_mutex.lockUncancelable(global_io);
             var iter = self.streams.iterator();
             while (iter.next()) |entry| {
                 const stream_ptr = entry.value_ptr.*;
@@ -802,7 +769,7 @@ const TunnelConnection = struct {
                     .revents = 0,
                 }) catch unreachable;
             }
-            self.streams_mutex.unlock();
+            self.streams_mutex.unlock(global_io);
 
             const ready = posix.poll(poll_fds.items, poll_timeout_ms) catch |err| {
                 std.debug.print("[TUNNEL] Poll error: {}\n", .{err});
@@ -945,12 +912,12 @@ const TunnelConnection = struct {
                 const key = StreamKey{ .service_id = data_msg.service_id, .stream_id = data_msg.stream_id };
                 var stream_ref: ?*Stream = null;
 
-                self.streams_mutex.lock();
+                self.streams_mutex.lockUncancelable(global_io);
                 if (self.streams.get(key)) |s| {
                     s.acquireRef();
                     stream_ref = s;
                 }
-                self.streams_mutex.unlock();
+                self.streams_mutex.unlock(global_io);
 
                 if (stream_ref) |s| {
                     defer s.releaseRef();
@@ -967,9 +934,9 @@ const TunnelConnection = struct {
                 tracePrint(enable_tunnel_trace, "[TUNNEL] CLOSE service_id={} stream_id={}\n", .{ close_msg.service_id, close_msg.stream_id });
 
                 const key = StreamKey{ .service_id = close_msg.service_id, .stream_id = close_msg.stream_id };
-                self.streams_mutex.lock();
+                self.streams_mutex.lockUncancelable(global_io);
                 const maybe_stream = self.streams.fetchRemove(key);
-                self.streams_mutex.unlock();
+                self.streams_mutex.unlock(global_io);
 
                 if (maybe_stream) |entry| {
                     // Stream still exists, stop and destroy it
@@ -1000,9 +967,9 @@ const TunnelConnection = struct {
                 std.debug.print("[TUNNEL-REVERSE] CONNECT_ERROR from client: stream_id={} error={s}\n", .{ err_msg.stream_id, err_msg.error_msg });
 
                 const key = StreamKey{ .service_id = err_msg.service_id, .stream_id = err_msg.stream_id };
-                self.streams_mutex.lock();
+                self.streams_mutex.lockUncancelable(global_io);
                 const maybe_stream = self.streams.fetchRemove(key);
-                self.streams_mutex.unlock();
+                self.streams_mutex.unlock(global_io);
 
                 if (maybe_stream) |entry| {
                     entry.value.stop();
@@ -1110,10 +1077,10 @@ const TunnelConnection = struct {
             self.sendStreamClose(stream);
         }
 
-        self.streams_mutex.lock();
+        self.streams_mutex.lockUncancelable(global_io);
         const key = StreamKey{ .service_id = stream.service_id, .stream_id = stream.stream_id };
         const removed = self.streams.fetchRemove(key);
-        self.streams_mutex.unlock();
+        self.streams_mutex.unlock(global_io);
         if (removed) |_| {
             stream.releaseRef();
         }
@@ -1151,7 +1118,7 @@ const TunnelConnection = struct {
         switch (service.transport) {
             .tcp => {
                 const address = try common.resolveHostPort(global_io, service.address, service.port);
-                var target_stream = try address.connect(global_io, .{});
+                var target_stream = try address.connect(global_io, .{ .mode = .stream });
                 var target_stream_guard = true;
                 defer if (target_stream_guard) target_stream.close(global_io);
 
@@ -1162,8 +1129,8 @@ const TunnelConnection = struct {
                 const stream = try Stream.create(global_allocator, msg.service_id, msg.stream_id, target_stream, self);
                 target_stream_guard = false; // ownership transferred to Stream
 
-                self.streams_mutex.lock();
-                defer self.streams_mutex.unlock();
+                self.streams_mutex.lockUncancelable(global_io);
+                defer self.streams_mutex.unlock(global_io);
 
                 const key = StreamKey{ .service_id = msg.service_id, .stream_id = msg.stream_id };
                 stream.acquireRef(); // map reference
@@ -1180,6 +1147,7 @@ const TunnelConnection = struct {
 
                     const forwarder = try udp_server.UdpForwarder.create(
                         global_allocator,
+                        global_io,
                         msg.service_id,
                         service.address,
                         service.port,
@@ -1233,18 +1201,18 @@ const TunnelConnection = struct {
 
         // Stop and release all streams without holding the mutex during blocking calls
         while (true) {
-            self.streams_mutex.lock();
+            self.streams_mutex.lockUncancelable(global_io);
             var iter = self.streams.iterator();
             const entry = iter.next();
             if (entry) |e| {
                 const key_copy = e.key_ptr.*;
                 const stream_ptr = e.value_ptr.*;
                 _ = self.streams.remove(key_copy);
-                self.streams_mutex.unlock();
+                self.streams_mutex.unlock(global_io);
                 stream_ptr.stop();
                 stream_ptr.releaseRef();
             } else {
-                self.streams_mutex.unlock();
+                self.streams_mutex.unlock(global_io);
                 break;
             }
         }
@@ -1433,7 +1401,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("[READY] Server ready. Press Ctrl+C to stop.\n\n", .{});
 
     // Generate persistent static keypair for Noise XX authentication
-    const static_keypair = std.crypto.dh.X25519.KeyPair.generate();
+    const static_keypair = std.crypto.dh.X25519.KeyPair.generate(global_io);
 
     const ConnectionEntry = struct {
         conn: *TunnelConnection,
@@ -1640,43 +1608,32 @@ fn reverseServiceListener(ctx_ptr: *anyopaque) void {
         ctx.allocator.destroy(ctx);
     }
 
-    // Create listener socket
-    const local_addr = resolveHostPort(ctx.listen_host, ctx.listen_port) catch |err| {
+    // Create listener via Io.net
+    const local_addr = common.resolveHostPort(global_io, ctx.listen_host, ctx.listen_port) catch |err| {
         std.debug.print("[REVERSE-SERVICE] Failed to parse address for service_id={}: {}\n", .{ ctx.service_id, err });
         return;
     };
 
-    const listen_fd = posix.socket(local_addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch |err| {
-        std.debug.print("[REVERSE-SERVICE] Failed to create socket for service_id={}: {}\n", .{ ctx.service_id, err });
+    var server = local_addr.listen(global_io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("[REVERSE-SERVICE] Failed to listen on port {} for service_id={}: {}\n", .{ ctx.listen_port, ctx.service_id, err });
         return;
     };
-    defer _ = posix.system.close(listen_fd);
-
-    posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
-
-    posix.bind(listen_fd, &local_addr.any, local_addr.getOsSockLen()) catch |err| {
-        std.debug.print("[REVERSE-SERVICE] Failed to bind service_id={} on port {}: {}\n", .{ ctx.service_id, ctx.listen_port, err });
-        return;
-    };
-
-    posix.listen(listen_fd, common.LISTEN_BACKLOG) catch |err| {
-        std.debug.print("[REVERSE-SERVICE] Failed to listen for service_id={}: {}\n", .{ ctx.service_id, err });
-        return;
-    };
+    defer server.deinit(global_io);
 
     std.debug.print("[REVERSE-SERVICE] Listening on {s}:{} (service_id={}, reverse mode)\n", .{ ctx.listen_host, ctx.listen_port, ctx.service_id });
 
     // Accept loop
     while (!shutdown_flag.load(.acquire) and ctx.tunnel_conn.running.load(.acquire)) {
-        // Poll for accept with timeout
+        // Poll on the underlying handle so we can honor the 1s shutdown check.
         var fds = [_]posix.pollfd{
-            .{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
         };
+        const ready = posix.poll(&fds, 1000) catch continue;
+        if (ready == 0) continue;
 
-        const ready = posix.poll(&fds, 1000) catch continue; // 1s timeout
-        if (ready == 0) continue; // Timeout, check shutdown
-
-        const user_fd = posix.accept(listen_fd, null, null, posix.SOCK.CLOEXEC) catch |err| {
+        const user_stream = server.accept(global_io) catch |err| {
+            if (err == error.SocketNotListening) break;
+            if (err == error.WouldBlock or err == error.ConnectionAborted) continue;
             std.debug.print("[REVERSE-SERVICE] Accept error for service_id={}: {}\n", .{ ctx.service_id, err });
             continue;
         };
@@ -1687,7 +1644,7 @@ fn reverseServiceListener(ctx_ptr: *anyopaque) void {
         std.debug.print("[REVERSE-SERVICE] External user connected, sending CONNECT to client (service_id={}, stream_id={})\n", .{ ctx.service_id, stream_id });
 
         // Apply socket tuning
-        TunnelConnection.setSockOpts(user_fd, ctx.tunnel_conn.cfg);
+        TunnelConnection.setSockOpts(user_stream.socket.handle, ctx.tunnel_conn.cfg);
 
         // Send CONNECT message to client through tunnel
         const connect_msg = tunnel.ConnectMsg{
@@ -1699,35 +1656,35 @@ fn reverseServiceListener(ctx_ptr: *anyopaque) void {
         var encode_buf: [512]u8 = undefined;
         const encoded_len = connect_msg.encodeInto(&encode_buf) catch {
             std.debug.print("[REVERSE-SERVICE] Failed to encode CONNECT message\n", .{});
-            _ = posix.system.close(user_fd);
+            user_stream.close(global_io);
             continue;
         };
 
         ctx.tunnel_conn.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
             std.debug.print("[REVERSE-SERVICE] Failed to send CONNECT to client: {}\n", .{err});
             ctx.tunnel_conn.handleSendFailure(err);
-            _ = posix.system.close(user_fd);
+            user_stream.close(global_io);
             continue;
         };
 
-        // Create Stream to forward user_socket <-> tunnel
-        const stream = Stream.create(global_allocator, ctx.service_id, stream_id, user_fd, ctx.tunnel_conn) catch |err| {
+        // Create Stream to forward user_stream <-> tunnel
+        const stream = Stream.create(global_allocator, ctx.service_id, stream_id, user_stream, ctx.tunnel_conn) catch |err| {
             std.debug.print("[REVERSE-SERVICE] Failed to create stream: {}\n", .{err});
-            _ = posix.system.close(user_fd);
+            user_stream.close(global_io);
             continue;
         };
 
-        ctx.tunnel_conn.streams_mutex.lock();
+        ctx.tunnel_conn.streams_mutex.lockUncancelable(global_io);
         const key = StreamKey{ .service_id = ctx.service_id, .stream_id = stream_id };
         stream.acquireRef();
         ctx.tunnel_conn.streams.put(key, stream) catch |err| {
-            ctx.tunnel_conn.streams_mutex.unlock();
+            ctx.tunnel_conn.streams_mutex.unlock(global_io);
             std.debug.print("[REVERSE-SERVICE] Failed to register stream: {}\n", .{err});
             stream.releaseRef(); // undo map ref
             stream.stop();
             continue;
         };
-        ctx.tunnel_conn.streams_mutex.unlock();
+        ctx.tunnel_conn.streams_mutex.unlock(global_io);
 
         std.debug.print("[REVERSE-SERVICE] Stream {} created for reverse connection\n", .{stream_id});
     }
