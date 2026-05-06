@@ -50,7 +50,7 @@ pub const UdpForwarder = struct {
             .send_fn = send_fn,
             .running = std.atomic.Value(bool).init(true),
             .thread = undefined,
-            .session_manager = udp_session.UdpSessionManager.init(allocator),
+            .session_manager = udp_session.UdpSessionManager.init(allocator, io),
             .timeout_seconds = timeout_seconds,
         };
 
