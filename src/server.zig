@@ -387,7 +387,10 @@ const ReverseListener = struct {
         tunnel_conn: *TunnelConnection,
     ) !*ReverseListener {
         const addr = try common.resolveHostPort(global_io, service.address, service.port);
-        var server = try addr.listen(global_io, .{ .reuse_address = true });
+        // Reverse listeners are rebound on every tunnel reconnect — must NOT
+        // use addr.listen(.reuse_address=true) which sets SO_REUSEPORT on POSIX
+        // and lets the kernel load-balance to a stale listener mid-rebind.
+        var server = try common.bindListener(addr, common.LISTEN_BACKLOG);
         errdefer server.deinit(global_io);
 
         const listener = try allocator.create(ReverseListener);
@@ -460,16 +463,17 @@ const ReverseListener = struct {
                 continue;
             };
 
-            // Add stream to tunnel's streams map (CRITICAL for reverse routing)
+            // Add stream to tunnel's streams map (CRITICAL for reverse routing).
+            // The create ref IS the map ref — no extra acquireRef. On put failure,
+            // explicit releaseRef takes the count to 0 and destroys the stream.
             const key = StreamKey{ .service_id = self.service.id, .stream_id = stream_id };
             self.tunnel_conn.streams_mutex.lockUncancelable(global_io);
             defer self.tunnel_conn.streams_mutex.unlock(global_io);
 
-            stream.acquireRef(); // map reference
             self.tunnel_conn.streams.put(key, stream) catch |err| {
                 std.debug.print("[REVERSE] Failed to register stream: {}\n", .{err});
-                stream.releaseRef(); // undo map reference
                 stream.stop();
+                stream.releaseRef(); // drop create ref → destroys
                 continue;
             };
 
@@ -1133,11 +1137,10 @@ const TunnelConnection = struct {
                 defer self.streams_mutex.unlock(global_io);
 
                 const key = StreamKey{ .service_id = msg.service_id, .stream_id = msg.stream_id };
-                stream.acquireRef(); // map reference
+                // Create ref IS map ref — no extra acquire.
                 self.streams.put(key, stream) catch |err| {
-                    // Drop map ref before shutting down thread
-                    stream.releaseRef();
                     stream.stop();
+                    stream.releaseRef(); // drop create ref → destroys
                     return err;
                 };
             },
@@ -1614,7 +1617,7 @@ fn reverseServiceListener(ctx_ptr: *anyopaque) void {
         return;
     };
 
-    var server = local_addr.listen(global_io, .{ .reuse_address = true }) catch |err| {
+    var server = common.bindListener(local_addr, common.LISTEN_BACKLOG) catch |err| {
         std.debug.print("[REVERSE-SERVICE] Failed to listen on port {} for service_id={}: {}\n", .{ ctx.listen_port, ctx.service_id, err });
         return;
     };
@@ -1676,12 +1679,12 @@ fn reverseServiceListener(ctx_ptr: *anyopaque) void {
 
         ctx.tunnel_conn.streams_mutex.lockUncancelable(global_io);
         const key = StreamKey{ .service_id = ctx.service_id, .stream_id = stream_id };
-        stream.acquireRef();
+        // Create ref IS map ref — no extra acquire.
         ctx.tunnel_conn.streams.put(key, stream) catch |err| {
             ctx.tunnel_conn.streams_mutex.unlock(global_io);
             std.debug.print("[REVERSE-SERVICE] Failed to register stream: {}\n", .{err});
-            stream.releaseRef(); // undo map ref
             stream.stop();
+            stream.releaseRef(); // drop create ref → destroys
             continue;
         };
         ctx.tunnel_conn.streams_mutex.unlock(global_io);

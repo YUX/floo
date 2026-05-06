@@ -173,13 +173,19 @@ pub const Channel = struct {
 
     /// Send an immutable payload by copying it into an internal scratch buffer.
     /// Used for small control-plane messages and any caller that only has const data.
+    ///
+    /// Hot path: bypasses self.writer's Io.Writer interface and writes directly
+    /// via posix writev so we get one syscall per frame (matches the original
+    /// pre-migration writev semantics; the buffered Stream.Writer was costing
+    /// roughly 3x throughput due to per-call vtable dispatch + flush overhead).
     pub fn sendCopy(self: *Channel, payload: []const u8) !void {
         self.send_mutex.lockUncancelable(self.io);
         defer self.send_mutex.unlock(self.io);
 
+        const fd = self.stream.socket.handle;
+
         if (!self.encryption_enabled) {
-            try common.writeFrame(self.writer, payload);
-            try self.writer.flush();
+            try common.writeFrameDirect(fd, payload);
             self.recordTx(payload.len);
             return;
         }
@@ -192,20 +198,20 @@ pub const Channel = struct {
 
         @memcpy(target_buf[0..payload.len], payload);
         const encrypted_slice = try self.encryptInPlace(target_buf, payload.len);
-        try common.writeFrame(self.writer, encrypted_slice);
-        try self.writer.flush();
+        try common.writeFrameDirect(fd, encrypted_slice);
         self.recordTx(payload.len);
     }
 
     /// Encrypt (when necessary) and send a mutable payload in-place.
     /// `buffer.len` must include enough capacity for the ciphertext/tag.
+    ///
+    /// Hot path: same direct-writev rationale as sendCopy.
     pub fn sendDataInPlace(self: *Channel, buffer: []u8, payload_len: usize) !void {
         self.send_mutex.lockUncancelable(self.io);
         defer self.send_mutex.unlock(self.io);
 
         const slice = try self.prepareSendSlice(buffer, payload_len);
-        try common.writeFrame(self.writer, slice);
-        try self.writer.flush();
+        try common.writeFrameDirect(self.stream.socket.handle, slice);
         self.recordTx(payload_len);
     }
 

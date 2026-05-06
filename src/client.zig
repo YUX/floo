@@ -1060,14 +1060,13 @@ const TunnelClient = struct {
                     return;
                 };
 
-                // Add to connections
+                // Add to connections — create ref IS map ref.
                 self.connections_mutex.lockUncancelable(global_io);
-                conn.acquireRef(); // map reference
                 self.connections.put(msg.stream_id, conn) catch |err| {
                     self.connections_mutex.unlock(global_io);
                     std.debug.print("[CLIENT] Failed to store reverse connection: {}\n", .{err});
-                    conn.releaseRef(); // undo map ref
                     conn.stop();
+                    conn.releaseRef(); // drop create ref → destroys
                     return;
                 };
                 self.connections_mutex.unlock(global_io);
@@ -1109,12 +1108,12 @@ const TunnelClient = struct {
         const conn = try LocalConnection.create(global_allocator, msg.service_id, msg.stream_id, local_stream, self);
         stream_guard = false;
 
+        // Create ref IS map ref — no extra acquire.
         self.connections_mutex.lockUncancelable(global_io);
-        conn.acquireRef();
         self.connections.put(msg.stream_id, conn) catch |err| {
             self.connections_mutex.unlock(global_io);
-            conn.releaseRef();
             conn.stop();
+            conn.releaseRef(); // drop create ref → destroys
             return err;
         };
         self.connections_mutex.unlock(global_io);
@@ -1150,12 +1149,12 @@ const TunnelClient = struct {
         // Create local connection handler
         const conn = try LocalConnection.create(global_allocator, service_id, stream_id, local_stream, self);
 
+        // Create ref IS map ref — no extra acquire.
         self.connections_mutex.lockUncancelable(global_io);
-        conn.acquireRef();
         self.connections.put(stream_id, conn) catch |err| {
             self.connections_mutex.unlock(global_io);
-            conn.releaseRef();
             conn.stop();
+            conn.releaseRef(); // drop create ref → destroys
             return err;
         };
         self.connections_mutex.unlock(global_io);

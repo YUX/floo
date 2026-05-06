@@ -179,6 +179,67 @@ pub fn writeFrame(writer: *Io.Writer, payload: []const u8) !void {
     try writer.writeAll(payload);
 }
 
+/// Write a length-prefixed frame DIRECTLY via writev, bypassing any Io
+/// buffered Writer.
+///
+/// This is the hot data path. The std.Io.Stream.Writer interface adds 2-3
+/// vtable hops + buffering per frame, which costs us roughly 3x throughput
+/// vs the original posix.writev-based path. This helper restores the original
+/// scatter-gather behavior: one syscall per frame regardless of header/payload
+/// split. libc's writev is consistent across macOS and Linux (we link libc).
+pub fn writeFrameDirect(handle: posix.fd_t, payload: []const u8) !void {
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], @intCast(payload.len), .big);
+
+    var header_sent: usize = 0;
+    var payload_sent: usize = 0;
+
+    while (header_sent < header.len or payload_sent < payload.len) {
+        var iovecs_buf: [2]std.c.iovec_const = undefined;
+        var iovec_count: c_uint = 0;
+
+        if (header_sent < header.len) {
+            const remaining = header[header_sent..];
+            iovecs_buf[iovec_count] = .{ .base = remaining.ptr, .len = remaining.len };
+            iovec_count += 1;
+        }
+
+        if (payload_sent < payload.len) {
+            const remaining = payload[payload_sent..];
+            iovecs_buf[iovec_count] = .{ .base = remaining.ptr, .len = remaining.len };
+            iovec_count += 1;
+        }
+
+        const written = std.c.writev(handle, &iovecs_buf, iovec_count);
+        if (written < 0) {
+            const errno = std.posix.errno(written);
+            switch (errno) {
+                .INTR => continue,
+                .AGAIN => continue,
+                .PIPE => return error.ConnectionClosed,
+                .CONNRESET => return error.ConnectionClosed,
+                else => return error.WriteFailed,
+            }
+        }
+        if (written == 0) return error.ConnectionClosed;
+
+        var remaining: usize = @intCast(written);
+        if (header_sent < header.len) {
+            const header_remaining = header.len - header_sent;
+            if (remaining >= header_remaining) {
+                remaining -= header_remaining;
+                header_sent = header.len;
+            } else {
+                header_sent += remaining;
+                remaining = 0;
+            }
+        }
+        if (remaining > 0 and payload_sent < payload.len) {
+            payload_sent += @min(remaining, payload.len - payload_sent);
+        }
+    }
+}
+
 /// Format a std.Io.net.IpAddress into a temporary buffer for logging.
 pub fn formatAddress(addr: Io.net.IpAddress, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{f}", .{addr}) catch "unavailable";
@@ -203,6 +264,71 @@ pub fn resolveHostPort(io: Io, host: []const u8, port: u16) !Io.net.IpAddress {
 /// Receive an exact number of bytes through an Io.Reader.
 pub fn recvAll(reader: *Io.Reader, buffer: []u8) !void {
     return reader.readSliceAll(buffer);
+}
+
+/// Bind a TCP listener with ONLY SO_REUSEADDR (not SO_REUSEPORT).
+///
+/// std.Io.net.IpAddress.listen(.{ .reuse_address = true }) sets BOTH
+/// SO_REUSEADDR and SO_REUSEPORT on POSIX, which changes load-balancing
+/// semantics: the kernel distributes incoming connections across all
+/// listeners bound to the same port. That breaks floo's reverse-listener
+/// rebind (a new tunnel arriving briefly has both old and new listener
+/// bound — connections land on the soon-to-die one and get reset).
+///
+/// Returns a fully-formed Io.net.Server constructed from a raw libc socket.
+pub fn bindListener(addr: Io.net.IpAddress, backlog: u32) !Io.net.Server {
+    const family: c_uint = switch (addr) {
+        .ip4 => @intCast(std.c.AF.INET),
+        .ip6 => @intCast(std.c.AF.INET6),
+    };
+
+    // macOS' socket(2) rejects SOCK_CLOEXEC as a type-flag; set FD_CLOEXEC
+    // via fcntl after instead. (Linux accepts the SOCK_CLOEXEC bit but the
+    // fcntl path is portable.)
+    const fd = std.c.socket(family, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return error.SocketCreateFailed;
+    errdefer _ = std.c.close(fd);
+    _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+
+    const reuse: c_int = 1;
+    if (std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &reuse, @sizeOf(c_int)) != 0) {
+        return error.SetSockOptFailed;
+    }
+
+    switch (addr) {
+        .ip4 => |v4| {
+            var sa: std.c.sockaddr.in = .{
+                .family = std.c.AF.INET,
+                .port = std.mem.nativeToBig(u16, v4.port),
+                .addr = std.mem.bytesToValue(u32, &v4.bytes),
+                .zero = @splat(0),
+            };
+            if (std.c.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa))) != 0) {
+                return error.BindFailed;
+            }
+        },
+        .ip6 => |v6| {
+            var sa: std.c.sockaddr.in6 = .{
+                .family = std.c.AF.INET6,
+                .port = std.mem.nativeToBig(u16, v6.port),
+                .flowinfo = v6.flow,
+                .addr = v6.bytes,
+                .scope_id = v6.interface.index,
+            };
+            if (std.c.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa))) != 0) {
+                return error.BindFailed;
+            }
+        },
+    }
+
+    if (std.c.listen(fd, @intCast(backlog)) != 0) {
+        return error.ListenFailed;
+    }
+
+    return .{
+        .socket = .{ .handle = fd, .address = addr },
+        .options = if (Io.net.Server.AcceptOptions != void) .{ .mode = .stream, .protocol = .tcp } else {},
+    };
 }
 
 /// Write all bytes to a raw socket handle, looping over partial writes.
