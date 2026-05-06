@@ -70,18 +70,28 @@ pub const UdpForwarder = struct {
 
     pub fn stop(self: *UdpForwarder) void {
         self.running.store(false, .release);
-        var to_close = std.ArrayListUnmanaged(tunnel.StreamId).empty;
-        defer to_close.deinit(self.allocator);
 
-        self.sessions_mutex.lockUncancelable(self.io);
-        var iter = self.sessions.keyIterator();
-        while (iter.next()) |key_ptr| {
-            if (to_close.append(self.allocator, key_ptr.*)) |_| {} else |_| break;
-        }
-        self.sessions_mutex.unlock(self.io);
+        // Pop one session at a time under the lock. This avoids:
+        //   - The audit's B-5 leak: previously an OOM in the snapshot
+        //     ArrayList.append broke the loop and abandoned the
+        //     remaining sessions' threads + sockets.
+        //   - The B-4 race: any session created between the old
+        //     snapshot-collect and remove-loop was missed; now sessions
+        //     created concurrently are observed on the next iteration.
+        // The cost is one mutex acquire per session instead of one for
+        // the whole snapshot — fine for shutdown.
+        while (true) {
+            self.sessions_mutex.lockUncancelable(self.io);
+            var iter = self.sessions.keyIterator();
+            const next_key = iter.next();
+            const stream_id_opt = if (next_key) |k| k.* else null;
+            self.sessions_mutex.unlock(self.io);
 
-        for (to_close.items) |stream_id| {
-            self.removeSession(stream_id, false);
+            if (stream_id_opt) |stream_id| {
+                self.removeSession(stream_id, false);
+            } else {
+                break;
+            }
         }
     }
 

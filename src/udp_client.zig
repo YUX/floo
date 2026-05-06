@@ -132,16 +132,16 @@ pub const UdpForwarder = struct {
 
     /// Handle incoming UDP data from tunnel (forward to local client)
     pub fn handleUdpData(self: *UdpForwarder, udp_msg: tunnel.UdpDataMsg) !void {
-        const session = self.session_manager.getByStreamId(udp_msg.stream_id) orelse {
+        const dest_addr = self.session_manager.lookupSourceAddr(udp_msg.stream_id) orelse {
             std.debug.print("[UDP-CLIENT] Unknown stream_id={}, dropping packet\n", .{udp_msg.stream_id});
             return;
         };
 
-        try self.local_socket.send(self.io, &session.source_addr, udp_msg.data);
+        try self.local_socket.send(self.io, &dest_addr, udp_msg.data);
 
         std.debug.print("[UDP-CLIENT] Forwarded {} bytes to local {f}\n", .{
             udp_msg.data.len,
-            session.source_addr,
+            dest_addr,
         });
     }
 
