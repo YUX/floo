@@ -1992,8 +1992,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("\n[READY] All services ready. Press Ctrl+C to stop.\n\n", .{});
 
         // Wait for shutdown signal. Tick every 250ms; once per second we run
-        // UDP session eviction across all forwarders (matches the legacy
-        // single-service path's behavior).
+        // UDP session eviction across all forwarders.
         var udp_evict_counter: u8 = 0;
         while (!shutdown_flag.load(.acquire)) {
             processSignalNotifications(&shutdown_notice_printed);
@@ -2007,76 +2006,6 @@ pub fn main(init: std.process.Init) !void {
                 for (multi_service_udp_forwarders.items) |fwd| {
                     fwd.cleanupExpiredSessions() catch {};
                 }
-            }
-        }
-    } else if (default_transport == .udp) {
-        // Legacy single-service UDP mode
-        // UDP mode: create UDP forwarders
-        std.debug.print("[UDP-CLIENT] Creating UDP forwarders on port {}...\n", .{local_port});
-
-        // Wait for first tunnel to be available
-        while (loadTunnelClient(tunnel_clients, &tunnel_clients_mutex, 0) == null and !shutdown_flag.load(.acquire)) {
-            processSignalNotifications(&shutdown_notice_printed);
-            {
-                const ns = 100 * std.time.ns_per_ms;
-                Io.sleep(global_io, .fromNanoseconds(@intCast(ns)), .awake) catch {};
-            }
-        }
-
-        if (loadTunnelClient(tunnel_clients, &tunnel_clients_mutex, 0)) |first_client| {
-            // Allocate attachment first; the forwarder needs its address as
-            // the opaque pointer used by send_fn at create time.
-            const att = try allocator.create(UdpAttachment);
-            errdefer allocator.destroy(att);
-            att.* = UdpAttachment.init(undefined);
-
-            const forwarder = try udp_client.UdpForwarder.create(
-                allocator,
-                global_io,
-                default_service_id,
-                local_host,
-                local_port,
-                @ptrCast(att),
-                sendTunnelPayload,
-                cfg.advanced.udp_timeout_seconds,
-            );
-            att.forwarder = forwarder;
-            att.tunnel.store(first_client, .release);
-
-            // Register attachment so the tunnel-0 reconnection thread re-binds
-            // it on every reconnect (audit fix A-1).
-            tunnel_clients_mutex.lockUncancelable(global_io);
-            udp_attachments.append(allocator, att) catch {};
-            tunnel_clients_mutex.unlock(global_io);
-
-            try first_client.udp_forwarders.put(default_service_id, forwarder);
-
-            // Send CONNECT message to server to initialize UDP forwarder
-            const stream_id = first_client.next_stream_id.fetchAdd(1, .acq_rel);
-            const connect_msg = tunnel.ConnectMsg{
-                .service_id = default_service_id,
-                .stream_id = stream_id,
-                .token = first_client.default_token,
-            };
-
-            var encode_buf: [512]u8 = undefined;
-            const encoded_len = try connect_msg.encodeInto(&encode_buf);
-            try first_client.channel.sendCopy(encode_buf[0..encoded_len]);
-
-            std.debug.print("[UDP-CLIENT] Sent CONNECT message to server (stream_id={})\n", .{stream_id});
-            std.debug.print("[UDP-CLIENT] UDP forwarder ready on {s}:{}\n", .{ local_host, local_port });
-            std.debug.print("[READY] Client ready. Press Ctrl+C to stop.\n\n", .{});
-
-            // Wait for shutdown signal
-            while (!shutdown_flag.load(.acquire)) {
-                processSignalNotifications(&shutdown_notice_printed);
-                {
-                    const ns = 250 * std.time.ns_per_ms;
-                    Io.sleep(global_io, .fromNanoseconds(@intCast(ns)), .awake) catch {};
-                }
-
-                // Periodic session cleanup
-                forwarder.cleanupExpiredSessions() catch {};
             }
         }
     } else {
