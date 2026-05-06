@@ -1,17 +1,22 @@
 const std = @import("std");
 const posix = std.posix;
-const net = @import("net_compat.zig");
+const Io = std.Io;
 const tunnel = @import("tunnel.zig");
 const noise = @import("noise.zig");
 const common = @import("common.zig");
 
 /// Server-side UDP forwarder.
-/// Each tunnel stream gets an independent connected UDP socket so replies from
-/// the target can be associated with the originating client stream.
+///
+/// Each tunnel stream gets an independent ephemeral UDP socket so replies
+/// from the target can be associated with the originating client stream.
+/// Unlike the previous "connected UDP" design, std.Io.net.Socket has no
+/// connect operation for datagrams, so we keep `target_addr` on the
+/// forwarder and pass it to every send().
 pub const UdpForwarder = struct {
     allocator: std.mem.Allocator,
+    io: Io,
     service_id: tunnel.ServiceId,
-    target_addr: net.Address,
+    target_addr: Io.net.IpAddress,
     tunnel_conn: *anyopaque,
     send_fn: *const fn (conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void,
     running: std.atomic.Value(bool),
@@ -21,6 +26,7 @@ pub const UdpForwarder = struct {
 
     pub fn create(
         allocator: std.mem.Allocator,
+        io: Io,
         service_id: tunnel.ServiceId,
         target_host: []const u8,
         target_port: u16,
@@ -28,10 +34,11 @@ pub const UdpForwarder = struct {
         send_fn: *const fn (conn: *anyopaque, buffer: []u8, payload_len: usize) anyerror!void,
         timeout_seconds: u64,
     ) !*UdpForwarder {
-        const target_addr = try net.Address.resolveIp(target_host, target_port);
+        const target_addr = try common.resolveHostPort(io, target_host, target_port);
         const forwarder = try allocator.create(UdpForwarder);
         forwarder.* = .{
             .allocator = allocator,
+            .io = io,
             .service_id = service_id,
             .target_addr = target_addr,
             .tunnel_conn = tunnel_conn,
@@ -54,7 +61,7 @@ pub const UdpForwarder = struct {
 
         const session = try self.ensureSession(udp_msg.stream_id, udp_msg.source_addr, udp_msg.source_port, now);
 
-        _ = posix.send(session.socket_fd, udp_msg.data, 0) catch |err| {
+        session.socket.send(self.io, &self.target_addr, udp_msg.data) catch |err| {
             std.debug.print("[UDP-SERVER] send error for stream {}: {}\n", .{ udp_msg.stream_id, err });
             return err;
         };
@@ -86,7 +93,7 @@ pub const UdpForwarder = struct {
 
     const Session = struct {
         stream_id: tunnel.StreamId,
-        socket_fd: posix.fd_t,
+        socket: Io.net.Socket,
         thread: std.Thread,
         running: std.atomic.Value(bool),
         forwarder: *UdpForwarder,
@@ -116,14 +123,18 @@ pub const UdpForwarder = struct {
         }
         self.sessions_mutex.unlock();
 
-        const fd = try posix.socket(self.target_addr.any.family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
-        errdefer posix.close(fd);
-        try posix.connect(fd, &self.target_addr.any, self.target_addr.getOsSockLen());
+        // Bind an ephemeral local UDP socket on the same address family as the target.
+        const ephemeral: Io.net.IpAddress = switch (self.target_addr) {
+            .ip4 => .{ .ip4 = Io.net.Ip4Address.unspecified(0) },
+            .ip6 => .{ .ip6 = Io.net.Ip6Address.unspecified(0) },
+        };
+        const sock = try ephemeral.bind(self.io, .{ .mode = .dgram });
+        errdefer sock.close(self.io);
 
         const session = try self.allocator.create(Session);
         session.* = .{
             .stream_id = stream_id,
-            .socket_fd = fd,
+            .socket = sock,
             .thread = undefined,
             .running = std.atomic.Value(bool).init(true),
             .forwarder = self,
@@ -137,7 +148,7 @@ pub const UdpForwarder = struct {
         session.thread = std.Thread.spawn(.{
             .stack_size = common.DEFAULT_THREAD_STACK,
         }, sessionRecvThread, .{session}) catch |err| {
-            posix.close(fd);
+            sock.close(self.io);
             self.allocator.destroy(session);
             return err;
         };
@@ -146,9 +157,9 @@ pub const UdpForwarder = struct {
         self.sessions.put(stream_id, session) catch |err| {
             self.sessions_mutex.unlock();
             session.running.store(false, .release);
-            posix.shutdown(session.socket_fd, .recv) catch {};
+            _ = posix.system.shutdown(session.socket.handle, posix.SHUT.RD);
             session.thread.join();
-            posix.close(session.socket_fd);
+            session.socket.close(self.io);
             self.allocator.destroy(session);
             return err;
         };
@@ -162,11 +173,11 @@ pub const UdpForwarder = struct {
         const forwarder = session.forwarder;
 
         while (session.running.load(.acquire) and forwarder.running.load(.acquire)) {
-            const n = posix.recv(session.socket_fd, &buf, 0) catch |err| {
-                if (err == error.Interrupted) continue;
+            const msg = session.socket.receive(forwarder.io, &buf) catch {
+                if (!session.running.load(.acquire)) break;
                 break;
             };
-            if (n <= 0) continue;
+            if (msg.data.len == 0) continue;
 
             session.last_activity_ns.store(@as(i64, @intCast(common.nanoTimestamp())), .release);
 
@@ -176,7 +187,7 @@ pub const UdpForwarder = struct {
                 .stream_id = session.stream_id,
                 .source_addr = session.source_addr[0..session.source_addr_len],
                 .source_port = session.source_port,
-                .data = buf[0..n],
+                .data = msg.data,
             };
 
             const encoded_len = udp_msg.encodeInto(&encode_buf) catch {
@@ -194,8 +205,6 @@ pub const UdpForwarder = struct {
     fn pruneExpiredSessions(self: *UdpForwarder, now: i64) void {
         if (self.timeout_ns == 0) return;
 
-        // Workaround for Zig compiler bug in Debug mode on some platforms
-        // Split into smaller parts to avoid genSetReg error
         var expired_items = std.ArrayListUnmanaged(tunnel.StreamId).empty;
         defer expired_items.deinit(self.allocator);
 
@@ -216,7 +225,6 @@ pub const UdpForwarder = struct {
             }
         }
 
-        // Remove expired sessions outside the lock
         for (expired_items.items) |stream_id| {
             self.removeSession(stream_id, false);
         }
@@ -230,11 +238,11 @@ pub const UdpForwarder = struct {
         if (entry) |removed| {
             const session = removed.value;
             session.running.store(false, .release);
-            posix.shutdown(session.socket_fd, .recv) catch {};
+            _ = posix.system.shutdown(session.socket.handle, posix.SHUT.RD);
             if (!caller_is_thread) {
                 session.thread.join();
             }
-            posix.close(session.socket_fd);
+            session.socket.close(self.io);
             self.allocator.destroy(session);
             std.debug.print("[UDP-SERVER] Session {} closed\n", .{stream_id});
         }
