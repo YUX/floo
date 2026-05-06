@@ -6,7 +6,7 @@ const tunnel = @import("tunnel.zig");
 pub const DEFAULT_PSK = "change-me-psk";
 pub const DEFAULT_TOKEN = "change-me-token";
 pub const DEFAULT_PORT = 8443;
-pub const DEFAULT_CIPHER = "aes256gcm";
+pub const DEFAULT_CIPHER = "aegis128l";
 
 pub const Transport = enum {
     tcp,

@@ -3,7 +3,7 @@
 # Credentials must match your server!
 
 server = "your-server:8443"
-cipher = "aes256gcm"
+cipher = "aegis128l"
 psk = "REPLACE_ME"      # ⚠️ Must match server PSK!
 token = "REPLACE_ME"    # ⚠️ Must match server token!
 

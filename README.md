@@ -114,7 +114,7 @@ Edit `floos.toml` and set your **real credentials**:
 ```toml
 bind = "0.0.0.0"
 port = 8443
-cipher = "aes256gcm"
+cipher = "aegis128l"
 psk = "YOUR_GENERATED_PSK_HERE"        # ← Paste your openssl output
 token = "YOUR_GENERATED_TOKEN_HERE"    # ← Paste your openssl output
 
@@ -137,7 +137,7 @@ cp configs/flooc.example.toml flooc.toml
 Edit `flooc.toml` with the **same credentials**:
 ```toml
 server = "your-vps-ip:8443"            # ← Your VPS address
-cipher = "aes256gcm"
+cipher = "aegis128l"
 psk = "YOUR_GENERATED_PSK_HERE"        # ← Must match server!
 token = "YOUR_GENERATED_TOKEN_HERE"    # ← Must match server!
 
@@ -272,10 +272,10 @@ Choose based on your hardware:
 
 | Cipher | Single Stream | Multi-Stream (4x) | Hardware Acceleration | Use When |
 |--------|---------------|-------------------|----------------------|----------|
-| `aegis128l` | **22.1 Gbps** | **7.7 Gbps** | ARMv8, x86 AES-NI | Modern CPU, max speed |
+| `aegis128l` (**default**) | **22.1 Gbps** | **7.7 Gbps** | ARMv8, x86 AES-NI | Modern CPU, max speed |
 | `aegis256` | **19.2 Gbps** | **7.4 Gbps** | ARMv8, x86 AES-NI | Modern CPU, max security |
 | `aes128gcm` | **14.5 Gbps** | **5.9 Gbps** | ARMv8, x86 AES-NI | Modern CPU, compatibility |
-| `aes256gcm` | **13.4 Gbps** | **5.6 Gbps** | ARMv8, x86 AES-NI | Modern CPU, standard choice |
+| `aes256gcm` | **13.4 Gbps** | **5.6 Gbps** | ARMv8, x86 AES-NI | Compliance / FIPS-style |
 | `chacha20poly1305` | **3.4 Gbps** | **2.3 Gbps** | Software-only | Older CPU, mobile devices |
 | `none` (plaintext) | **30.9 Gbps** | **9.6 Gbps** | N/A | Debug/testing only |
 
