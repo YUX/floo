@@ -782,10 +782,15 @@ fn parseServiceDefinition(allocator: std.mem.Allocator, name: []const u8, value:
     var transport: Transport = .tcp;
     var addr_port = value;
 
-    // Check for transport suffix
+    // Check for transport suffix. Audit B-12: previously a typo like
+    // `dns = "10.0.0.5:53/udq"` silently became tcp; surface the error
+    // instead so users notice their misconfiguration.
     if (std.mem.lastIndexOfScalar(u8, value, '/')) |slash_pos| {
         const transport_str = value[slash_pos + 1 ..];
-        transport = Transport.fromString(transport_str) orelse .tcp;
+        transport = Transport.fromString(transport_str) orelse {
+            std.debug.print("[CONFIG] Unknown transport '{s}' for service '{s}'; expected 'tcp' or 'udp'\n", .{ transport_str, name });
+            return error.InvalidTransport;
+        };
         addr_port = value[0..slash_pos];
     }
 
