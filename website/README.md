@@ -4,12 +4,12 @@ Modern, cyberpunk-themed project website for Floo, built with React and Vite.
 
 ## Features
 
-- 🎨 Dark/cyberpunk themed design with neon accents
-- ⚡ Animated hero section with performance metrics
-- 📊 Interactive performance benchmarks
-- 🔗 Live GitHub integration (stars, releases)
-- 📱 Fully responsive design
-- 🚀 Fast and optimized with Vite
+- Dark/cyberpunk themed design with neon accents
+- Animated hero section with performance metrics
+- Interactive performance benchmarks
+- Live GitHub integration (stars, releases)
+- Fully responsive design
+- Fast and optimized with Vite
 
 ## Development
 
@@ -63,20 +63,20 @@ If you need to deploy manually:
 ```
 website/
 ├── src/
-│   ├── components/        # React components
-│   │   ├── Hero.jsx       # Hero section with animated metrics
-│   │   ├── Features.jsx   # Features grid
+│   ├── components/         # React components
+│   │   ├── Hero.jsx        # Hero section with animated metrics
+│   │   ├── Features.jsx    # Features grid
 │   │   ├── Performance.jsx # Performance benchmarks
 │   │   ├── Installation.jsx # Installation guide
-│   │   ├── GitHub.jsx     # GitHub stats integration
-│   │   └── Footer.jsx     # Footer
-│   ├── App.jsx            # Main app component
-│   ├── App.css            # Global app styles
-│   ├── index.css          # Global CSS variables and theme
-│   └── main.jsx           # Entry point
-├── index.html             # HTML template
-├── vite.config.js         # Vite configuration
-└── package.json           # Dependencies and scripts
+│   │   ├── GitHub.jsx      # GitHub stats integration
+│   │   └── Footer.jsx      # Footer
+│   ├── App.jsx             # Main app component
+│   ├── App.css             # Global app styles
+│   ├── index.css           # Global CSS variables and theme
+│   └── main.jsx            # Entry point
+├── index.html              # HTML template
+├── vite.config.js          # Vite configuration
+└── package.json            # Dependencies and scripts
 ```
 
 ## Customization
@@ -87,10 +87,10 @@ Edit the CSS variables in `src/index.css`:
 
 ```css
 :root {
-  --accent-cyan: #00f3ff;
-  --accent-pink: #ff006e;
-  --accent-purple: #8b5cf6;
-  /* ... */
+    --accent-cyan: #00f3ff;
+    --accent-pink: #ff006e;
+    --accent-purple: #8b5cf6;
+    /* ... */
 }
 ```
 

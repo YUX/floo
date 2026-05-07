@@ -13,17 +13,17 @@ _/ ____\  |   ____   ____
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Floo** is a lightweight, secure tunneling toolkit that lets you:
-- 🔒 Access private services through encrypted tunnels
-- 🌐 Expose local services to the internet securely
-- ⚡ Achieve multi-gigabit throughput (22-31 Gbps with hardware crypto)
-- 🧠 Auto-scale tunnels to your CPU cores and pin them to dedicated threads
-- 📦 Deploy a single static binary with zero dependencies
+- Access private services through encrypted tunnels
+- Expose local services to the internet securely
+- Achieve multi-gigabit throughput (22-31 Gbps with hardware crypto)
+- Auto-scale tunnels to your CPU cores and pin them to dedicated threads
+- Deploy a single static binary with zero dependencies
 
 Written in Zig with modern cryptography (Noise XX protocol), Floo provides both **forward tunneling** (reach into private networks) and **reverse tunneling** (expose local services) with strong authentication.
 
 ---
 
-## 🎯 Common Use Cases
+## Common Use Cases
 
 <details>
 <summary><b>Access your home database from anywhere</b></summary>
@@ -73,7 +73,7 @@ proxy_url = "socks5://corporate-proxy:1080"
 
 ---
 
-## 🚀 Quick Start (5 minutes)
+## Quick Start (5 minutes)
 
 ### Step 1: Get Floo
 
@@ -91,7 +91,7 @@ zig build -Doptimize=ReleaseFast
 
 ### Step 2: Generate Strong Credentials
 
-⚠️ **Security First**: Never use default or weak credentials!
+**Security First.** Never use default or weak credentials. Floo refuses to start with example placeholders, default strings, or PSKs shorter than 16 characters or with too few distinct byte values.
 
 ```bash
 # Generate a strong PSK (Pre-Shared Key)
@@ -115,8 +115,8 @@ Edit `floos.toml` and set your **real credentials**:
 bind = "0.0.0.0"
 port = 8443
 cipher = "aegis128l"
-psk = "YOUR_GENERATED_PSK_HERE"        # ← Paste your openssl output
-token = "YOUR_GENERATED_TOKEN_HERE"    # ← Paste your openssl output
+psk = "YOUR_GENERATED_PSK_HERE" # ← Paste your openssl output
+token = "YOUR_GENERATED_TOKEN_HERE" # ← Paste your openssl output
 
 [services]
 # Example: allow clients to reach an internal database
@@ -136,10 +136,10 @@ cp configs/flooc.example.toml flooc.toml
 
 Edit `flooc.toml` with the **same credentials**:
 ```toml
-server = "your-vps-ip:8443"            # ← Your VPS address
+server = "your-vps-ip:8443" # ← Your VPS address
 cipher = "aegis128l"
-psk = "YOUR_GENERATED_PSK_HERE"        # ← Must match server!
-token = "YOUR_GENERATED_TOKEN_HERE"    # ← Must match server!
+psk = "YOUR_GENERATED_PSK_HERE" # ← Must match server!
+token = "YOUR_GENERATED_TOKEN_HERE" # ← Must match server!
 
 [services]
 # Listen locally and connect through tunnel to server's "database" service
@@ -184,7 +184,7 @@ curl http://your-vps-ip:8096
 
 ---
 
-## 📖 Understanding Forward vs Reverse Modes
+## Understanding Forward vs Reverse Modes
 
 ### Forward Mode: Reach Into Private Networks
 
@@ -193,11 +193,11 @@ curl http://your-vps-ip:8096
 ```
 ┌─────────┐    encrypted    ┌─────────┐              ┌──────────┐
 │ Laptop  │───────tunnel────│   VPS   │──────────────│ Home DB  │
-│ (you)   │                 │ (floos) │    local     │ 10.0.0.5 │
+│ (you)   │                 │ (floos) │     local    │ 10.0.0.5 │
 └─────────┘                 └─────────┘              └──────────┘
- flooc
- connects to                 defines [services]
- 127.0.0.1:5432             database = "10.0.0.5:5432"
+ flooc                                                      ^
+ connects to                  defines [services]
+ 127.0.0.1:5432               database = "10.0.0.5:5432"
 ```
 
 **Client config** (`flooc.toml`): Local listener
@@ -217,13 +217,13 @@ database = "10.0.0.5:5432"
 **Scenario**: Share your home media server with friends.
 
 ```
-┌─────────┐              ┌─────────┐     encrypted   ┌──────────┐
+┌─────────┐              ┌─────────┐    encrypted    ┌──────────┐
 │ Friend  │──────────────│   VPS   │───────tunnel────│ Home     │
 │ Browser │   internet   │ (floos) │                 │ Jellyfin │
 └─────────┘              └─────────┘                 └──────────┘
-                         binds on                     flooc
-connects to              0.0.0.0:8096                 exposes
-your-vps:8096            [reverse_services]          127.0.0.1:8096
+                          binds on                     flooc
+ connects to              0.0.0.0:8096                 exposes
+ your-vps:8096            [reverse_services]           127.0.0.1:8096
 ```
 
 **Server config** (`floos.toml`): Public listener
@@ -240,7 +240,7 @@ media = "127.0.0.1:8096"
 
 ---
 
-## 🛠️ Configuration Reference
+## Configuration Reference
 
 ### Minimal Config
 
@@ -268,18 +268,16 @@ web = "127.0.0.1:8080"
 
 ### Cipher Options
 
-Choose based on your hardware:
+Choose based on your hardware. See the [Performance](#performance) section for measured throughput.
 
-| Cipher | Single Stream | Multi-Stream (4x) | Hardware Acceleration | Use When |
-|--------|---------------|-------------------|----------------------|----------|
-| `aegis128l` (**default**) | **22.1 Gbps** | **7.7 Gbps** | ARMv8, x86 AES-NI | Modern CPU, max speed |
-| `aegis256` | **19.2 Gbps** | **7.4 Gbps** | ARMv8, x86 AES-NI | Modern CPU, max security |
-| `aes128gcm` | **14.5 Gbps** | **5.9 Gbps** | ARMv8, x86 AES-NI | Modern CPU, compatibility |
-| `aes256gcm` | **13.4 Gbps** | **5.6 Gbps** | ARMv8, x86 AES-NI | Compliance / FIPS-style |
-| `chacha20poly1305` | **3.4 Gbps** | **2.3 Gbps** | Software-only | Older CPU, mobile devices |
-| `none` (plaintext) | **30.9 Gbps** | **9.6 Gbps** | N/A | Debug/testing only |
-
-**Performance tested on Apple M1 (4 vCPU). Single stream = optimal throughput, Multi-stream = realistic concurrent usage.**
+| Cipher | Hardware Acceleration | Use When |
+|---|---|---|
+| `aegis128l` (**default**) | ARMv8 crypto, x86 AES-NI | Modern CPU, balanced speed/security |
+| `aegis256` | ARMv8 crypto, x86 AES-NI | Modern CPU, larger security margin |
+| `aes128gcm` | ARMv8 crypto, x86 AES-NI | Modern CPU, broadest compatibility |
+| `aes256gcm` | ARMv8 crypto, x86 AES-NI | Compliance / FIPS-style requirements |
+| `chacha20poly1305` | Software-only | Older CPUs without AES-NI, mobile |
+| `none` (plaintext) | N/A | Debugging on a trusted network — encryption is off but PSK auth still runs |
 
 ### Per-Service Tokens
 
@@ -312,38 +310,41 @@ voip = "10.0.0.30:5060/udp"
 
 ```toml
 [advanced]
-socket_buffer_size = 4194304      # 4MB buffers for high throughput
-num_tunnels = 0                   # 0 = auto based on CPU cores
-pin_threads = true                # Pin tunnel handlers to CPU cores
-io_batch_bytes = 131072           # Per-stream I/O buffer size
-tcp_nodelay = true                # Disable Nagle for lower latency
-heartbeat_interval_seconds = 30   # Keepalive frequency
+socket_buffer_size = 4194304 # 4MB buffers for high throughput
+num_tunnels = 0 # 0 = auto based on CPU cores
+pin_threads = true # Pin tunnel handlers to CPU cores
+io_batch_bytes = 131072 # Per-stream I/O buffer size
+tcp_nodelay = true # Disable Nagle for lower latency
+heartbeat_interval_seconds = 30 # Keepalive frequency
 ```
 
-> ℹ️ **num_tunnels**: leave at `0` to match your CPU core count automatically. Set an explicit number only when you need to cap or boost tunnel fan-out.
+> **num_tunnels**: leave at `0` to match your CPU core count automatically. Set an explicit number only when you need to cap or boost tunnel fan-out.
 >
-> ℹ️ **pin_threads**: keeps each tunnel on a dedicated core (Linux/Unix). Disable only if your scheduler forbids manual affinity.
+> **pin_threads**: keeps each tunnel on a dedicated core (Linux/Unix). Disable only if your scheduler forbids manual affinity.
 >
-> ℹ️ **io_batch_bytes**: per-stream read/write buffer size. Increase for jumbo frames or high-latency satellite links; decrease for memory-constrained devices.
+> **io_batch_bytes**: per-stream read/write buffer size. Increase for jumbo frames or high-latency satellite links; decrease for memory-constrained devices.
 
 ---
 
-## 🔍 Built-in Diagnostics
+## Built-in Diagnostics
 
-Validate your configuration before running:
+Validate your configuration before running. `--doctor` checks the config file, network reachability, credential strength, and probes every local listener you've configured (TCP services with `listen()`, UDP services with `bind()`) plus every reverse-service target with a real connect:
 
 ```bash
 # Test server config
 ./floos --doctor floos.toml
-# ✓ Configuration valid
-# ✓ Can bind on 0.0.0.0:8443
-# ✓ All forward targets reachable
+# [OK]   Configuration parsed
+# [OK]   Bind 0.0.0.0:8443 available
+# [OK]   All forward targets reachable
 
 # Test client config
 ./flooc --doctor flooc.toml
-# ✓ Configuration valid
-# ✓ Server reachable at vps.example.com:8443
-# ⚠ Warning: proxy_url not set
+# [OK]   Configuration parsed (services: 2)
+# [OK]   Remote vps.example.com:8443 resolves to 198.51.100.42:8443
+# [OK]   Local TCP port 5432 available for service 'database' on 127.0.0.1
+# [OK]   Local UDP port 53   available for service 'dns'      on 127.0.0.1
+# [OK]   Reverse target 127.0.0.1:8096 reachable for service 'media'
+# [OK]   Ping succeeded (connect 0.21 ms, handshake 1.84 ms)
 ```
 
 Measure tunnel latency:
@@ -357,13 +358,13 @@ Test target connectivity:
 
 ```bash
 ./floos --ping floos.toml
-# [PING] database (10.0.0.5:5432): 1.2ms ✓
-# [PING] api (10.0.0.10:443): 3.5ms ✓
+# [PING] database (10.0.0.5:5432): 1.2ms
+# [PING] api (10.0.0.10:443): 3.5ms
 ```
 
 ---
 
-## 📦 Prebuilt Binaries
+## Prebuilt Binaries
 
 Every release publishes optimized binaries for:
 
@@ -381,7 +382,7 @@ Download from [releases page](https://github.com/YUX/floo/releases).
 
 ---
 
-## 🏗️ Building from Source
+## Building from Source
 
 Requires [Zig 0.16.0](https://ziglang.org/download/) (stable).
 
@@ -410,25 +411,25 @@ zig build test
 
 ---
 
-## 🔐 Security Features
+## Security Features
 
-- ✅ **Noise XX protocol** - Modern cryptographic handshake with perfect forward secrecy
-- ✅ **AEAD ciphers** - Authenticated encryption prevents tampering
-- ✅ **PSK authentication** - Mutual verification of server and client
-- ✅ **Per-service tokens** - Fine-grained access control
-- ✅ **Constant-time comparisons** - Prevents timing attacks
-- ✅ **Rate limiting** - Protects against connection floods (100/sec default)
-- ✅ **No default credentials** - Refuses to start with example passwords
+- **Noise XX protocol** — modern cryptographic handshake with perfect forward secrecy
+- **AEAD ciphers** — authenticated encryption prevents tampering
+- **PSK authentication** — mutual verification of server and client; required even when `cipher = "none"` (a small HMAC-SHA256 nonce-bound proof-of-knowledge handshake runs in plaintext mode too, so an attacker who reaches the port without the PSK still cannot speak the protocol)
+- **Per-service tokens** — fine-grained access control
+- **Constant-time comparisons** — prevents timing attacks on PSK and token checks
+- **Rate limiting** — protects against connection floods (100/sec default; the slow-path refill is single-winner-by-CAS so the bucket can't be over-refilled under contention)
+- **No default credentials** — refuses to start with the example PSK/token, refuses placeholder strings (`REPLACE_*`, `YOUR_GENERATED_*`, `changeme`, …), and refuses any PSK shorter than 16 characters or with fewer than 8 distinct byte values
 
-⚠️ **Important Security Notes**:
-1. Always use strong, randomly-generated PSKs and tokens
+**Important Security Notes:**
+1. Always use strong, randomly-generated PSKs and tokens (`openssl rand -base64 32`)
 2. Never commit credentials to version control
 3. Rotate credentials if you suspect compromise
-4. Use `cipher = "none"` only for debugging on trusted networks
+4. `cipher = "none"` disables encryption and frame integrity, but **not** authentication — it is intended for debugging on trusted networks where you want to inspect plaintext frames; tokens still travel in cleartext over the link, so do not use it on untrusted networks.
 
 ---
 
-## 📚 Examples
+## Examples
 
 The `examples/` directory contains complete working setups:
 
@@ -443,7 +444,7 @@ Each example includes ready-to-use config files and setup instructions.
 
 ---
 
-## 🗺️ Roadmap
+## Roadmap
 
 - [ ] Compression for high-latency links
 - [ ] io_uring backend (Linux performance boost)
@@ -453,7 +454,7 @@ Each example includes ready-to-use config files and setup instructions.
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Pull requests welcome! Please:
 - Include tests for protocol changes
@@ -463,44 +464,46 @@ Pull requests welcome! Please:
 
 ---
 
-## 📄 License
+## License
 
 MIT License - see [LICENSE](LICENSE) file.
 
 ---
 
-## ⚡ Performance
+## Performance
 
-Benchmarked on Apple M1 (4 vCPU), 1 second duration:
+Benchmarked on Apple M1 (8 vCPU), forward mode, 4 streams × 8 tunnels × 3 sec, ReleaseFast. Receiver-side throughput.
 
-### Single Stream (Optimal Throughput)
+| Cipher | Throughput | Notes |
+|---|---:|---|
+| Raw loopback (control) | ~80 Gbps | Reference: pure iperf3 over loopback |
+| `aes128gcm` | **24.4 Gbps** | Best encrypted, ARMv8 AES extensions |
+| `aes256gcm` | 22.2 Gbps | |
+| `aegis256` | 20.4 Gbps | |
+| `aegis128l` (default) | 20.5 Gbps | |
+| `none` (plaintext) | 18.7 Gbps | Encryption off, PSK auth still required |
+| `chacha20poly1305` | 6.65 Gbps | Software-only AEAD |
 
-| Cipher | Forward | Reverse | vs FRP | vs Rathole |
-|--------|---------|---------|--------|------------|
-| **Plaintext** | **30.9 Gbps** | **30.5 Gbps** | **3.4x faster** | **1.9x faster** |
-| **AEGIS-128L** | **22.1 Gbps** | **23.3 Gbps** | **2.4x faster** | **1.3x faster** |
-| **AEGIS-256** | **19.2 Gbps** | **21.2 Gbps** | **2.1x faster** | **1.2x faster** |
-| **AES-128-GCM** | **14.5 Gbps** | **16.2 Gbps** | **1.6x faster** | Similar |
-| **AES-256-GCM** | **13.4 Gbps** | **14.1 Gbps** | **1.5x faster** | Similar |
-| **ChaCha20** | **3.4 Gbps** | **3.4 Gbps** | Similar | 0.5x |
+The unreleased post-audit work (P-1: cached pollfd array with generation-counter invalidation in the recv loop) lifts hardware-accelerated ciphers by 5–10% over the v0.2.0 baseline on this hardware:
 
-*FRP: 9.2 Gbps, Rathole: 16.6 Gbps (single stream baseline)*
+| Cipher | v0.2.0 | Post-fix | Δ |
+|---|---:|---:|---:|
+| `aes128gcm` | 22.1 | 24.4 | +10.4% |
+| `aes256gcm` | 20.9 | 22.2 | +6.2% |
+| `aegis128l` | 19.4 | 20.5 | +5.7% |
+| `chacha20`, `none`, `aegis256` | — | — | within ±5% bench noise |
 
-### Multi-Stream (4 Concurrent Streams)
+**Key takeaway:** for maximum throughput on modern x86/ARM, use AES-128-GCM or AEGIS-128L; ChaCha20 is for older CPUs without AES-NI / ARMv8 crypto. Run `./run_benchmarks.sh` to measure on your own hardware.
 
-| Cipher | Forward | Reverse | Notes |
-|--------|---------|---------|-------|
-| **Plaintext** | **9.6 Gbps** | **9.6 Gbps** | Still 3x faster than FRP |
-| **AEGIS-128L** | **7.7 Gbps** | **7.9 Gbps** | Best encrypted option |
-| **AES-256-GCM** | **5.6 Gbps** | **5.5 Gbps** | Widely compatible |
-| **ChaCha20** | **2.3 Gbps** | **2.3 Gbps** | Software fallback |
-
-**Key Takeaway**: For maximum throughput, use single streams with AEGIS-128L. For multiple concurrent connections, performance scales linearly with CPU cores.
+Earlier comparisons against FRP and Rathole (v0.2.0 README baseline: ~2–3× faster than FRP, ~1.3× faster than Rathole on AEGIS-128L) have not been re-measured for this revision.
 
 ---
 
 **Questions?** Check the [examples/](examples/) directory or open an issue.
-# 🔍 Built-in Runtime Metrics
+
+---
+
+## Built-in Runtime Metrics
 
 Every `floos`/`flooc` process keeps live counters for:
 
@@ -510,8 +513,8 @@ Every `floos`/`flooc` process keeps live counters for:
 Dump a snapshot at any time with `SIGUSR1`, or just stop the process cleanly:
 
 ```bash
-kill -USR1 $(pgrep floos)   # server side
-kill -USR1 $(pgrep flooc)   # client side
+kill -USR1 $(pgrep floos) # server side
+kill -USR1 $(pgrep flooc) # client side
 ```
 
 Sample output:

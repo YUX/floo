@@ -3,7 +3,7 @@
 **Branch:** `remediation/v0.2.0`
 **Target:** Zig 0.16.0 stable
 **Strategy:** Path C — migrate to `std.Io` (high-level abstraction), unlocks io_uring backend down the line.
-**Status:** ✅ **COMPLETE.** `zig build` produces both binaries on 0.16.0 stable; `zig build test` is 36/36 green; `zig build -Doptimize=ReleaseFast` succeeds. See *Migration progress* below for the per-file commit log.
+**Status:** **COMPLETE.** `zig build` produces both binaries on 0.16.0 stable; `zig build test` is 36/36 green; `zig build -Doptimize=ReleaseFast` succeeds. See *Migration progress* below for the per-file commit log.
 
 ---
 
@@ -27,10 +27,10 @@ gains an io_uring backend by swapping `Io.Threaded` for `Io.Uring`.
 
 ```zig
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;
-    const gpa = init.gpa;
-    const args = init.minimal.args;
-    // ...
+ const io = init.io;
+ const gpa = init.gpa;
+ const args = init.minimal.args;
+ // ...
 }
 ```
 
@@ -54,9 +54,9 @@ backed by either `std.heap.smp_allocator` (release) or `std.heap.DebugAllocator`
 Notes:
 - `Stream.Reader` and `Stream.Writer` are **buffered**. The buffer is caller-supplied.
 - For floo's "encrypted frame in/out" pattern we want a *small* buffer or to use the
-  unbuffered path; otherwise the buffered reader/writer collides with our own ring.
+ unbuffered path; otherwise the buffered reader/writer collides with our own ring.
 - TCP options like `TCP_NODELAY`, `SO_KEEPALIVE` are set via `ListenOptions.tcp` /
-  `ConnectOptions.tcp` (need to verify exact field names per `net.zig`).
+ `ConnectOptions.tcp` (need to verify exact field names per `net.zig`).
 
 ### 3. UDP — `Socket`
 
@@ -104,29 +104,29 @@ synchronous flows, treat `error.Cancel` like a graceful shutdown signal.
 
 ## Migration order (bottom-up; each stage breaks compile until the next lands)
 
-1. ✅ **Mechanical** (`1cc860a`): allocator, args, ArrayListUnmanaged, posix.exit.
-2. ✅ **`main()` signature** (`f959381`): server.zig, client.zig take `std.process.Init`.
-3. ✅ **`common.zig`** (`f959381`): I/O helpers take `*Io.Reader` / `*Io.Writer`.
-4. ✅ **`noise.zig`** (`f959381`): `noiseXXHandshake(reader, writer, ...)`.
-5. ✅ **`transport/channel.zig`** (`a84cf95`): holds `Stream` + reader/writer.
-6. ✅ **`proxy.zig`** (`95e2807`): SOCKS5/HTTP CONNECT return `Stream`.
-7. ✅ **`udp_session.zig`** (`5275734`): uses `IpAddress`.
-8. ✅ **`udp_client.zig`** (`206d9f0`): uses `Socket`, `IncomingMessage`.
-9. ✅ **`udp_server.zig`** (`f0fe2f8`): ephemeral `Socket` per session, no connected-UDP.
-10. ✅ **`config.zig` + `diagnostics.zig`** (`6cb5ae6`): `Io.Dir.cwd().readFileAlloc`; dropped /tmp log.
-11. ✅ **`server.zig`** (`5f3d3fe` + `6a808a5`): full Stream/Server migration; signal pipe collapsed to no-op; ~190 lines net delta.
-12. ✅ **`client.zig`** (`800ec13`): mirror of server changes; LocalConnection holds Stream; udp_session.UdpSessionManager gained io field; ~440 lines net delta.
-13. ✅ **`net_compat.zig`** (`bf7a02f`): deleted; ~170 lines retired in favor of `std.Io.net.IpAddress`.
+1. **Mechanical** (`1cc860a`): allocator, args, ArrayListUnmanaged, posix.exit.
+2. **`main()` signature** (`f959381`): server.zig, client.zig take `std.process.Init`.
+3. **`common.zig`** (`f959381`): I/O helpers take `*Io.Reader` / `*Io.Writer`.
+4. **`noise.zig`** (`f959381`): `noiseXXHandshake(reader, writer, ...)`.
+5. **`transport/channel.zig`** (`a84cf95`): holds `Stream` + reader/writer.
+6. **`proxy.zig`** (`95e2807`): SOCKS5/HTTP CONNECT return `Stream`.
+7. **`udp_session.zig`** (`5275734`): uses `IpAddress`.
+8. **`udp_client.zig`** (`206d9f0`): uses `Socket`, `IncomingMessage`.
+9. **`udp_server.zig`** (`f0fe2f8`): ephemeral `Socket` per session, no connected-UDP.
+10. **`config.zig` + `diagnostics.zig`** (`6cb5ae6`): `Io.Dir.cwd().readFileAlloc`; dropped /tmp log.
+11. **`server.zig`** (`5f3d3fe` + `6a808a5`): full Stream/Server migration; signal pipe collapsed to no-op; ~190 lines net delta.
+12. **`client.zig`** (`800ec13`): mirror of server changes; LocalConnection holds Stream; udp_session.UdpSessionManager gained io field; ~440 lines net delta.
+13. **`net_compat.zig`** (`bf7a02f`): deleted; ~170 lines retired in favor of `std.Io.net.IpAddress`.
 
 ## Result
 
 ```
-$ ~/.zvm/0.16.0/zig build           # 0 errors
-$ ~/.zvm/0.16.0/zig build test       # 36/36 pass
+$ ~/.zvm/0.16.0/zig build # 0 errors
+$ ~/.zvm/0.16.0/zig build test # 36/36 pass
 $ ~/.zvm/0.16.0/zig build -Doptimize=ReleaseFast
 $ ls -lh zig-out/bin/
-flooc  535K
-floos  469K
+flooc 535K
+floos 469K
 ```
 
 14 commits, ~1100 net lines changed, zero new dependencies. `net_compat.zig` shim retired. CI workflows still need to be pinned to `version: 0.16.0` (was `master`) — that's a one-line change per workflow saved for the same PR that merges this branch.
@@ -144,25 +144,25 @@ the syscall — no perf win).
 Concrete changes by region:
 
 - **Imports & globals**: drop `net = @import("net_compat.zig")`, add `Io = std.Io`.
-  `global_io` already exists.
+ `global_io` already exists.
 - **`Stream` struct (~line 540)**: `target_fd: posix.fd_t` → `target_stream: Io.net.Stream`.
-  `stop()` and `destroyInternal()` use `target_stream.close(global_io)`. `fd_closed`
-  atomic still works (idempotent close guard).
+ `stop()` and `destroyInternal()` use `target_stream.close(global_io)`. `fd_closed`
+ atomic still works (idempotent close guard).
 - **`TunnelConnection` struct (~line 600)**: `tunnel_fd` → `tunnel_stream: Io.net.Stream`
-  + `tunnel_reader_buf`, `tunnel_writer_buf` ([4096]u8 each) + cached `tunnel_reader: Io.net.Stream.Reader`
-  and `tunnel_writer: Io.net.Stream.Writer`. Channel gets `&tunnel_reader.interface` and
-  `&tunnel_writer.interface`.
+ + `tunnel_reader_buf`, `tunnel_writer_buf` ([4096]u8 each) + cached `tunnel_reader: Io.net.Stream.Reader`
+ and `tunnel_writer: Io.net.Stream.Writer`. Channel gets `&tunnel_reader.interface` and
+ `&tunnel_writer.interface`.
 - **`TunnelConnection.run()` poll loop (~line 740-870)**: poll_fds populated from
-  `stream.socket.handle`. After poll returns, read via `posix.read(handle, buf)`
-  on the raw fd (we want unbuffered framing reads, not the buffered `Io.Reader`).
+ `stream.socket.handle`. After poll returns, read via `posix.read(handle, buf)`
+ on the raw fd (we want unbuffered framing reads, not the buffered `Io.Reader`).
 - **`forwardTargetData` (~line 1040)**: same — `posix.read` on raw handle.
 - **`handleConnect` TCP path (~line 1118)**: `posix.socket+posix.connect` →
-  `addr.connect(io, .{})` returning Stream. Apply TCP options to `stream.socket.handle`
-  via existing `common.applyTcpOptions`.
+ `addr.connect(io, .{})` returning Stream. Apply TCP options to `stream.socket.handle`
+ via existing `common.applyTcpOptions`.
 - **`ReverseListener.create` (~line 418)**: `posix.socket+bind+listen` →
-  `addr.listen(io, .{ .reuse_address = true })` returning `Server`.
+ `addr.listen(io, .{ .reuse_address = true })` returning `Server`.
 - **`ReverseListener.acceptorThread` (~line 457)**: `c.accept` → `server.accept(io)`
-  returning Stream. Drop the manual fcntl(CLOEXEC) — `Server.accept` sets it.
+ returning Stream. Drop the manual fcntl(CLOEXEC) — `Server.accept` sets it.
 - **`main()` accept loop (~line 1474-1620)**: same pattern as ReverseListener.
 - **Signal pipe (~line 47)**: `posix.pipe2` IS still available (verified).
 - **CPU pinning (~line 108)**: unchanged — `linux.sched_setaffinity` survives.
@@ -174,36 +174,36 @@ Estimated edit: ~150-200 line diff. One commit, one iteration.
 Same patterns as server.zig. Notable additions:
 - `tcpServiceListener` (~line 1383): same listener pattern.
 - `tunnelThreadWithReconnection` (~line 1475): `proxy.connectWithProxy` returns
-  `Stream` already; just thread `io` to it.
+ `Stream` already; just thread `io` to it.
 - `LocalConnection` (~line 553): `local_fd: posix.fd_t` → `local_stream: Io.net.Stream`.
 - `handleReverseConnect` (~line 981): `posix.socket+posix.connect` →
-  `addr.connect(io, .{})`.
+ `addr.connect(io, .{})`.
 
 ## Decisions to revisit
 
 ## Decisions to revisit
 
 - **TCP_NODELAY / keepalive:** `net.zig` exposes these via `ListenOptions`/`ConnectOptions`?
-  Need to verify the struct field names — the audit may have to fall back to setting them
-  via `posix.system.setsockopt` on the raw `Socket.Handle` if `Io` doesn't expose them.
+ Need to verify the struct field names — the audit may have to fall back to setting them
+ via `posix.system.setsockopt` on the raw `Socket.Handle` if `Io` doesn't expose them.
 
 - **`writev` for length-prefixed frames** (`common.writeFrameLocked`): `Stream.Writer` is
-  buffered, so we can write `header` then `payload` and rely on `flush` to coalesce.
-  Confirm with a benchmark — the `writev` syscall consolidation is a known floo perf win.
+ buffered, so we can write `header` then `payload` and rely on `flush` to coalesce.
+ Confirm with a benchmark — the `writev` syscall consolidation is a known floo perf win.
 
 - **CPU pinning** (`linux.sched_setaffinity`) is unaffected — `std.os.linux` survives.
 
 - **Signal handling:** `posix.sigaction` + `posix.SIG.*` are still in `std.posix` (we
-  verified `pub fn sigaction` is exported). Self-pipe (`pipe2`) needs to migrate to
-  `Io.pipe()` if it exists, or to `std.posix.system.pipe2`.
+ verified `pub fn sigaction` is exported). Self-pipe (`pipe2`) needs to migrate to
+ `Io.pipe()` if it exists, or to `std.posix.system.pipe2`.
 
 ## How to resume after a session boundary
 
 ```bash
 cd /Users/yux/Devs/floo
 git switch remediation/v0.2.0
-git log --oneline -10                        # see committed progress
-~/.zvm/0.16.0/zig build 2>&1 | head -30      # see remaining errors
+git log --oneline -10 # see committed progress
+~/.zvm/0.16.0/zig build 2>&1 | head -30 # see remaining errors
 # Pick the next file from the migration order list above.
 # Each PR lands one file's worth of changes (intermediate states won't compile
 # until the whole graph is done — that's expected).

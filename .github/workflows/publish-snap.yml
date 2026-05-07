@@ -76,14 +76,14 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           if [ "${{ secrets.SNAPCRAFT_TOKEN }}" != "" ]; then
-            echo "✅ Published to Snap Store" >> $GITHUB_STEP_SUMMARY
+            echo "Published to Snap Store" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "Users can install with:" >> $GITHUB_STEP_SUMMARY
             echo '```bash' >> $GITHUB_STEP_SUMMARY
             echo "sudo snap install floo" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           else
-            echo "⚠️ Not published (SNAPCRAFT_TOKEN secret not set)" >> $GITHUB_STEP_SUMMARY
+            echo "Not published (SNAPCRAFT_TOKEN secret not set)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "To enable automatic publishing:" >> $GITHUB_STEP_SUMMARY
             echo "1. Register on https://snapcraft.io/" >> $GITHUB_STEP_SUMMARY

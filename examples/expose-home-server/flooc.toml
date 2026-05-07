@@ -2,10 +2,10 @@
 # =======================================================
 # Run this on your HOME MACHINE where Jellyfin/Plex runs
 
-server = "YOUR_VPS_IP_OR_HOSTNAME:8443"    # ← Replace with your VPS address
+server = "YOUR_VPS_IP_OR_HOSTNAME:8443" # ← Replace with your VPS address
 cipher = "aes256gcm"
 
-# ⚠️  MUST MATCH SERVER! Use same credentials from floos.toml
+# MUST MATCH SERVER! Use same credentials from floos.toml
 psk = "REPLACE_WITH_SAME_PSK_AS_SERVER"
 token = "REPLACE_WITH_SAME_TOKEN_AS_SERVER"
 
@@ -32,7 +32,7 @@ tcp_keepalive_interval = 10
 tcp_keepalive_count = 3
 
 # Larger buffers for smooth 4K streaming
-socket_buffer_size = 8388608           # 8MB
+socket_buffer_size = 8388608 # 8MB
 
 # Auto-reconnect if internet drops
 reconnect_enabled = true

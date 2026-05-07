@@ -7,9 +7,9 @@
 #
 # Quick Start:
 # 1. Get credentials from your server administrator (PSK and token)
-#    OR generate them yourself:
-#    openssl rand -base64 32  # For PSK
-#    openssl rand -base64 24  # For token
+# OR generate them yourself:
+# openssl rand -base64 32 # For PSK
+# openssl rand -base64 24 # For token
 #
 # 2. Replace the placeholder values below with actual credentials
 #
@@ -32,19 +32,21 @@ server = "your-vps-hostname.com:8443"
 # ----------------------------------------------------------------------------
 
 # Cipher: MUST match the server's cipher setting
-#   - aegis128l (default, recommended): Fastest on ARMv8+ and modern x86 (22+ Gbps)
-#   - aes256gcm: Compatible default with AES-NI hardware
-#   - chacha20poly1305: Best for older CPUs without AES-NI
+# - aegis128l (default, recommended): Fast and conservative on ARMv8+ and modern x86
+# - aes128gcm: Often the fastest on ARMv8 / x86 with AES-NI; broadest interop
+# - aes256gcm: Same speed class, larger security margin
+# - chacha20poly1305: Software-only; for older CPUs without AES-NI
+# - none: Plaintext (debug only). Encryption off, but PSK auth still required.
 cipher = "aegis128l"
 
 # PSK (Pre-Shared Key): MUST match server exactly!
 # Get this from your server administrator
-# ⚠️  NEVER use the placeholder below - the client will fail to connect!
+# NEVER use the placeholder below - the client will fail to connect!
 psk = "REPLACE_WITH_SERVER_PSK_HERE"
 
 # Default token: MUST match server's default token
 # Get this from your server administrator
-# ⚠️  NEVER use the placeholder below - connections will be rejected!
+# NEVER use the placeholder below - connections will be rejected!
 token = "REPLACE_WITH_SERVER_TOKEN_HERE"
 
 # Optional: Auto-select this service when running in single-service mode
@@ -65,7 +67,7 @@ token = "REPLACE_WITH_SERVER_TOKEN_HERE"
 
 # Example: SSH to remote machine via localhost:2222
 # ssh = "127.0.0.1:2222"
-# ssh.token = "specific-ssh-token"  # If server requires different token
+# ssh.token = "specific-ssh-token" # If server requires different token
 
 # Example: Access remote PostgreSQL database
 # database = "127.0.0.1:5432"
@@ -90,7 +92,7 @@ token = "REPLACE_WITH_SERVER_TOKEN_HERE"
 
 # Example: Expose local SSH for remote access
 # ssh_home = "127.0.0.1:22"
-# ssh_home.token = "home-ssh-token"  # Recommended for security
+# ssh_home.token = "home-ssh-token" # Recommended for security
 
 # Example: Expose Prometheus metrics
 # metrics = "127.0.0.1:9090"
@@ -125,18 +127,18 @@ udp_timeout_seconds = 60
 socket_buffer_size = 8388608
 
 # TCP optimization
-tcp_nodelay = true                      # Lower latency (disable Nagle)
-tcp_keepalive = true                    # Detect dead connections
-tcp_keepalive_idle = 45                 # Seconds before first keepalive probe
-tcp_keepalive_interval = 10             # Seconds between keepalive probes
-tcp_keepalive_count = 3                 # Failed probes before timeout
+tcp_nodelay = true # Lower latency (disable Nagle)
+tcp_keepalive = true # Detect dead connections
+tcp_keepalive_idle = 45 # Seconds before first keepalive probe
+tcp_keepalive_interval = 10 # Seconds between keepalive probes
+tcp_keepalive_count = 3 # Failed probes before timeout
 
 # Heartbeat and reconnection
-heartbeat_timeout_seconds = 60          # Detect server disconnection
-reconnect_enabled = true                # Auto-reconnect on disconnect
-reconnect_initial_delay_ms = 1000       # Wait 1 second after disconnect
-reconnect_max_delay_ms = 30000          # Max 30 seconds between attempts
-reconnect_backoff_multiplier = 2        # Exponential backoff
+heartbeat_timeout_seconds = 60 # Detect server disconnection
+reconnect_enabled = true # Auto-reconnect on disconnect
+reconnect_initial_delay_ms = 1000 # Wait 1 second after disconnect
+reconnect_max_delay_ms = 30000 # Max 30 seconds between attempts
+reconnect_backoff_multiplier = 2 # Exponential backoff
 
 # Proxy support (for corporate firewalls)
 # Supports: socks5://host:port or http://host:port
@@ -154,24 +156,24 @@ proxy_url = ""
 # SCENARIO 1: Access home database from anywhere
 # -----------------------------------------------
 # Server (floos.toml):
-#   [services]
-#   postgres = "10.0.0.5:5432"
+# [services]
+# postgres = "10.0.0.5:5432"
 #
 # Client (flooc.toml):
-#   [services]
-#   postgres = "127.0.0.1:5432"
+# [services]
+# postgres = "127.0.0.1:5432"
 #
 # Usage: psql -h 127.0.0.1 -p 5432
 #
 # SCENARIO 2: Share home media server
 # ------------------------------------
 # Server (floos.toml):
-#   [reverse_services]
-#   jellyfin = "0.0.0.0:8096"
+# [reverse_services]
+# jellyfin = "0.0.0.0:8096"
 #
 # Client (flooc.toml):
-#   [reverse_services]
-#   jellyfin = "127.0.0.1:8096"
+# [reverse_services]
+# jellyfin = "127.0.0.1:8096"
 #
 # Friends access: http://your-vps-ip:8096
 #
@@ -184,17 +186,20 @@ proxy_url = ""
 # Security Best Practices
 # ----------------------------------------------------------------------------
 #
-# ✅ DO:
-#   - Keep credentials secure (never commit to git)
-#   - Use different tokens for different services
-#   - Verify server certificate/identity before connecting
-#   - Monitor connection logs for suspicious activity
-#   - Rotate credentials periodically
+# DO:
+# - Keep credentials secure (never commit to git)
+# - Use different tokens for different services
+# - Verify server certificate/identity before connecting
+# - Monitor connection logs for suspicious activity
+# - Rotate credentials periodically
 #
-# ❌ DON'T:
-#   - Use weak or default credentials (connection will fail)
-#   - Share credentials over unsecured channels
-#   - Connect to untrusted servers
-#   - Use cipher = "none" on untrusted networks
+# DON'T:
+# - Use weak or default credentials (connection will fail)
+# - Share credentials over unsecured channels
+# - Connect to untrusted servers
+# - Use cipher = "none" on untrusted networks. Plaintext mode still
+# requires the PSK for mutual authentication, but the data and your
+# per-service tokens travel in cleartext over the link, so reserve it
+# for debugging on networks you control.
 #
 # ----------------------------------------------------------------------------

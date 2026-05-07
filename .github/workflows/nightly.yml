@@ -99,12 +99,12 @@ jobs:
 
           ---
 
-          ### 🚀 Performance
+          ### Performance
           - **29.4 Gbps** encrypted throughput (AEGIS-128L)
           - **671 KB** total binary size
           - **Zero dependencies**
 
-          ### 📥 Downloads
+          ### Downloads
 
           | Platform | File | Recommended For |
           |----------|------|-----------------|
@@ -118,14 +118,14 @@ jobs:
           | **macOS Intel** | \`floo-x86_64-macos.tar.gz\` | Legacy Intel Macs |
           | **macOS Intel (Haswell+)** | \`floo-x86_64-macos-haswell.tar.gz\` | Best perf on 2013+ Macs |
 
-          ### ⚠️ Note
+          ### Note
 
           This is a **pre-release nightly build** from the latest code.
           - Updated automatically on every push to main
           - For production, use numbered releases (v0.1.0, v0.2.0, etc.)
           - Binaries are built with \`ReleaseFast\` optimization
 
-          ### 🔒 Security
+          ### Security
 
           Before using:
           1. Replace placeholder PSK/tokens in config files

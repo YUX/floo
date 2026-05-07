@@ -133,7 +133,7 @@ jobs:
           echo "Git tag version: $TAG_VERSION"
 
           if [ "$VERSION" != "$TAG_VERSION" ]; then
-            echo "❌ ERROR: Version mismatch!"
+            echo "ERROR: Version mismatch!"
             echo "   build.zig.zon has version '$VERSION'"
             echo "   Git tag is 'v$TAG_VERSION'"
             echo ""
@@ -141,7 +141,7 @@ jobs:
             exit 1
           fi
 
-          echo "✅ Version match confirmed: $VERSION"
+          echo "Version match confirmed: $VERSION"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -166,45 +166,45 @@ jobs:
 
             **High-throughput tunneling in Zig - Zero dependencies, maximum performance**
 
-            ### 🚀 Performance (Apple M1 MacBook Air)
+            ### Performance (Apple M1 MacBook Air)
             - **29.4 Gbps** encrypted throughput (AEGIS-128L cipher)
             - **62% faster** than Rathole
             - **194% faster** than FRP
 
-            ### 📦 Binary Sizes
+            ### Binary Sizes
             - Client (`flooc`): 394 KB
             - Server (`floos`): 277 KB
             - **Total: 671 KB**
 
-            ### ✨ Key Features
-            - 🔐 Noise XX + PSK authentication (5 AEAD ciphers)
-            - 🚀 Multi-service multiplexing
-            - ⚡ Parallel tunnels with round-robin load balancing
-            - 🌐 Proxy support (SOCKS5 + HTTP CONNECT)
-            - 💓 Heartbeat supervision & auto-reconnect
-            - 🔄 Hot config reload (SIGHUP)
-            - 📊 Built-in diagnostics (`--doctor`, `--ping`)
-            - 🎯 Per-service token authentication
+            ### Key Features
+            - Noise XX + PSK authentication (5 AEAD ciphers)
+            - Multi-service multiplexing
+            - Parallel tunnels with round-robin load balancing
+            - Proxy support (SOCKS5 + HTTP CONNECT)
+            - Heartbeat supervision & auto-reconnect
+            - Hot config reload (SIGHUP)
+            - Built-in diagnostics (`--doctor`, `--ping`)
+            - Per-service token authentication
 
-            ### 📥 Installation
+            ### Installation
 
             **Choose your platform:**
 
             | Platform | Download | CPU Optimization |
             |----------|----------|------------------|
             | **Linux x86_64 (glibc)** | `floo-x86_64-linux-gnu.tar.gz` | Generic compatibility |
-            | **Linux x86_64 (Haswell+)** ⚡ | `floo-x86_64-linux-gnu-haswell.tar.gz` | AES-NI/BMI2 tuned |
+            | **Linux x86_64 (Haswell+)** | `floo-x86_64-linux-gnu-haswell.tar.gz` | AES-NI/BMI2 tuned |
             | **Linux x86_64 (static)** | `floo-x86_64-linux-musl.tar.gz` | Works on Alpine / scratch containers |
             | **Linux ARM64 (generic)** | `floo-aarch64-linux-gnu.tar.gz` | ARM servers, Jetson |
-            | **Linux ARM64 (Neoverse)** ⚡ | `floo-aarch64-linux-gnu-neoverse-n1.tar.gz` | Graviton / Ampere instances |
-            | **Linux ARM64 (Raspberry Pi 4/5)** 🥧 | `floo-aarch64-linux-gnu-rpi4.tar.gz` | Tuned for Cortex-A72 |
+            | **Linux ARM64 (Neoverse)** | `floo-aarch64-linux-gnu-neoverse-n1.tar.gz` | Graviton / Ampere instances |
+            | **Linux ARM64 (Raspberry Pi 4/5)** | `floo-aarch64-linux-gnu-rpi4.tar.gz` | Tuned for Cortex-A72 |
             | **macOS Intel** | `floo-x86_64-macos.tar.gz` | macOS 11+ universal baseline |
-            | **macOS Intel (Haswell+)** ⚡ | `floo-x86_64-macos-haswell.tar.gz` | Best perf on 2013+ Macs |
+            | **macOS Intel (Haswell+)** | `floo-x86_64-macos-haswell.tar.gz` | Best perf on 2013+ Macs |
             | **macOS Apple Silicon** | `floo-aarch64-macos-m1.tar.gz` | M1/M2/M3/M4 with ARMv8 crypto |
 
-            ⚡ **Recommended:** Optimized builds provide significantly better crypto performance (3-5x faster encryption).
+            **Recommended:** Optimized builds provide significantly better crypto performance (3-5x faster encryption).
 
-            🥧 **Raspberry Pi users:** Use the `aarch64-linux-gnu-rpi` variant to avoid illegal instruction errors on Pi 4/5.
+            **Raspberry Pi users:** Use the `aarch64-linux-gnu-rpi` variant to avoid illegal instruction errors on Pi 4/5.
 
             **Extract and use:**
             ```bash
@@ -214,7 +214,7 @@ jobs:
             ./floos --version
             ```
 
-            ### 📖 Quick Start
+            ### Quick Start
 
             See the [README](https://github.com/${{ github.repository }}) for complete documentation including:
             - Configuration guide
@@ -223,7 +223,7 @@ jobs:
             - Proxy setup
             - Troubleshooting
 
-            ### ⚠️ Security Note
+            ### Security Note
 
             Before production use:
             1. Replace placeholder PSK and tokens in config files
@@ -232,4 +232,4 @@ jobs:
 
             ---
 
-            **Built with ❤️ in Zig**
+            **Built with in Zig**

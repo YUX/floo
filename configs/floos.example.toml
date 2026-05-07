@@ -7,8 +7,8 @@
 #
 # Quick Start:
 # 1. Generate strong credentials:
-#    openssl rand -base64 32  # For PSK
-#    openssl rand -base64 24  # For token
+# openssl rand -base64 32 # For PSK
+# openssl rand -base64 24 # For token
 #
 # 2. Replace the placeholder values below with your generated credentials
 #
@@ -22,28 +22,30 @@
 # Core Server Settings (REQUIRED)
 # ----------------------------------------------------------------------------
 
-bind = "0.0.0.0"        # Listen on all interfaces (use "127.0.0.1" for local only)
-port = 8443             # Port for tunnel connections (clients connect here)
+bind = "0.0.0.0" # Listen on all interfaces (use "127.0.0.1" for local only)
+port = 8443 # Port for tunnel connections (clients connect here)
 
 # ----------------------------------------------------------------------------
 # Security Settings (REQUIRED - REPLACE THESE!)
 # ----------------------------------------------------------------------------
 
 # Cipher: Choose based on your CPU
-#   - aegis128l (default, recommended): Fastest on ARMv8+ and modern x86 (22+ Gbps)
-#   - aes256gcm: Compatible default with AES-NI hardware
-#   - aes128gcm: Faster than aes256gcm, still secure
-#   - chacha20poly1305: Best for older CPUs without AES-NI
+# - aegis128l (default, recommended): Fast and conservative on ARMv8+ and modern x86
+# - aes128gcm: Often the fastest on ARMv8 / x86 with AES-NI; broadest interop
+# - aes256gcm: Same speed class, larger security margin / FIPS-style
+# - aegis256: Larger security margin than aegis128l
+# - chacha20poly1305: Software-only; for older CPUs without AES-NI
+# - none: Plaintext (debug only). Encryption off, but PSK auth still required.
 cipher = "aegis128l"
 
 # PSK (Pre-Shared Key): MUST be strong and random!
 # Generate with: openssl rand -base64 32
-# ⚠️  NEVER use the placeholder below - the server will refuse to start!
+# NEVER use the placeholder below - the server will refuse to start!
 psk = "REPLACE_WITH_OPENSSL_RAND_BASE64_32_OUTPUT"
 
 # Default token: Used for service authentication
 # Generate with: openssl rand -base64 24
-# ⚠️  NEVER use the placeholder below - the server will refuse to start!
+# NEVER use the placeholder below - the server will refuse to start!
 token = "REPLACE_WITH_OPENSSL_RAND_BASE64_24_OUTPUT"
 
 # ----------------------------------------------------------------------------
@@ -62,7 +64,7 @@ token = "REPLACE_WITH_OPENSSL_RAND_BASE64_24_OUTPUT"
 
 # Example: PostgreSQL database in private subnet
 # database = "10.0.0.20:5432"
-# database.token = "unique-db-token-here"  # Optional: per-service token
+# database.token = "unique-db-token-here" # Optional: per-service token
 
 # Example: Internal Kubernetes dashboard
 # k8s_dashboard = "192.168.1.100:8443"
@@ -86,7 +88,7 @@ token = "REPLACE_WITH_OPENSSL_RAND_BASE64_24_OUTPUT"
 
 # Example: SSH access to home machines
 # ssh = "0.0.0.0:2222"
-# ssh.token = "unique-ssh-token-here"  # Recommended for sensitive services
+# ssh.token = "unique-ssh-token-here" # Recommended for sensitive services
 
 # Example: Home security camera streams
 # camera = "0.0.0.0:5000/udp"
@@ -114,32 +116,36 @@ pin_threads = true
 io_batch_bytes = 131072
 
 # TCP optimization settings
-tcp_nodelay = true                      # Disable Nagle's algorithm (lower latency)
-tcp_keepalive = true                    # Enable TCP keepalive
-tcp_keepalive_idle = 45                 # Seconds before first keepalive probe
-tcp_keepalive_interval = 10             # Seconds between keepalive probes
-tcp_keepalive_count = 3                 # Number of failed probes before timeout
+tcp_nodelay = true # Disable Nagle's algorithm (lower latency)
+tcp_keepalive = true # Enable TCP keepalive
+tcp_keepalive_idle = 45 # Seconds before first keepalive probe
+tcp_keepalive_interval = 10 # Seconds between keepalive probes
+tcp_keepalive_count = 3 # Number of failed probes before timeout
 
 # Heartbeat settings (detect dead connections)
-heartbeat_interval_seconds = 30         # How often to send heartbeats
-heartbeat_timeout_seconds = 60          # Consider connection dead after this
+heartbeat_interval_seconds = 30 # How often to send heartbeats
+heartbeat_timeout_seconds = 60 # Consider connection dead after this
 
 # ----------------------------------------------------------------------------
 # Security Best Practices
 # ----------------------------------------------------------------------------
 #
-# ✅ DO:
-#   - Use strong random credentials (openssl rand -base64)
-#   - Use different tokens for different services
-#   - Rotate credentials periodically
-#   - Use per-service tokens for sensitive services (database, ssh)
-#   - Monitor connection logs
+# DO:
+# - Use strong random credentials (openssl rand -base64)
+# - Use different tokens for different services
+# - Rotate credentials periodically
+# - Use per-service tokens for sensitive services (database, ssh)
+# - Monitor connection logs
 #
-# ❌ DON'T:
-#   - Use weak or default credentials (server will refuse to start)
-#   - Commit credentials to version control
-#   - Share credentials over unsecured channels
-#   - Use cipher = "none" in production (debugging only!)
-#   - Bind reverse_services to 0.0.0.0 unless you want public access
+# DON'T:
+# - Use weak or default credentials (server will refuse to start)
+# - Commit credentials to version control
+# - Share credentials over unsecured channels
+# - Use cipher = "none" in production. It disables encryption and frame
+# integrity but still requires the PSK for mutual authentication, so it's
+# not an open relay; tokens still travel in cleartext over the link though,
+# so only use it on trusted networks where you actually want to inspect
+# plaintext frames.
+# - Bind reverse_services to 0.0.0.0 unless you want public access
 #
 # ----------------------------------------------------------------------------

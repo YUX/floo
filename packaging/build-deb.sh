@@ -7,9 +7,9 @@
 set -e
 
 if [ -z "$1" ]; then
-    echo "Usage: $0 VERSION"
-    echo "Example: $0 0.1.2"
-    exit 1
+ echo "Usage: $0 VERSION"
+ echo "Example: $0 0.1.2"
+ exit 1
 fi
 
 VERSION=$1
@@ -70,19 +70,19 @@ Description: Secure, high-performance tunneling in Zig
  multiple AEAD ciphers.
  .
  Features:
-  - 29.4 Gbps throughput with AEGIS-128L cipher
-  - Zero runtime dependencies
-  - Reverse and forward tunneling modes
-  - SOCKS5 and HTTP CONNECT proxy support
-  - Config changes applied on restart (SIGHUP reload temporarily disabled)
-  - Built-in diagnostics (--doctor, --ping)
+ - 29.4 Gbps throughput with AEGIS-128L cipher
+ - Zero runtime dependencies
+ - Reverse and forward tunneling modes
+ - SOCKS5 and HTTP CONNECT proxy support
+ - Config changes applied on restart (SIGHUP reload temporarily disabled)
+ - Built-in diagnostics (--doctor, --ping)
 EOF
 
 # Build package
 cd ..
 dpkg-deb --build "$PACKAGE_DIR"
 
-echo "✓ Built: ${PACKAGE_DIR}.deb"
+echo " Built: ${PACKAGE_DIR}.deb"
 echo ""
 
 # Build for arm64 (aarch64)
@@ -130,19 +130,19 @@ Description: Secure, high-performance tunneling in Zig
  multiple AEAD ciphers.
  .
  Features:
-  - 29.4 Gbps throughput with AEGIS-128L cipher
-  - Zero runtime dependencies
-  - Reverse and forward tunneling modes
-  - SOCKS5 and HTTP CONNECT proxy support
-  - Config changes applied on restart (SIGHUP reload temporarily disabled)
-  - Built-in diagnostics (--doctor, --ping)
+ - 29.4 Gbps throughput with AEGIS-128L cipher
+ - Zero runtime dependencies
+ - Reverse and forward tunneling modes
+ - SOCKS5 and HTTP CONNECT proxy support
+ - Config changes applied on restart (SIGHUP reload temporarily disabled)
+ - Built-in diagnostics (--doctor, --ping)
 EOF
 
 # Build package
 cd ..
 dpkg-deb --build "$PACKAGE_DIR"
 
-echo "✓ Built: ${PACKAGE_DIR}.deb"
+echo " Built: ${PACKAGE_DIR}.deb"
 echo ""
 
 cd ..
@@ -153,6 +153,6 @@ ls -lh "${BUILD_DIR}"/*.deb
 
 echo ""
 echo "To install locally:"
-echo "  sudo dpkg -i ${BUILD_DIR}/floo_${VERSION}-1_amd64.deb"
+echo " sudo dpkg -i ${BUILD_DIR}/floo_${VERSION}-1_amd64.deb"
 echo ""
 echo "To create APT repository, see: packaging/setup-apt-repo.sh"

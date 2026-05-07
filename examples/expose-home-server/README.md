@@ -2,31 +2,31 @@
 
 Share your home media server with friends without opening router ports or dealing with dynamic DNS. Floo creates a secure encrypted tunnel from your home to a public VPS, making your media server accessible on the internet.
 
-## 📋 What You Need
+## What You Need
 
 - **Home machine** running Jellyfin/Plex/Emby
 - **Public VPS** (DigitalOcean, AWS, etc.) with a static IP
 - **5 minutes** to set up
 
-## 🏗️ How It Works
+## How It Works
 
 ```
-┌─────────────────┐              ┌─────────────────┐              ┌──────────────┐
-│   Friend's      │              │   Your VPS      │              │ Your Home    │
-│   Browser       │──────────────│   (floos)       │──────────────│ (flooc +     │
-│                 │  Internet    │                 │  Encrypted   │  Jellyfin)   │
-│                 │              │ Listens :80     │  Tunnel      │ 127.0.0.1    │
-└─────────────────┘              └─────────────────┘              └──────────────┘
+┌─────────────────┐                ┌─────────────────┐                ┌──────────────┐
+│   Friend's      │                │   Your VPS      │                │  Your Home   │
+│   Browser       │── Internet ────│   (floos)       │── Encrypted ───│  (flooc +    │
+│                 │                │   Listens :80   │   Tunnel       │   Jellyfin)  │
+│                 │                │                 │                │  127.0.0.1   │
+└─────────────────┘                └─────────────────┘                └──────────────┘
 
-Friend visits                    Relay traffic                   Media server
-http://vps-ip/                  over secure tunnel              stays private
+  Friend visits                      Relay traffic                       Media server
+  http://vps-ip/                     over secure tunnel                  stays private
 ```
 
 **Key benefit**: No port forwarding or dynamic DNS needed. Your home router stays secure with no exposed ports.
 
 ---
 
-## 🚀 Step-by-Step Setup
+## Step-by-Step Setup
 
 ### Step 1: Generate Strong Credentials
 
@@ -48,18 +48,18 @@ On your VPS, create `floos.toml`:
 
 ```toml
 bind = "0.0.0.0"
-port = 8443              # Clients connect here
+port = 8443 # Clients connect here
 cipher = "aes256gcm"
-psk = "PASTE_YOUR_PSK_HERE"       # ← From step 1
-token = "PASTE_YOUR_TOKEN_HERE"   # ← From step 1
+psk = "PASTE_YOUR_PSK_HERE" # ← From step 1
+token = "PASTE_YOUR_TOKEN_HERE" # ← From step 1
 
 [reverse_services]
-jellyfin = "0.0.0.0:8096"  # Public access on port 8096
+jellyfin = "0.0.0.0:8096" # Public access on port 8096
 
 [advanced]
 tcp_nodelay = true
 tcp_keepalive = true
-socket_buffer_size = 8388608    # 8MB buffers for streaming
+socket_buffer_size = 8388608 # 8MB buffers for streaming
 pin_threads = true
 io_batch_bytes = 131072
 heartbeat_interval_seconds = 30
@@ -77,20 +77,20 @@ heartbeat_interval_seconds = 30
 On your home machine (where Jellyfin runs), create `flooc.toml`:
 
 ```toml
-server = "YOUR_VPS_IP:8443"      # ← Your VPS address
+server = "YOUR_VPS_IP:8443" # ← Your VPS address
 cipher = "aes256gcm"
-psk = "PASTE_SAME_PSK_HERE"      # ← Must match server!
-token = "PASTE_SAME_TOKEN_HERE"  # ← Must match server!
+psk = "PASTE_SAME_PSK_HERE" # ← Must match server!
+token = "PASTE_SAME_TOKEN_HERE" # ← Must match server!
 
 [reverse_services]
-jellyfin = "127.0.0.1:8096"      # Your local Jellyfin port
+jellyfin = "127.0.0.1:8096" # Your local Jellyfin port
 
 [advanced]
-num_tunnels = 0                  # Auto-match CPU cores (set >0 to override)
+num_tunnels = 0 # Auto-match CPU cores (set >0 to override)
 pin_threads = true
 io_batch_bytes = 131072
-reconnect_enabled = true         # Auto-reconnect if connection drops
-socket_buffer_size = 8388608     # 8MB buffers for streaming
+reconnect_enabled = true # Auto-reconnect if connection drops
+socket_buffer_size = 8388608 # 8MB buffers for streaming
 ```
 
 **Start the client**:
@@ -107,7 +107,7 @@ Open a browser and go to:
 http://YOUR_VPS_IP:8096
 ```
 
-You should see your Jellyfin login page! 🎉
+You should see your Jellyfin login page!
 
 The traffic flows:
 1. Friend → VPS:8096
@@ -117,21 +117,22 @@ The traffic flows:
 
 ---
 
-## ✅ Verify Setup
+## Verify Setup
 
 Test your configuration before going live:
 
 ```bash
 # On home machine
 ./flooc --doctor flooc.toml
-# ✓ Configuration valid
-# ✓ Connected to tunnel server
-# ✓ Handshake completed
+# [OK]   Configuration parsed (services: 1)
+# [OK]   Remote YOUR_VPS_IP:8443 resolves to ...
+# [OK]   Reverse target 127.0.0.1:8096 reachable for service 'jellyfin'
+# [OK]   Ping succeeded (handshake ~ms)
 ```
 
 ---
 
-## 🔒 Security Hardening (Recommended)
+## Security Hardening (Recommended)
 
 ### Add HTTPS
 
@@ -140,24 +141,24 @@ Put nginx/Caddy on your VPS to add HTTPS:
 ```nginx
 # /etc/nginx/sites-available/media
 server {
-    listen 443 ssl;
-    server_name media.yourdomain.com;
+ listen 443 ssl;
+ server_name media.yourdomain.com;
 
-    ssl_certificate /etc/letsencrypt/live/media.yourdomain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/media.yourdomain.com/privkey.pem;
+ ssl_certificate /etc/letsencrypt/live/media.yourdomain.com/fullchain.pem;
+ ssl_certificate_key /etc/letsencrypt/live/media.yourdomain.com/privkey.pem;
 
-    location / {
-        proxy_pass http://127.0.0.1:8096;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
+ location / {
+ proxy_pass http://127.0.0.1:8096;
+ proxy_set_header Host $host;
+ proxy_set_header X-Real-IP $remote_addr;
+ }
 }
 ```
 
 Then change floos.toml to bind on localhost:
 ```toml
 [reverse_services]
-jellyfin = "127.0.0.1:8096"  # Only nginx can access
+jellyfin = "127.0.0.1:8096" # Only nginx can access
 ```
 
 ### Run as System Service
@@ -189,7 +190,7 @@ sudo systemctl start flooc
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
@@ -210,12 +211,12 @@ curl http://127.0.0.1:8096
 nc -zv YOUR_VPS_IP 8443
 
 # View flooc logs
-./flooc flooc.toml  # Watch output for errors
+./flooc flooc.toml # Watch output for errors
 ```
 
 ---
 
-## 🎯 Advanced: Multiple Services
+## Advanced: Multiple Services
 
 Want to expose Jellyfin AND Plex? Easy:
 
@@ -245,29 +246,29 @@ admin_panel.token = "admin-secret-token"
 
 ---
 
-## 💡 Performance Tips
+## Performance Tips
 
 For 4K streaming:
 ```toml
 [advanced]
-socket_buffer_size = 8388608     # 8MB buffers
-num_tunnels = 0                  # Auto-match CPU cores (set >0 to force)
-pin_threads = true               # Keep tunnels on dedicated cores
-io_batch_bytes = 131072          # Larger per-stream batch
-tcp_nodelay = true               # Lower latency
+socket_buffer_size = 8388608 # 8MB buffers
+num_tunnels = 0 # Auto-match CPU cores (set >0 to force)
+pin_threads = true # Keep tunnels on dedicated cores
+io_batch_bytes = 131072 # Larger per-stream batch
+tcp_nodelay = true # Lower latency
 ```
 
-> 💡 Run `kill -USR1 $(pgrep flooc)` or `kill -USR1 $(pgrep floos)` to dump live
+> Run `kill -USR1 $(pgrep flooc)` or `kill -USR1 $(pgrep floos)` to dump live
 > throughput and encryption timing stats while you tune these settings.
 
 For bandwidth monitoring, check your VPS:
 ```bash
-iftop -i eth0  # Monitor traffic in real-time
+iftop -i eth0 # Monitor traffic in real-time
 ```
 
 ---
 
-## 📱 Mobile Access
+## Mobile Access
 
 Your friends can access your server from their phones too! Just give them:
 ```
@@ -283,4 +284,4 @@ http://media.yourdomain.com
 
 **Questions?** Check the [main README](../../README.md) or open an issue.
 
-**Enjoying Floo?** ⭐ Star the repo and share with friends!
+**Enjoying Floo?** Star the repo and share with friends!

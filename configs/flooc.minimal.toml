@@ -4,8 +4,8 @@
 
 server = "your-server:8443"
 cipher = "aegis128l"
-psk = "REPLACE_ME"      # ⚠️ Must match server PSK!
-token = "REPLACE_ME"    # ⚠️ Must match server token!
+psk = "REPLACE_ME" # Must match server PSK!
+token = "REPLACE_ME" # Must match server token!
 
 # Expose local service through server's reverse tunnel
 [reverse_services]
