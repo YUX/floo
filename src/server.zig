@@ -33,6 +33,23 @@ var encrypt_calls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var tunnel_tx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var tunnel_rx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var flush_stats_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Per-process gate for the encryption time profile.  Resolved on first
+/// read into module-scope statics so we don't hit `getenv` per
+/// Channel.init.  Set `FLOO_PROFILE_ENCRYPT=1` in the environment to
+/// opt in.
+var encrypt_profile_checked: std.atomic.Value(bool) = .init(false);
+var encrypt_profile_value: bool = false;
+
+fn encrypt_profile_enabled() bool {
+    if (!encrypt_profile_checked.load(.acquire)) {
+        const cstr = std.c.getenv("FLOO_PROFILE_ENCRYPT");
+        encrypt_profile_value = if (cstr) |c| (c[0] != 0 and c[0] != '0') else false;
+        encrypt_profile_checked.store(true, .release);
+        std.debug.print("[PROFILE] encrypt-time profile {s}\n", .{if (encrypt_profile_value) "ENABLED via FLOO_PROFILE_ENCRYPT" else "disabled (set FLOO_PROFILE_ENCRYPT=1 to enable)"});
+    }
+    return encrypt_profile_value;
+}
 var sighup_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var cpu_assigner: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var cached_cpu_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
@@ -452,8 +469,8 @@ const ReverseListener = struct {
             // The create ref IS the map ref — no extra acquireRef. On put failure,
             // explicit releaseRef takes the count to 0 and destroys the stream.
             const key = StreamKey{ .service_id = self.service.id, .stream_id = stream_id };
-            self.tunnel_conn.streams_mutex.lockUncancelable(global_io);
-            defer self.tunnel_conn.streams_mutex.unlock(global_io);
+            self.tunnel_conn.streams_mutex.lock();
+            defer self.tunnel_conn.streams_mutex.unlock();
 
             self.tunnel_conn.streams.put(key, stream) catch |err| {
                 std.debug.print("[REVERSE] Failed to register stream: {}\n", .{err});
@@ -668,7 +685,11 @@ const TunnelConnection = struct {
     tunnel_reader: Io.net.Stream.Reader,
     tunnel_writer: Io.net.Stream.Writer,
     streams: std.HashMap(StreamKey, *Stream, StreamKeyContext, 80),
-    streams_mutex: std.Io.Mutex,
+    /// common.HotMutex (os_unfair_lock on Darwin, raw futex on Linux)
+    /// instead of Io.Mutex; see transport/Channel.send_mutex for
+    /// rationale. Held briefly per recv-DATA, send-DATA, CONNECT, CLOSE
+    /// — every cycle of the data path.
+    streams_mutex: common.HotMutex,
     channel: transport.Channel,
     running: std.atomic.Value(bool),
 
@@ -704,7 +725,7 @@ const TunnelConnection = struct {
             .tunnel_reader = undefined,
             .tunnel_writer = undefined,
             .streams = std.HashMap(StreamKey, *Stream, StreamKeyContext, 80).init(allocator),
-            .streams_mutex = .init,
+            .streams_mutex = .{},
             .channel = undefined,
             .running = std.atomic.Value(bool).init(true),
             .udp_forwarder = null,
@@ -728,10 +749,20 @@ const TunnelConnection = struct {
             .static_keypair = static_keypair,
             .role = .server,
             .version = build_options.version,
-            .stats = transport.EncryptionStats{
-                .total_ns = &encrypt_total_ns,
-                .calls = &encrypt_calls,
-            },
+            // Encryption profile is opt-in — wiring stats per-frame
+            // costs two `clock_gettime` reads (cheap commpage/vDSO calls,
+            // but real at multi-Gbps frame rates).  Set
+            // `FLOO_PROFILE_ENCRYPT=1` in the environment to re-enable
+            // the per-process `[PROFILE] server encryption ...` line at
+            // exit.  Throughput byte counters stay on unconditionally
+            // (single `.monotonic` fetchAdd per frame).
+            .stats = if (encrypt_profile_enabled())
+                transport.EncryptionStats{
+                    .total_ns = &encrypt_total_ns,
+                    .calls = &encrypt_calls,
+                }
+            else
+                null,
             .throughput = transport.ThroughputStats{
                 .tx_bytes = &tunnel_tx_bytes,
                 .rx_bytes = &tunnel_rx_bytes,
@@ -805,7 +836,7 @@ const TunnelConnection = struct {
             }) catch unreachable;
             poll_entries.append(global_allocator, .{ .tunnel = {} }) catch unreachable;
 
-            self.streams_mutex.lockUncancelable(global_io);
+            self.streams_mutex.lock();
             var iter = self.streams.iterator();
             while (iter.next()) |entry| {
                 const stream_ptr = entry.value_ptr.*;
@@ -820,7 +851,7 @@ const TunnelConnection = struct {
                     .revents = 0,
                 }) catch unreachable;
             }
-            self.streams_mutex.unlock(global_io);
+            self.streams_mutex.unlock();
 
             const ready = posix.poll(poll_fds.items, poll_timeout_ms) catch |err| {
                 std.debug.print("[TUNNEL] Poll error: {}\n", .{err});
@@ -968,12 +999,12 @@ const TunnelConnection = struct {
                 const key = StreamKey{ .service_id = data_msg.service_id, .stream_id = data_msg.stream_id };
                 var stream_ref: ?*Stream = null;
 
-                self.streams_mutex.lockUncancelable(global_io);
+                self.streams_mutex.lock();
                 if (self.streams.get(key)) |s| {
                     s.acquireRef();
                     stream_ref = s;
                 }
-                self.streams_mutex.unlock(global_io);
+                self.streams_mutex.unlock();
 
                 if (stream_ref) |s| {
                     defer s.releaseRef();
@@ -990,9 +1021,9 @@ const TunnelConnection = struct {
                 tracePrint(enable_tunnel_trace, "[TUNNEL] CLOSE service_id={} stream_id={}\n", .{ close_msg.service_id, close_msg.stream_id });
 
                 const key = StreamKey{ .service_id = close_msg.service_id, .stream_id = close_msg.stream_id };
-                self.streams_mutex.lockUncancelable(global_io);
+                self.streams_mutex.lock();
                 const maybe_stream = self.streams.fetchRemove(key);
-                self.streams_mutex.unlock(global_io);
+                self.streams_mutex.unlock();
 
                 if (maybe_stream) |entry| {
                     // Stream still exists, stop and destroy it
@@ -1025,9 +1056,9 @@ const TunnelConnection = struct {
                 std.debug.print("[TUNNEL-REVERSE] CONNECT_ERROR from client: stream_id={} error={s}\n", .{ err_msg.stream_id, err_msg.error_msg });
 
                 const key = StreamKey{ .service_id = err_msg.service_id, .stream_id = err_msg.stream_id };
-                self.streams_mutex.lockUncancelable(global_io);
+                self.streams_mutex.lock();
                 const maybe_stream = self.streams.fetchRemove(key);
-                self.streams_mutex.unlock(global_io);
+                self.streams_mutex.unlock();
 
                 if (maybe_stream) |entry| {
                     entry.value.stop();
@@ -1135,10 +1166,10 @@ const TunnelConnection = struct {
             self.sendStreamClose(stream);
         }
 
-        self.streams_mutex.lockUncancelable(global_io);
+        self.streams_mutex.lock();
         const key = StreamKey{ .service_id = stream.service_id, .stream_id = stream.stream_id };
         const removed = self.streams.fetchRemove(key);
-        self.streams_mutex.unlock(global_io);
+        self.streams_mutex.unlock();
         if (removed) |_| {
             stream.releaseRef();
         }
@@ -1187,8 +1218,8 @@ const TunnelConnection = struct {
                 const stream = try Stream.create(global_allocator, msg.service_id, msg.stream_id, target_stream, self);
                 target_stream_guard = false; // ownership transferred to Stream
 
-                self.streams_mutex.lockUncancelable(global_io);
-                defer self.streams_mutex.unlock(global_io);
+                self.streams_mutex.lock();
+                defer self.streams_mutex.unlock();
 
                 const key = StreamKey{ .service_id = msg.service_id, .stream_id = msg.stream_id };
                 // Create ref IS map ref — no extra acquire.
@@ -1268,18 +1299,18 @@ const TunnelConnection = struct {
         // All check `running` before insert. So the iterative pop here
         // converges; concurrent inserts during teardown are not observed.
         while (true) {
-            self.streams_mutex.lockUncancelable(global_io);
+            self.streams_mutex.lock();
             var iter = self.streams.iterator();
             const entry = iter.next();
             if (entry) |e| {
                 const key_copy = e.key_ptr.*;
                 const stream_ptr = e.value_ptr.*;
                 _ = self.streams.remove(key_copy);
-                self.streams_mutex.unlock(global_io);
+                self.streams_mutex.unlock();
                 stream_ptr.stop();
                 stream_ptr.releaseRef();
             } else {
-                self.streams_mutex.unlock(global_io);
+                self.streams_mutex.unlock();
                 break;
             }
         }
@@ -1442,6 +1473,10 @@ pub fn main(init: std.process.Init) !void {
             .flags = 0,
         };
         posix.sigaction(posix.SIG.INT, &sig_action, null);
+        // SIGTERM was previously unbound — the handler at handleSignal()
+        // already accepts it, but without sigaction it took the default
+        // action (process kill, no defers run, no profile/stats flush).
+        posix.sigaction(posix.SIG.TERM, &sig_action, null);
         if (@hasDecl(posix.SIG, "HUP")) {
             posix.sigaction(posix.SIG.HUP, &sig_action, null); // Register SIGHUP for hot reload
         }
@@ -1733,17 +1768,17 @@ fn reverseServiceListener(ctx_ptr: *anyopaque) void {
             continue;
         };
 
-        ctx.tunnel_conn.streams_mutex.lockUncancelable(global_io);
+        ctx.tunnel_conn.streams_mutex.lock();
         const key = StreamKey{ .service_id = ctx.service_id, .stream_id = stream_id };
         // Create ref IS map ref — no extra acquire.
         ctx.tunnel_conn.streams.put(key, stream) catch |err| {
-            ctx.tunnel_conn.streams_mutex.unlock(global_io);
+            ctx.tunnel_conn.streams_mutex.unlock();
             std.debug.print("[REVERSE-SERVICE] Failed to register stream: {}\n", .{err});
             stream.stop();
             stream.releaseRef(); // drop create ref → destroys
             continue;
         };
-        ctx.tunnel_conn.streams_mutex.unlock(global_io);
+        ctx.tunnel_conn.streams_mutex.unlock();
 
         std.debug.print("[REVERSE-SERVICE] Stream {} created for reverse connection\n", .{stream_id});
     }

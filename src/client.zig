@@ -37,6 +37,22 @@ var tunnel_tx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var tunnel_rx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var flush_stats_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var sighup_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Per-process gate for the encryption time profile.  Resolved on first
+/// read into module-scope statics.  Set `FLOO_PROFILE_ENCRYPT=1` in the
+/// environment to opt in.
+var encrypt_profile_checked: std.atomic.Value(bool) = .init(false);
+var encrypt_profile_value: bool = false;
+
+fn encrypt_profile_enabled() bool {
+    if (!encrypt_profile_checked.load(.acquire)) {
+        const cstr = std.c.getenv("FLOO_PROFILE_ENCRYPT");
+        encrypt_profile_value = if (cstr) |c| (c[0] != 0 and c[0] != '0') else false;
+        encrypt_profile_checked.store(true, .release);
+        std.debug.print("[PROFILE] encrypt-time profile {s}\n", .{if (encrypt_profile_value) "ENABLED via FLOO_PROFILE_ENCRYPT" else "disabled (set FLOO_PROFILE_ENCRYPT=1 to enable)"});
+    }
+    return encrypt_profile_value;
+}
 var tunnel_cpu_assigner: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var tunnel_cpu_cache: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
@@ -630,7 +646,11 @@ const TunnelClient = struct {
     tunnel_writer: Io.net.Stream.Writer,
     service_id: tunnel.ServiceId,
     connections: std.AutoHashMap(tunnel.StreamId, *LocalConnection),
-    connections_mutex: std.Io.Mutex,
+    /// common.HotMutex (os_unfair_lock on Darwin, raw futex on Linux)
+    /// instead of Io.Mutex; see transport/Channel.send_mutex for
+    /// rationale. Hot on the data path (held per CONNECT/CONNECT_ACK
+    /// /CLOSE/recv-DATA lookup).
+    connections_mutex: common.HotMutex,
     channel: transport.Channel,
     next_stream_id: std.atomic.Value(u32),
     running: std.atomic.Value(bool),
@@ -674,7 +694,7 @@ const TunnelClient = struct {
             .tunnel_writer = undefined,
             .service_id = service_id,
             .connections = std.AutoHashMap(tunnel.StreamId, *LocalConnection).init(allocator),
-            .connections_mutex = .init,
+            .connections_mutex = .{},
             .channel = undefined,
             .next_stream_id = std.atomic.Value(u32).init(1),
             .running = std.atomic.Value(bool).init(true),
@@ -700,10 +720,15 @@ const TunnelClient = struct {
             .static_keypair = static_keypair,
             .role = .client,
             .version = build_options.version,
-            .stats = transport.EncryptionStats{
-                .total_ns = &encrypt_total_ns,
-                .calls = &encrypt_calls,
-            },
+            // Encryption profile is opt-in via FLOO_PROFILE_ENCRYPT — see
+            // server.zig for rationale.
+            .stats = if (encrypt_profile_enabled())
+                transport.EncryptionStats{
+                    .total_ns = &encrypt_total_ns,
+                    .calls = &encrypt_calls,
+                }
+            else
+                null,
             .throughput = transport.ThroughputStats{
                 .tx_bytes = &tunnel_tx_bytes,
                 .rx_bytes = &tunnel_rx_bytes,
@@ -788,7 +813,7 @@ const TunnelClient = struct {
             }) catch unreachable;
             poll_entries.append(global_allocator, .{ .tunnel = {} }) catch unreachable;
 
-            self.connections_mutex.lockUncancelable(global_io);
+            self.connections_mutex.lock();
             var iter = self.connections.iterator();
             while (iter.next()) |entry| {
                 const conn_ptr = entry.value_ptr.*;
@@ -807,7 +832,7 @@ const TunnelClient = struct {
                     continue;
                 };
             }
-            self.connections_mutex.unlock(global_io);
+            self.connections_mutex.unlock();
 
             const ready = posix.poll(poll_fds.items, poll_timeout_ms) catch |err| {
                 std.debug.print("[CLIENT] Poll error: {}\n", .{err});
@@ -932,9 +957,9 @@ const TunnelClient = struct {
                 const err_msg = try tunnel.ConnectErrorMsg.decodeRef(message_slice);
                 std.debug.print("[CLIENT] CONNECT_ERROR stream_id={} code={s} error={s}\n", .{ err_msg.stream_id, @tagName(err_msg.error_code), err_msg.error_msg });
 
-                self.connections_mutex.lockUncancelable(global_io);
+                self.connections_mutex.lock();
                 const maybe_conn = self.connections.fetchRemove(err_msg.stream_id);
-                self.connections_mutex.unlock(global_io);
+                self.connections_mutex.unlock();
 
                 if (maybe_conn) |entry| {
                     entry.value.stop();
@@ -945,12 +970,12 @@ const TunnelClient = struct {
                 const data_msg = try tunnel.DataMsg.decode(message_slice);
 
                 var conn_ref: ?*LocalConnection = null;
-                self.connections_mutex.lockUncancelable(global_io);
+                self.connections_mutex.lock();
                 if (self.connections.get(data_msg.stream_id)) |conn_entry| {
                     conn_entry.acquireRef();
                     conn_ref = conn_entry;
                 }
-                self.connections_mutex.unlock(global_io);
+                self.connections_mutex.unlock();
 
                 if (conn_ref) |active_conn| {
                     defer active_conn.releaseRef();
@@ -966,9 +991,9 @@ const TunnelClient = struct {
                 const close_msg = try tunnel.CloseMsg.decode(message_slice);
                 tracePrint(enable_tunnel_trace, "[CLIENT] CLOSE stream_id={}\n", .{close_msg.stream_id});
 
-                self.connections_mutex.lockUncancelable(global_io);
+                self.connections_mutex.lock();
                 const maybe_conn = self.connections.fetchRemove(close_msg.stream_id);
-                self.connections_mutex.unlock(global_io);
+                self.connections_mutex.unlock();
 
                 if (maybe_conn) |entry| {
                     entry.value.stop();
@@ -1078,15 +1103,15 @@ const TunnelClient = struct {
                 };
 
                 // Add to connections — create ref IS map ref.
-                self.connections_mutex.lockUncancelable(global_io);
+                self.connections_mutex.lock();
                 self.connections.put(msg.stream_id, conn) catch |err| {
-                    self.connections_mutex.unlock(global_io);
+                    self.connections_mutex.unlock();
                     std.debug.print("[CLIENT] Failed to store reverse connection: {}\n", .{err});
                     conn.stop();
                     conn.releaseRef(); // drop create ref → destroys
                     return;
                 };
-                self.connections_mutex.unlock(global_io);
+                self.connections_mutex.unlock();
 
                 // Send CONNECT_ACK to server
                 const ack_msg = tunnel.ConnectAckMsg{
@@ -1126,14 +1151,14 @@ const TunnelClient = struct {
         stream_guard = false;
 
         // Create ref IS map ref — no extra acquire.
-        self.connections_mutex.lockUncancelable(global_io);
+        self.connections_mutex.lock();
         self.connections.put(msg.stream_id, conn) catch |err| {
-            self.connections_mutex.unlock(global_io);
+            self.connections_mutex.unlock();
             conn.stop();
             conn.releaseRef(); // drop create ref → destroys
             return err;
         };
-        self.connections_mutex.unlock(global_io);
+        self.connections_mutex.unlock();
 
         // Send CONNECT_ACK back to server
         const ack_msg = tunnel.ConnectAckMsg{
@@ -1167,14 +1192,14 @@ const TunnelClient = struct {
         const conn = try LocalConnection.create(global_allocator, service_id, stream_id, local_stream, self);
 
         // Create ref IS map ref — no extra acquire.
-        self.connections_mutex.lockUncancelable(global_io);
+        self.connections_mutex.lock();
         self.connections.put(stream_id, conn) catch |err| {
-            self.connections_mutex.unlock(global_io);
+            self.connections_mutex.unlock();
             conn.stop();
             conn.releaseRef(); // drop create ref → destroys
             return err;
         };
-        self.connections_mutex.unlock(global_io);
+        self.connections_mutex.unlock();
 
         // Send encrypted CONNECT message (no allocation - use stack buffer)
         const connect_msg = tunnel.ConnectMsg{
@@ -1270,9 +1295,9 @@ const TunnelClient = struct {
             self.sendCloseFrame(conn.service_id, conn.stream_id);
         }
 
-        self.connections_mutex.lockUncancelable(global_io);
+        self.connections_mutex.lock();
         const removed = self.connections.fetchRemove(conn.stream_id);
-        self.connections_mutex.unlock(global_io);
+        self.connections_mutex.unlock();
         if (removed) |_| {
             conn.releaseRef(); // drop map-held reference
         }
@@ -1302,18 +1327,18 @@ const TunnelClient = struct {
 
         // Stop all connections
         while (true) {
-            self.connections_mutex.lockUncancelable(global_io);
+            self.connections_mutex.lock();
             var iter = self.connections.iterator();
             const entry = iter.next();
             if (entry) |e| {
                 const key_copy = e.key_ptr.*;
                 const conn_ptr = e.value_ptr.*;
                 _ = self.connections.remove(key_copy);
-                self.connections_mutex.unlock(global_io);
+                self.connections_mutex.unlock();
                 conn_ptr.stop();
                 conn_ptr.releaseRef();
             } else {
-                self.connections_mutex.unlock(global_io);
+                self.connections_mutex.unlock();
                 break;
             }
         }
@@ -1778,6 +1803,10 @@ pub fn main(init: std.process.Init) !void {
             .flags = 0,
         };
         posix.sigaction(posix.SIG.INT, &sig_action, null);
+        // SIGTERM previously unbound — handleSignal already accepts it,
+        // but without sigaction the default action (process kill) runs
+        // and `defer diagnostics.flush*` never fires.
+        posix.sigaction(posix.SIG.TERM, &sig_action, null);
         if (@hasDecl(posix.SIG, "HUP")) {
             posix.sigaction(posix.SIG.HUP, &sig_action, null); // Register SIGHUP for hot reload
         }

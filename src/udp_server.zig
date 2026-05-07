@@ -22,7 +22,10 @@ pub const UdpForwarder = struct {
     running: std.atomic.Value(bool),
     timeout_ns: i64,
     sessions: std.AutoHashMap(tunnel.StreamId, *Session),
-    sessions_mutex: std.Io.Mutex,
+    /// common.HotMutex — held briefly per inbound UDP datagram and per
+    /// reverse-direction send.  See transport/Channel.send_mutex for
+    /// rationale.
+    sessions_mutex: common.HotMutex,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -46,7 +49,7 @@ pub const UdpForwarder = struct {
             .running = std.atomic.Value(bool).init(true),
             .timeout_ns = @as(i64, @intCast(timeout_seconds * std.time.ns_per_s)),
             .sessions = std.AutoHashMap(tunnel.StreamId, *Session).init(allocator),
-            .sessions_mutex = .init,
+            .sessions_mutex = .{},
         };
         return forwarder;
     }
@@ -81,11 +84,11 @@ pub const UdpForwarder = struct {
         // The cost is one mutex acquire per session instead of one for
         // the whole snapshot — fine for shutdown.
         while (true) {
-            self.sessions_mutex.lockUncancelable(self.io);
+            self.sessions_mutex.lock();
             var iter = self.sessions.keyIterator();
             const next_key = iter.next();
             const stream_id_opt = if (next_key) |k| k.* else null;
-            self.sessions_mutex.unlock(self.io);
+            self.sessions_mutex.unlock();
 
             if (stream_id_opt) |stream_id| {
                 self.removeSession(stream_id, false);
@@ -122,8 +125,8 @@ pub const UdpForwarder = struct {
     ) !*Session {
         // Fast path: session already exists.
         {
-            self.sessions_mutex.lockUncancelable(self.io);
-            defer self.sessions_mutex.unlock(self.io);
+            self.sessions_mutex.lock();
+            defer self.sessions_mutex.unlock();
             if (self.sessions.get(stream_id)) |session| {
                 if (session.source_addr_len != source_addr.len or
                     session.source_port != source_port or
@@ -173,9 +176,9 @@ pub const UdpForwarder = struct {
 
         // Race-safe insert: re-check under the lock, install if free, otherwise
         // tear down our duplicate and return the winner (or error on mismatch).
-        self.sessions_mutex.lockUncancelable(self.io);
+        self.sessions_mutex.lock();
         if (self.sessions.get(stream_id)) |existing| {
-            self.sessions_mutex.unlock(self.io);
+            self.sessions_mutex.unlock();
             session.running.store(false, .release);
             _ = posix.system.shutdown(session.socket.handle, posix.SHUT.RD);
             session.thread.join();
@@ -190,7 +193,7 @@ pub const UdpForwarder = struct {
             return existing;
         }
         self.sessions.put(stream_id, session) catch |err| {
-            self.sessions_mutex.unlock(self.io);
+            self.sessions_mutex.unlock();
             session.running.store(false, .release);
             _ = posix.system.shutdown(session.socket.handle, posix.SHUT.RD);
             session.thread.join();
@@ -198,7 +201,7 @@ pub const UdpForwarder = struct {
             self.allocator.destroy(session);
             return err;
         };
-        self.sessions_mutex.unlock(self.io);
+        self.sessions_mutex.unlock();
 
         return session;
     }
@@ -244,8 +247,8 @@ pub const UdpForwarder = struct {
         defer expired_items.deinit(self.allocator);
 
         {
-            self.sessions_mutex.lockUncancelable(self.io);
-            defer self.sessions_mutex.unlock(self.io);
+            self.sessions_mutex.lock();
+            defer self.sessions_mutex.unlock();
 
             var iter = self.sessions.iterator();
             while (iter.next()) |entry| {
@@ -266,9 +269,9 @@ pub const UdpForwarder = struct {
     }
 
     fn removeSession(self: *UdpForwarder, stream_id: tunnel.StreamId, caller_is_thread: bool) void {
-        self.sessions_mutex.lockUncancelable(self.io);
+        self.sessions_mutex.lock();
         const entry = self.sessions.fetchRemove(stream_id);
-        self.sessions_mutex.unlock(self.io);
+        self.sessions_mutex.unlock();
 
         if (entry) |removed| {
             const session = removed.value;

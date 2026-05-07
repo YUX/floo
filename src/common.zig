@@ -4,11 +4,118 @@ const posix = std.posix;
 const Io = std.Io;
 const config = @import("config.zig");
 
+/// Thread-only mutex, no fiber/Io awareness. Designed for the data path
+/// where every nanosecond matters and we have only OS threads in flight.
+///
+/// Why not std.Io.Mutex: that type goes through an Io vtable on contention
+/// (`io.futexWaitUncancelable`) so it can suspend a fiber. We have no
+/// fibers, so the indirection is dead weight. Why not std.Thread.Mutex:
+/// 0.16 doesn't expose one — that name is the kernel-thread struct.
+///
+///   * Darwin → os_unfair_lock (single CAS uncontended; layout is one u32).
+///   * Linux  → 3-state futex (Drepper's classic; same shape as a private
+///     pthread_mutex, but no glibc indirection).
+///
+/// On ARM the fast path is `cmpxchgWeak` — at most one LL/SC pair, allowed
+/// to spuriously fail.  `Io.Mutex`'s fast path uses `cmpxchgStrong`, which
+/// adds the LL/SC retry loop.  Materially cheaper on ARM, equivalent on
+/// x86 (`lock cmpxchg`).
+///
+/// Held briefly across hashmap lookups, refcount bumps, and (for
+/// transport.Channel.send_mutex) one writev syscall plus an in-place
+/// AEAD encrypt. Not re-entrant. `os_unfair_lock` is intentionally
+/// non-fair — fine for short critical sections, can starve under
+/// pathological adversarial contention.
+pub const HotMutex = if (builtin.os.tag == .macos or builtin.os.tag == .ios)
+    DarwinHotMutex
+else
+    FutexHotMutex;
+
+const DarwinHotMutex = extern struct {
+    raw: std.c.os_unfair_lock = .{},
+
+    pub inline fn lock(self: *DarwinHotMutex) void {
+        std.c.os_unfair_lock_lock(&self.raw);
+    }
+
+    pub inline fn unlock(self: *DarwinHotMutex) void {
+        std.c.os_unfair_lock_unlock(&self.raw);
+    }
+
+    pub inline fn tryLock(self: *DarwinHotMutex) bool {
+        return std.c.os_unfair_lock_trylock(&self.raw);
+    }
+};
+
+const FutexHotMutex = extern struct {
+    state: std.atomic.Value(u32) = .init(unlocked),
+
+    const unlocked: u32 = 0;
+    const locked: u32 = 1;
+    const contended: u32 = 2;
+
+    pub inline fn lock(self: *FutexHotMutex) void {
+        if (self.state.cmpxchgWeak(unlocked, locked, .acquire, .monotonic)) |_| {
+            self.lockSlow();
+        }
+    }
+
+    fn lockSlow(self: *FutexHotMutex) void {
+        @branchHint(.cold);
+        var s = self.state.swap(contended, .acquire);
+        while (s != unlocked) {
+            futexWait(&self.state, contended);
+            s = self.state.swap(contended, .acquire);
+        }
+    }
+
+    pub inline fn unlock(self: *FutexHotMutex) void {
+        if (self.state.swap(unlocked, .release) == contended) {
+            futexWake(&self.state, 1);
+        }
+    }
+
+    pub inline fn tryLock(self: *FutexHotMutex) bool {
+        return self.state.cmpxchgStrong(unlocked, locked, .acquire, .monotonic) == null;
+    }
+
+    fn futexWait(ptr: *std.atomic.Value(u32), expected: u32) void {
+        if (builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            _ = linux.futex_4arg(
+                &ptr.raw,
+                .{ .cmd = .WAIT, .private = true },
+                expected,
+                null,
+            );
+        } else {
+            // No futex available; fall back to a brief yield so we don't
+            // burn the CPU.  Hot path on non-Linux non-Darwin is not the
+            // current target — Floo ships for macOS and Linux.
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn futexWake(ptr: *std.atomic.Value(u32), count: u32) void {
+        if (builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            _ = linux.futex_3arg(
+                &ptr.raw,
+                .{ .cmd = .WAKE, .private = true },
+                count,
+            );
+        }
+    }
+};
+
 /// Read the monotonic clock as nanoseconds.
 ///
-/// Goes through `posix.system.clock_gettime` (raw syscall) rather than the
-/// std.Io clock so that callers in atomic-update paths (no Io in scope) can
-/// still get monotonic timestamps without plumbing Io through every API.
+/// Calls `posix.system.clock_gettime` directly rather than going through
+/// the std.Io clock so callers in atomic-update paths (no Io in scope)
+/// can still get monotonic timestamps without plumbing Io through every
+/// API.  On Darwin and Linux this is a userspace read (commpage / vDSO),
+/// not a real syscall — ~10–20 ns each.  The cost is real at multi-Gbps
+/// frame rates but smaller than a syscall trap.
 pub fn nanoTimestamp() i128 {
     var ts: posix.timespec = undefined;
     _ = posix.system.clock_gettime(.MONOTONIC, &ts);
@@ -236,7 +343,13 @@ pub fn writeFrameDirect(handle: posix.fd_t, payload: []const u8) !void {
             const errno = std.posix.errno(written);
             switch (errno) {
                 .INTR => continue,
-                .AGAIN => continue,
+                // The data path holds `Channel.send_mutex` across this
+                // loop and only ever uses blocking sockets, so EAGAIN
+                // from a blocking writev is a programming error (e.g.,
+                // a future change flipping the fd non-blocking without
+                // a matching poll-loop integration).  We choose loud
+                // failure over a silent infinite spin under the lock.
+                .AGAIN => return error.WriteFailed,
                 .PIPE => return error.ConnectionClosed,
                 .CONNRESET => return error.ConnectionClosed,
                 else => return error.WriteFailed,

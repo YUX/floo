@@ -82,7 +82,10 @@ pub const UdpSessionManager = struct {
     io: Io,
     sessions: std.AutoHashMap(SessionKey, UdpSession),
     reverse_map: std.AutoHashMap(tunnel.StreamId, SessionKey),
-    mutex: std.Io.Mutex,
+    /// common.HotMutex — held briefly per inbound UDP datagram (getOrCreate
+    /// lookup or reverse_map fetch).  Same hot-path shape as the TCP
+    /// `streams_mutex`.
+    mutex: common.HotMutex,
     next_stream_id: std.atomic.Value(u32),
     scratch_keys: std.ArrayListUnmanaged(SessionKey),
 
@@ -92,7 +95,7 @@ pub const UdpSessionManager = struct {
             .io = io,
             .sessions = std.AutoHashMap(SessionKey, UdpSession).init(allocator),
             .reverse_map = std.AutoHashMap(tunnel.StreamId, SessionKey).init(allocator),
-            .mutex = .init,
+            .mutex = .{},
             .next_stream_id = std.atomic.Value(u32).init(1),
             .scratch_keys = .empty,
         };
@@ -111,8 +114,8 @@ pub const UdpSessionManager = struct {
     /// chain-walk + entry-replace on every packet. Now we mutate via `getPtr`
     /// so the existing-session fast path is a single hash lookup.
     pub fn getOrCreate(self: *UdpSessionManager, source_addr: Io.net.IpAddress) !UdpSession {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         const key = SessionKey.initFromAddress(source_addr);
 
@@ -137,8 +140,8 @@ pub const UdpSessionManager = struct {
     /// `&session.source_addr`, which silently aliased a copy of the
     /// session's stack value here — fragile across refactors).
     pub fn lookupSourceAddr(self: *UdpSessionManager, stream_id: tunnel.StreamId) ?Io.net.IpAddress {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         const key = self.reverse_map.get(stream_id) orelse return null;
         if (self.sessions.get(key)) |session| return session.source_addr;
@@ -147,8 +150,8 @@ pub const UdpSessionManager = struct {
 
     /// Remove expired sessions
     pub fn cleanupExpired(self: *UdpSessionManager, timeout_seconds: u64) !usize {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         self.scratch_keys.clearRetainingCapacity();
 
@@ -170,8 +173,8 @@ pub const UdpSessionManager = struct {
 
     /// Count active sessions
     pub fn count(self: *UdpSessionManager) usize {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.sessions.count();
     }
 };

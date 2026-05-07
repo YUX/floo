@@ -15,27 +15,34 @@ pub const HandshakeMetrics = struct {
 };
 
 /// Shared encryption stats so callers can aggregate profile data.
+///
+/// `.monotonic` ordering is correct for these write-only counters: no
+/// other thread synchronizes through them.  `diagnostics.flushEncryptStats`
+/// reads them once at process exit, after all writers have joined or
+/// been signalled to stop.  On ARM (M-series) this avoids the `dmb ish`
+/// per fetchAdd that an `.acq_rel` order would emit.
 pub const EncryptionStats = struct {
     total_ns: *std.atomic.Value(u64),
     calls: *std.atomic.Value(u64),
 
     pub fn record(self: EncryptionStats, delta: u64) void {
-        _ = self.total_ns.fetchAdd(delta, .acq_rel);
-        _ = self.calls.fetchAdd(1, .acq_rel);
+        _ = self.total_ns.fetchAdd(delta, .monotonic);
+        _ = self.calls.fetchAdd(1, .monotonic);
     }
 };
 
 /// Optional throughput counters (bytes in/out) shared by caller.
+/// See `EncryptionStats` for the ordering rationale.
 pub const ThroughputStats = struct {
     tx_bytes: *std.atomic.Value(u64),
     rx_bytes: *std.atomic.Value(u64),
 
     pub fn recordTx(self: ThroughputStats, amount: usize) void {
-        _ = self.tx_bytes.fetchAdd(@intCast(amount), .acq_rel);
+        _ = self.tx_bytes.fetchAdd(@intCast(amount), .monotonic);
     }
 
     pub fn recordRx(self: ThroughputStats, amount: usize) void {
-        _ = self.rx_bytes.fetchAdd(@intCast(amount), .acq_rel);
+        _ = self.rx_bytes.fetchAdd(@intCast(amount), .monotonic);
     }
 };
 
@@ -77,7 +84,12 @@ pub const Channel = struct {
     recv_cipher: ?noise.TransportCipher,
     control_buffer: []u8,
     large_send_buffer: []u8,
-    send_mutex: std.Io.Mutex,
+    /// common.HotMutex (os_unfair_lock on Darwin, raw futex on Linux). The
+    /// Io.Mutex fast path is the same single CAS, but its slow path goes
+    /// through a vtable so a fiber can suspend on contention; we have no
+    /// fibers, only OS threads, so the vtable hop is dead weight. CHANGELOG
+    /// 0.2.0 cited this as the remaining headroom vs the 0.1.5 baseline.
+    send_mutex: common.HotMutex,
     stats: ?EncryptionStats,
     throughput: ?ThroughputStats,
 
@@ -144,7 +156,7 @@ pub const Channel = struct {
             .recv_cipher = recv_cipher,
             .control_buffer = control_buffer,
             .large_send_buffer = large_send_buffer,
-            .send_mutex = .init,
+            .send_mutex = .{},
             .stats = params.stats,
             .throughput = params.throughput,
         };
@@ -172,8 +184,8 @@ pub const Channel = struct {
     /// pre-migration writev semantics; the buffered Stream.Writer was costing
     /// roughly 3x throughput due to per-call vtable dispatch + flush overhead).
     pub fn sendCopy(self: *Channel, payload: []const u8) !void {
-        self.send_mutex.lockUncancelable(self.io);
-        defer self.send_mutex.unlock(self.io);
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
 
         const fd = self.stream.socket.handle;
 
@@ -200,8 +212,8 @@ pub const Channel = struct {
     ///
     /// Hot path: same direct-writev rationale as sendCopy.
     pub fn sendDataInPlace(self: *Channel, buffer: []u8, payload_len: usize) !void {
-        self.send_mutex.lockUncancelable(self.io);
-        defer self.send_mutex.unlock(self.io);
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
 
         const slice = try self.prepareSendSlice(buffer, payload_len);
         try common.writeFrameDirect(self.stream.socket.handle, slice);
@@ -258,13 +270,18 @@ pub const Channel = struct {
         const encrypted_len = payload_len + noise.TAG_LEN;
 
         if (self.send_cipher) |*cipher| {
-            const start_ns = common.nanoTimestamp();
-            try cipher.encrypt(buffer[0..payload_len], buffer[0..encrypted_len]);
-            const end_ns = common.nanoTimestamp();
-
+            // Hot path: only sample the clock when stats are actually wired
+            // up (debug/diagnostics builds). On the steady-state data path
+            // this used to do two clock_gettime() syscalls per frame even
+            // when the recorded value was discarded.
             if (self.stats) |stats| {
+                const start_ns = common.nanoTimestamp();
+                try cipher.encrypt(buffer[0..payload_len], buffer[0..encrypted_len]);
+                const end_ns = common.nanoTimestamp();
                 const delta: u64 = @intCast(end_ns - start_ns);
                 stats.record(delta);
+            } else {
+                try cipher.encrypt(buffer[0..payload_len], buffer[0..encrypted_len]);
             }
 
             return buffer[0..encrypted_len];
