@@ -204,7 +204,7 @@ jobs:
 
             **Recommended:** Optimized builds provide significantly better crypto performance (3-5x faster encryption).
 
-            **Raspberry Pi users:** Use the `aarch64-linux-gnu-rpi` variant to avoid illegal instruction errors on Pi 4/5.
+            **Raspberry Pi users:** Use the `aarch64-linux-gnu-rpi4` variant to avoid illegal instruction errors on Pi 4/5.
 
             **Extract and use:**
             ```bash
@@ -232,4 +232,4 @@ jobs:
 
             ---
 
-            **Built with in Zig**
+            **Built with Zig**

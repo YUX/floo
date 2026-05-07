@@ -129,7 +129,7 @@ flooc 535K
 floos 469K
 ```
 
-14 commits, ~1100 net lines changed, zero new dependencies. `net_compat.zig` shim retired. CI workflows still need to be pinned to `version: 0.16.0` (was `master`) — that's a one-line change per workflow saved for the same PR that merges this branch.
+14 commits, ~1100 net lines changed, zero new dependencies. `net_compat.zig` shim retired. CI workflows are pinned to `version: 0.16.0`.
 
 ## server.zig migration plan (~54 posix call sites)
 

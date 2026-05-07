@@ -15,7 +15,7 @@ Modern, cyberpunk-themed project website for Floo, built with React and Vite.
 
 ### Prerequisites
 
-- Node.js 18+ and npm
+- Node.js 20.19+ or 22.12+ and npm
 
 ### Install Dependencies
 
