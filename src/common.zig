@@ -534,17 +534,26 @@ pub const RateLimiter = struct {
         }
 
         // Slow path: refill if the interval has elapsed.
+        //
+        // Race: previously, two callers observing `elapsed >= interval`
+        // would both `tokens.store(max_tokens)` then `fetchSub(1)`, briefly
+        // letting through `max_tokens × N_concurrent` rather than just
+        // `max_tokens`.  Fix: use the last_refill timestamp as the lock —
+        // the thread that successfully cmpxchg's the timestamp from `last`
+        // to `now` is the unique winner that gets to refill the bucket.
+        // Losers fall through and return false (or hit the fast path on
+        // their next call).
         const now: i64 = @intCast(nanoTimestamp());
         const last = self.last_refill.load(.monotonic);
         const elapsed = now - last;
 
         if (elapsed >= self.refill_interval_ns) {
-            self.tokens.store(self.max_tokens, .monotonic);
-            _ = self.last_refill.cmpxchgWeak(last, now, .monotonic, .monotonic);
-
-            const refilled = self.tokens.load(.monotonic);
-            if (refilled > 0) {
-                _ = self.tokens.fetchSub(1, .monotonic);
+            if (self.last_refill.cmpxchgStrong(last, now, .monotonic, .monotonic) == null) {
+                // We won the race to refill.  Take one for ourselves and
+                // publish the rest.  Doing the +max-1 in one store avoids
+                // the brief window where `tokens == max_tokens` could let
+                // the fast path race ahead of our own consumption.
+                self.tokens.store(self.max_tokens - 1, .monotonic);
                 return true;
             }
         }

@@ -786,6 +786,100 @@ fn computeAuthTag(psk: []const u8, handshake_hash: []const u8, role: u8) [HASH_L
     return tag;
 }
 
+/// Plaintext-mode PSK proof-of-knowledge.
+///
+/// When the operator selects `cipher = "none"` the Noise XX handshake is
+/// skipped entirely — there is no DH, no chaining key, no AEAD.  The
+/// pre-S-1 code path silently accepted any peer in this mode (the README
+/// says "Debug/testing only" but the failure mode was "open relay").
+///
+/// This routine preserves *mutual authentication* even when encryption is
+/// off: each side draws a 32-byte random nonce, exchanges nonces, and both
+/// compute `HMAC-SHA256(psk, label || initiator_nonce || responder_nonce ||
+/// role_byte)`.  The role byte (`I`/`R`) is direction-bound to prevent a
+/// peer from echoing back our own tag.  Binding both nonces makes each
+/// successful exchange unique — replay across connections fails because
+/// the nonces differ.
+///
+/// Confidentiality: still none.  Integrity of subsequent traffic: still
+/// none.  But "I know the PSK" is proven by *both* parties before any data
+/// frame is exchanged.  An attacker without the PSK cannot complete the
+/// exchange, so the stream stays closed.  Cost: one HMAC + one round
+/// trip; this only runs in the explicitly-debug `cipher=none` path so the
+/// hot path is unaffected.
+pub fn plaintextPskHandshake(
+    io: Io,
+    reader: *Io.Reader,
+    writer: *Io.Writer,
+    is_initiator: bool,
+    psk: []const u8,
+) !void {
+    if (psk.len == 0) return error.MissingPsk;
+
+    const NONCE_LEN: usize = 32;
+    const LABEL = "floo-plaintext-psk-v1";
+
+    var local_nonce: [NONCE_LEN]u8 = undefined;
+    io.random(&local_nonce);
+    defer crypto.secureZero(u8, &local_nonce);
+
+    var peer_nonce: [NONCE_LEN]u8 = undefined;
+    defer crypto.secureZero(u8, &peer_nonce);
+
+    // Exchange nonces.  Initiator goes first so the wire order is
+    // deterministic regardless of role.
+    if (is_initiator) {
+        try writer.writeAll(&local_nonce);
+        try writer.flush();
+        try reader.readSliceAll(&peer_nonce);
+    } else {
+        try reader.readSliceAll(&peer_nonce);
+        try writer.writeAll(&local_nonce);
+        try writer.flush();
+    }
+
+    const initiator_nonce = if (is_initiator) &local_nonce else &peer_nonce;
+    const responder_nonce = if (is_initiator) &peer_nonce else &local_nonce;
+
+    const local_role: u8 = if (is_initiator) 'I' else 'R';
+    const peer_role: u8 = if (is_initiator) 'R' else 'I';
+
+    var local_tag: [HASH_LEN]u8 = undefined;
+    {
+        var hmac = crypto.auth.hmac.sha2.HmacSha256.init(psk);
+        hmac.update(LABEL);
+        hmac.update(initiator_nonce);
+        hmac.update(responder_nonce);
+        hmac.update(&[_]u8{local_role});
+        hmac.final(&local_tag);
+    }
+
+    var expected_peer_tag: [HASH_LEN]u8 = undefined;
+    {
+        var hmac = crypto.auth.hmac.sha2.HmacSha256.init(psk);
+        hmac.update(LABEL);
+        hmac.update(initiator_nonce);
+        hmac.update(responder_nonce);
+        hmac.update(&[_]u8{peer_role});
+        hmac.final(&expected_peer_tag);
+    }
+
+    var peer_tag: [HASH_LEN]u8 = undefined;
+    if (is_initiator) {
+        try writer.writeAll(&local_tag);
+        try writer.flush();
+        try reader.readSliceAll(&peer_tag);
+    } else {
+        try reader.readSliceAll(&peer_tag);
+        try writer.writeAll(&local_tag);
+        try writer.flush();
+    }
+
+    if (!common.constantTimeEqual(peer_tag[0..], expected_peer_tag[0..])) {
+        return error.AuthenticationFailed;
+    }
+}
+
 /// Noise_XX handshake pattern
 /// XX:
 ///   -> e

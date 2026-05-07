@@ -943,6 +943,36 @@ fn isPlaceholderCredential(value: []const u8) bool {
     return false;
 }
 
+/// Count distinct byte values in `value`.  Cheap proxy for "is this string
+/// plausibly random vs. obviously low-entropy".  Used as a coarse weak-PSK
+/// gate alongside the `len >= 16` and placeholder-prefix checks.
+fn distinctByteCount(value: []const u8) usize {
+    var seen = [_]bool{false} ** 256;
+    var count: usize = 0;
+    for (value) |b| {
+        if (!seen[b]) {
+            seen[b] = true;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// Reject obvious low-entropy credentials that pass the >=16-char gate but
+/// are clearly fat-finger inputs ("AAAAAAAAAAAAAAAA", "abababababababab",
+/// "passwordpassword").  Threshold is intentionally lenient — a 32-byte
+/// base64 string from `openssl rand` has ~28 distinct chars; a 16-char
+/// passphrase typically has 10+.  Anything with fewer than 8 distinct
+/// bytes in a 16+ char string has at most ~3 bits of Shannon entropy per
+/// char, which is well below "couldn't plausibly be random".  We don't
+/// try to catch every weak password — the README says "use openssl rand",
+/// the >=16-char gate filters fat-finger, and this catches the long tail.
+fn isLowEntropyCredential(value: []const u8) bool {
+    if (value.len < 16) return false; // Already caught by the length gate
+    const distinct = distinctByteCount(value);
+    return distinct < 8;
+}
+
 fn validateSecurity(config: anytype) !void {
     const canonical = canonicalizeCipher(config.cipher) orelse return error.InvalidCipher;
     const encryption_enabled = !std.mem.eql(u8, canonical, "none");
@@ -969,10 +999,30 @@ fn validateSecurity(config: anytype) !void {
         return error.DefaultCredentials;
     }
 
-    if (encryption_enabled and config.psk.len == 0) {
+    // PSK is required regardless of cipher.  Even with `cipher = "none"` the
+    // channel layer now runs a plaintext PSK proof-of-knowledge handshake
+    // (audit S-1) so an attacker without the PSK can't speak the protocol.
+    // Without a PSK, that handshake would fail with `error.MissingPsk` at
+    // connect time — easier to surface here.
+    if (config.psk.len == 0) {
+        std.debug.print("[SECURITY] PSK is required (even with cipher=\"none\", PSK is used for mutual authentication)\n", .{});
         return error.MissingPsk;
     }
     if (encryption_enabled and config.psk.len < 16) {
+        return error.WeakPSK;
+    }
+    if (encryption_enabled and isLowEntropyCredential(config.psk)) {
+        std.debug.print(
+            "[SECURITY] PSK appears low-entropy (only {} distinct byte values); use `openssl rand -base64 32`\n",
+            .{distinctByteCount(config.psk)},
+        );
+        return error.WeakPSK;
+    }
+    if (config.token.len > 0 and isLowEntropyCredential(config.token)) {
+        std.debug.print(
+            "[SECURITY] Token appears low-entropy (only {} distinct byte values); use `openssl rand -base64 24`\n",
+            .{distinctByteCount(config.token)},
+        );
         return error.WeakPSK;
     }
 
@@ -1198,4 +1248,28 @@ test "isPlaceholderCredential prefix matching" {
     try std.testing.expect(!isPlaceholderCredential(""));
     try std.testing.expect(!isPlaceholderCredential("a-real-strong-secret-from-openssl"));
     try std.testing.expect(!isPlaceholderCredential("REPLACEMENT-PARTS")); // doesn't start with REPLACE_ or REPLACE-
+}
+
+test "isLowEntropyCredential catches obvious low-entropy strings" {
+    try std.testing.expect(isLowEntropyCredential("AAAAAAAAAAAAAAAA")); // 1 distinct
+    try std.testing.expect(isLowEntropyCredential("abababababababab")); // 2 distinct
+    try std.testing.expect(isLowEntropyCredential("0000000011111111")); // 2 distinct
+    try std.testing.expect(isLowEntropyCredential("aaaabbbbccccdddd")); // 4 distinct, 16 chars
+    // Strings with 8+ distinct bytes — accept (this is the floor; we don't
+    // try to catch all weak passphrases, just fat-finger inputs).
+    try std.testing.expect(!isLowEntropyCredential("abcdefgh01234567")); // 16 distinct
+    try std.testing.expect(!isLowEntropyCredential("a1b2c3d4e5f6g7h8")); // 16 distinct
+    // Length gate: short strings are caught by the length check, not this one.
+    try std.testing.expect(!isLowEntropyCredential("AA"));
+    try std.testing.expect(!isLowEntropyCredential(""));
+}
+
+test "validateSecurity rejects low-entropy PSK" {
+    var cfg = try ServerConfig.init(std.testing.allocator);
+    defer cfg.deinit();
+    cfg.allocator.free(cfg.psk);
+    cfg.psk = try dupString(cfg.allocator, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); // 32 chars, 1 distinct
+    cfg.allocator.free(cfg.token);
+    cfg.token = try dupString(cfg.allocator, "a-real-token-that-passes-checks");
+    try std.testing.expectError(error.WeakPSK, validateSecurity(&cfg));
 }

@@ -372,6 +372,15 @@ pub fn connectViaHttpConnect(
         // Basic auth: base64(username:password). The local auth_str buffer
         // is 512 bytes; pre-check so a long username/password yields a
         // helpful error rather than the bare NoSpaceLeft from bufPrint.
+        //
+        // Header-injection safety: a malicious credential containing CR/LF
+        // could in principle write extra HTTP header lines into the request.
+        // It can't here because the credential is base64-encoded BEFORE it
+        // is interpolated into the header line — the standard base64 alphabet
+        // is `[A-Za-z0-9+/=]` (no CR, no LF), so any \r or \n in the input
+        // becomes regular base64 characters in the output. The bufPrint at
+        // line 386 only ever sees clean alphanumerics, regardless of the
+        // bytes the user typed in proxy_url. Don't change this ordering.
         if (proxy_username.len + 1 + proxy_password.len + 1 > 512) {
             return error.ProxyCredentialsTooLong;
         }

@@ -488,25 +488,88 @@ fn runClientDoctor(allocator: std.mem.Allocator, opts: *CliOptions) !bool {
     var addr_buf: [64]u8 = undefined;
     diagnostics.reportCheck(.ok, "Remote {s}:{d} resolves to {s}", .{ remote_host, remote_port, formatAddress(remote_addr, &addr_buf) });
 
-    // Check local service ports
+    // Check local FORWARD service ports — these are the local listeners the
+    // client itself opens.  TCP services need a `listen()` probe; UDP services
+    // need a datagram `bind()` probe (the previous version always did `listen`,
+    // which fails-with-warning on UDP services even when the port is free).
     var service_iter = cfg.services.valueIterator();
     while (service_iter.next()) |service| {
         const local_addr = common.resolveHostPort(global_io, service.address, service.port) catch |err| {
             diagnostics.reportCheck(.warn, "Failed to parse address for service '{s}': {}", .{ service.name, err });
             continue;
         };
-        const probe = local_addr.listen(global_io, .{ .reuse_address = true });
-        if (probe) |srv| {
-            var srv_mut = srv;
-            defer srv_mut.deinit(global_io);
-            diagnostics.reportCheck(.ok, "Local port {} available for service '{s}' on {s}", .{ service.port, service.name, service.address });
-        } else |err| {
-            if (err == error.AddressInUse) {
-                diagnostics.reportCheck(.warn, "Local port {} for service '{s}' is already in use", .{ service.port, service.name });
-                had_fail = true;
-            } else {
-                diagnostics.reportCheck(.warn, "Unable to probe local port {} for service '{s}': {}", .{ service.port, service.name, err });
-            }
+        switch (service.transport) {
+            .tcp => {
+                const probe = local_addr.listen(global_io, .{ .reuse_address = true });
+                if (probe) |srv| {
+                    var srv_mut = srv;
+                    defer srv_mut.deinit(global_io);
+                    diagnostics.reportCheck(.ok, "Local TCP port {} available for service '{s}' on {s}", .{ service.port, service.name, service.address });
+                } else |err| {
+                    if (err == error.AddressInUse) {
+                        diagnostics.reportCheck(.warn, "Local TCP port {} for service '{s}' is already in use", .{ service.port, service.name });
+                        had_fail = true;
+                    } else {
+                        diagnostics.reportCheck(.warn, "Unable to probe local TCP port {} for service '{s}': {}", .{ service.port, service.name, err });
+                    }
+                }
+            },
+            .udp => {
+                const probe = local_addr.bind(global_io, .{ .mode = .dgram });
+                if (probe) |sock| {
+                    var sock_mut = sock;
+                    sock_mut.close(global_io);
+                    diagnostics.reportCheck(.ok, "Local UDP port {} available for service '{s}' on {s}", .{ service.port, service.name, service.address });
+                } else |err| {
+                    if (err == error.AddressInUse) {
+                        diagnostics.reportCheck(.warn, "Local UDP port {} for service '{s}' is already in use", .{ service.port, service.name });
+                        had_fail = true;
+                    } else {
+                        diagnostics.reportCheck(.warn, "Unable to probe local UDP port {} for service '{s}': {}", .{ service.port, service.name, err });
+                    }
+                }
+            },
+        }
+    }
+
+    // Check REVERSE service targets — for each reverse service the client
+    // dials a local target on demand when the server forwards a connection.
+    // We can't predict whether the target will be up at request time, but
+    // we can confirm it resolves and (for TCP) is reachable right now so the
+    // operator notices if e.g. their Jellyfin isn't running before they ship.
+    var rev_iter = cfg.reverse_services.valueIterator();
+    while (rev_iter.next()) |service| {
+        const target_addr = common.resolveHostPort(global_io, service.address, service.port) catch |err| {
+            diagnostics.reportCheck(.warn, "Failed to resolve reverse target for service '{s}': {}", .{ service.name, err });
+            continue;
+        };
+        switch (service.transport) {
+            .tcp => {
+                const conn = target_addr.connect(global_io, .{ .mode = .stream });
+                if (conn) |stream| {
+                    var stream_mut = stream;
+                    stream_mut.close(global_io);
+                    diagnostics.reportCheck(.ok, "Reverse target {s}:{} reachable for service '{s}'", .{ service.address, service.port, service.name });
+                } else |err| {
+                    diagnostics.reportCheck(.warn, "Reverse target {s}:{} not reachable for service '{s}': {} (will be retried at request time)", .{ service.address, service.port, service.name, err });
+                }
+            },
+            .udp => {
+                // UDP has no connect-success signal at the protocol level;
+                // confirm we can at least open a sender socket toward it.
+                const ephemeral: Io.net.IpAddress = switch (target_addr) {
+                    .ip4 => .{ .ip4 = Io.net.Ip4Address.unspecified(0) },
+                    .ip6 => .{ .ip6 = Io.net.Ip6Address.unspecified(0) },
+                };
+                const probe = ephemeral.bind(global_io, .{ .mode = .dgram });
+                if (probe) |sock| {
+                    var sock_mut = sock;
+                    sock_mut.close(global_io);
+                    diagnostics.reportCheck(.ok, "Reverse UDP target {s}:{} resolves for service '{s}'", .{ service.address, service.port, service.name });
+                } else |err| {
+                    diagnostics.reportCheck(.warn, "Failed to open UDP socket toward reverse target for service '{s}': {}", .{ service.name, err });
+                }
+            },
         }
     }
 
@@ -663,6 +726,11 @@ const TunnelClient = struct {
     // (via UdpAttachment), tunnel-client lifecycle just sets/clears
     // routes here on (re)connect.
     udp_forwarders: std.AutoHashMap(tunnel.ServiceId, *udp_client.UdpForwarder),
+    /// Generation counter bumped under `connections_mutex` on every insert
+    /// or remove from `connections`.  Mirrors the server-side P-1 fix: the
+    /// recv-loop poll-rebuild path caches its `poll_fds` array and only
+    /// rebuilds when this counter changes.
+    connections_generation: std.atomic.Value(u64),
     transport: config.Transport,
 
     // Heartbeat support
@@ -699,6 +767,7 @@ const TunnelClient = struct {
             .next_stream_id = std.atomic.Value(u32).init(1),
             .running = std.atomic.Value(bool).init(true),
             .udp_forwarders = std.AutoHashMap(tunnel.ServiceId, *udp_client.UdpForwarder).init(allocator),
+            .connections_generation = std.atomic.Value(u64).init(0),
             .transport = .tcp,
             .heartbeat_timeout_ms = cfg.advanced.heartbeat_timeout_seconds * 1000,
             .last_heartbeat_time = std.atomic.Value(i64).init(common.milliTimestamp()),
@@ -785,7 +854,22 @@ const TunnelClient = struct {
         var poll_fds = std.ArrayListUnmanaged(posix.pollfd).empty;
         defer poll_fds.deinit(global_allocator);
         var poll_entries = std.ArrayListUnmanaged(PollEntry).empty;
-        defer poll_entries.deinit(global_allocator);
+        // Borrow refs in cached poll_entries are released either on rebuild
+        // or here at scope exit if we break out mid-loop.  Mirrors the
+        // server-side P-1 cleanup.
+        defer {
+            for (poll_entries.items) |entry| switch (entry) {
+                .local => |conn_ptr| conn_ptr.releaseRef(),
+                .tunnel => {},
+            };
+            poll_entries.deinit(global_allocator);
+        }
+
+        // P-1: cache the poll_fds + poll_entries arrays.  Rebuild only when
+        // `connections_generation` changes — every insert/remove bumps the
+        // counter under `connections_mutex`.
+        var last_built_generation: u64 = 0;
+        var have_built = false;
 
         while (self.running.load(.acquire) and !shutdown_flag.load(.acquire)) {
             // Check heartbeat timeout if enabled
@@ -802,52 +886,53 @@ const TunnelClient = struct {
                 }
             }
 
-            // Build poll set: tunnel fd + current local connections
-            poll_fds.clearRetainingCapacity();
-            poll_entries.clearRetainingCapacity();
-
-            poll_fds.append(global_allocator, .{
-                .fd = self.tunnel_stream.socket.handle,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            }) catch unreachable;
-            poll_entries.append(global_allocator, .{ .tunnel = {} }) catch unreachable;
-
-            self.connections_mutex.lock();
-            var iter = self.connections.iterator();
-            while (iter.next()) |entry| {
-                const conn_ptr = entry.value_ptr.*;
-                conn_ptr.acquireRef();
-                poll_entries.append(global_allocator, .{ .local = conn_ptr }) catch {
-                    conn_ptr.releaseRef();
-                    continue;
+            const current_generation = self.connections_generation.load(.acquire);
+            if (!have_built or current_generation != last_built_generation) {
+                // Release refs held by the previous build.
+                for (poll_entries.items) |entry| switch (entry) {
+                    .local => |conn_ptr| conn_ptr.releaseRef(),
+                    .tunnel => {},
                 };
+                poll_fds.clearRetainingCapacity();
+                poll_entries.clearRetainingCapacity();
+
                 poll_fds.append(global_allocator, .{
-                    .fd = conn_ptr.local_stream.socket.handle,
+                    .fd = self.tunnel_stream.socket.handle,
                     .events = posix.POLL.IN,
                     .revents = 0,
-                }) catch {
-                    _ = poll_entries.pop();
-                    conn_ptr.releaseRef();
-                    continue;
-                };
+                }) catch unreachable;
+                poll_entries.append(global_allocator, .{ .tunnel = {} }) catch unreachable;
+
+                self.connections_mutex.lock();
+                last_built_generation = self.connections_generation.load(.acquire);
+                var iter = self.connections.iterator();
+                while (iter.next()) |entry| {
+                    const conn_ptr = entry.value_ptr.*;
+                    conn_ptr.acquireRef();
+                    poll_entries.append(global_allocator, .{ .local = conn_ptr }) catch {
+                        conn_ptr.releaseRef();
+                        continue;
+                    };
+                    poll_fds.append(global_allocator, .{
+                        .fd = conn_ptr.local_stream.socket.handle,
+                        .events = posix.POLL.IN,
+                        .revents = 0,
+                    }) catch {
+                        _ = poll_entries.pop();
+                        conn_ptr.releaseRef();
+                        continue;
+                    };
+                }
+                self.connections_mutex.unlock();
+                have_built = true;
             }
-            self.connections_mutex.unlock();
 
             const ready = posix.poll(poll_fds.items, poll_timeout_ms) catch |err| {
                 std.debug.print("[CLIENT] Poll error: {}\n", .{err});
                 break;
             };
 
-            if (ready == 0) {
-                for (poll_entries.items) |entry| {
-                    switch (entry) {
-                        .local => |conn_ptr| conn_ptr.releaseRef(),
-                        .tunnel => {},
-                    }
-                }
-                continue; // Timeout, check heartbeat and loop
-            }
+            if (ready == 0) continue; // Timeout, check heartbeat and loop
 
             var fatal_error = false;
             var idx: usize = 0;
@@ -908,25 +993,18 @@ const TunnelClient = struct {
                     },
                     .local => {
                         const conn = entry.local;
+                        // Cached borrow ref — DON'T releaseRef per-iteration.
+                        // The ref stays alive until the next rebuild (which
+                        // fires when completeLocalConnection bumps the
+                        // generation) or scope exit.
                         if (fd_info.revents != 0) {
                             self.handleLocalPollEvent(conn, fd_info.revents);
                         }
-                        conn.releaseRef();
                     },
                 }
             }
 
-            if (fatal_error) {
-                var release_idx = idx + 1;
-                while (release_idx < poll_entries.items.len) : (release_idx += 1) {
-                    switch (poll_entries.items[release_idx]) {
-                        .local => |conn_ptr| conn_ptr.releaseRef(),
-                        .tunnel => {},
-                    }
-                }
-                break;
-            }
-
+            if (fatal_error) break;
             if (!self.running.load(.acquire)) break;
         }
 
@@ -959,6 +1037,9 @@ const TunnelClient = struct {
 
                 self.connections_mutex.lock();
                 const maybe_conn = self.connections.fetchRemove(err_msg.stream_id);
+                if (maybe_conn != null) {
+                    _ = self.connections_generation.fetchAdd(1, .acq_rel);
+                }
                 self.connections_mutex.unlock();
 
                 if (maybe_conn) |entry| {
@@ -993,6 +1074,9 @@ const TunnelClient = struct {
 
                 self.connections_mutex.lock();
                 const maybe_conn = self.connections.fetchRemove(close_msg.stream_id);
+                if (maybe_conn != null) {
+                    _ = self.connections_generation.fetchAdd(1, .acq_rel);
+                }
                 self.connections_mutex.unlock();
 
                 if (maybe_conn) |entry| {
@@ -1062,7 +1146,9 @@ const TunnelClient = struct {
                     };
                     var encode_buf: [128]u8 = undefined;
                     const encoded_len = error_msg.encodeInto(&encode_buf) catch return;
-                    self.channel.sendCopy(encode_buf[0..encoded_len]) catch {};
+                    self.channel.sendCopy(encode_buf[0..encoded_len]) catch |send_err| {
+                        std.debug.print("[CLIENT] Failed to send unknown-service error for stream {}: {}\n", .{ msg.stream_id, send_err });
+                    };
                     return;
                 };
 
@@ -1087,7 +1173,9 @@ const TunnelClient = struct {
                     };
                     var encode_buf: [128]u8 = undefined;
                     const encoded_len = error_msg.encodeInto(&encode_buf) catch return;
-                    self.channel.sendCopy(encode_buf[0..encoded_len]) catch {};
+                    self.channel.sendCopy(encode_buf[0..encoded_len]) catch |send_err| {
+                        std.debug.print("[CLIENT] Failed to send connect-error for stream {}: {}\n", .{ msg.stream_id, send_err });
+                    };
                     return;
                 };
                 errdefer local_stream.close(global_io);
@@ -1111,6 +1199,7 @@ const TunnelClient = struct {
                     conn.releaseRef(); // drop create ref → destroys
                     return;
                 };
+                _ = self.connections_generation.fetchAdd(1, .acq_rel);
                 self.connections_mutex.unlock();
 
                 // Send CONNECT_ACK to server
@@ -1120,7 +1209,12 @@ const TunnelClient = struct {
                 };
                 var ack_buf: [64]u8 = undefined;
                 const ack_len = ack_msg.encodeInto(&ack_buf) catch return;
-                self.channel.sendCopy(ack_buf[0..ack_len]) catch {};
+                self.channel.sendCopy(ack_buf[0..ack_len]) catch |send_err| {
+                    // Server is waiting for this ACK to mark the stream live;
+                    // swallowing it silently let server-side timeouts be the
+                    // only signal something went wrong.
+                    std.debug.print("[CLIENT] Failed to send REVERSE CONNECT_ACK for stream {}: {}\n", .{ msg.stream_id, send_err });
+                };
             },
         }
     }
@@ -1158,6 +1252,7 @@ const TunnelClient = struct {
             conn.releaseRef(); // drop create ref → destroys
             return err;
         };
+        _ = self.connections_generation.fetchAdd(1, .acq_rel);
         self.connections_mutex.unlock();
 
         // Send CONNECT_ACK back to server
@@ -1199,6 +1294,7 @@ const TunnelClient = struct {
             conn.releaseRef(); // drop create ref → destroys
             return err;
         };
+        _ = self.connections_generation.fetchAdd(1, .acq_rel);
         self.connections_mutex.unlock();
 
         // Send encrypted CONNECT message (no allocation - use stack buffer)
@@ -1297,6 +1393,9 @@ const TunnelClient = struct {
 
         self.connections_mutex.lock();
         const removed = self.connections.fetchRemove(conn.stream_id);
+        if (removed != null) {
+            _ = self.connections_generation.fetchAdd(1, .acq_rel);
+        }
         self.connections_mutex.unlock();
         if (removed) |_| {
             conn.releaseRef(); // drop map-held reference
@@ -1309,7 +1408,11 @@ const TunnelClient = struct {
         var encode_buf: [16]u8 = undefined;
         const close_msg = tunnel.CloseMsg{ .service_id = service_id, .stream_id = stream_id };
         const encoded_len = close_msg.encodeInto(&encode_buf) catch return;
-        self.channel.sendCopy(encode_buf[0..encoded_len]) catch {};
+        // Best-effort close notification — server will detect via heartbeat
+        // timeout if this fails, but log so we know.
+        self.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
+            std.debug.print("[CLIENT] Failed to send CLOSE for stream {}: {}\n", .{ stream_id, err });
+        };
     }
 
     fn handleSendFailure(self: *TunnelClient, err: anyerror) void {
@@ -1991,15 +2094,28 @@ pub fn main(init: std.process.Init) !void {
 
                     // Register attachment so the tunnel-0 reconnection thread
                     // re-binds it on every reconnect (audit fix A-1).
+                    // Failing to append breaks UDP after the first reconnect;
+                    // surface the error rather than silently producing a
+                    // forwarder that survives until the next reconnect kills it.
                     tunnel_clients_mutex.lockUncancelable(global_io);
-                    udp_attachments.append(allocator, att) catch {};
+                    udp_attachments.append(allocator, att) catch |err| {
+                        tunnel_clients_mutex.unlock(global_io);
+                        std.debug.print("[UDP-SERVICE] Failed to register attachment for '{s}': {}\n", .{ service.name, err });
+                        return err;
+                    };
                     tunnel_clients_mutex.unlock(global_io);
 
                     // Inbound dispatch on the current tunnel client (B-1:
                     // multiple UDP services route by service_id).
                     try first_client.udp_forwarders.put(service.id, forwarder);
-                    // Tracked separately for periodic session eviction.
-                    multi_service_udp_forwarders.append(allocator, forwarder) catch {};
+                    // Tracked separately for periodic session eviction.  If
+                    // this append fails, this forwarder won't get its idle
+                    // sessions evicted — log loudly rather than leaking memory
+                    // silently under load.
+                    multi_service_udp_forwarders.append(allocator, forwarder) catch |err| {
+                        std.debug.print("[UDP-SERVICE] Failed to register forwarder for eviction for '{s}': {}\n", .{ service.name, err });
+                        return err;
+                    };
 
                     // Send initial CONNECT message for UDP service
                     const stream_id = first_client.next_stream_id.fetchAdd(1, .acq_rel);
@@ -2033,7 +2149,9 @@ pub fn main(init: std.process.Init) !void {
             if (udp_evict_counter >= 4) { // ~1s
                 udp_evict_counter = 0;
                 for (multi_service_udp_forwarders.items) |fwd| {
-                    fwd.cleanupExpiredSessions() catch {};
+                    fwd.cleanupExpiredSessions() catch |err| {
+                        std.debug.print("[UDP-EVICT] cleanup failed: {}\n", .{err});
+                    };
                 }
             }
         }

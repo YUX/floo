@@ -5,6 +5,12 @@ const tunnel = @import("tunnel.zig");
 const noise = @import("noise.zig");
 const common = @import("common.zig");
 
+/// Per-syscall recv timeout on each session's UDP socket.  Picked so that
+/// `sessionRecvThread` re-checks shutdown flags ~once per second; chosen
+/// independently of the forwarder's idle timeout (which can be much longer)
+/// because it controls liveness, not eviction.
+const RECV_TIMEOUT_SECONDS: u32 = 1;
+
 /// Server-side UDP forwarder.
 ///
 /// Each tunnel stream gets an independent ephemeral UDP socket so replies
@@ -149,6 +155,15 @@ pub const UdpForwarder = struct {
         };
         const sock = try ephemeral.bind(self.io, .{ .mode = .dgram });
 
+        // Apply a short recv timeout so sessionRecvThread wakes periodically
+        // and re-checks `running`. Without this, a target server that never
+        // replies pins this thread + socket + session struct for the lifetime
+        // of the process — the only existing exit path is shutdown(SHUT.RD)
+        // from removeSession, which won't fire until something else triggers
+        // session teardown. SO_RCVTIMEO on a blocking dgram socket returns
+        // EAGAIN/EWOULDBLOCK on expiry, which we treat as non-fatal below.
+        common.applySocketTimeout(sock.handle, RECV_TIMEOUT_SECONDS);
+
         const session = self.allocator.create(Session) catch |err| {
             sock.close(self.io);
             return err;
@@ -211,8 +226,11 @@ pub const UdpForwarder = struct {
         const forwarder = session.forwarder;
 
         while (session.running.load(.acquire) and forwarder.running.load(.acquire)) {
-            const msg = session.socket.receive(forwarder.io, &buf) catch {
-                if (!session.running.load(.acquire)) break;
+            const msg = session.socket.receive(forwarder.io, &buf) catch |err| {
+                // EAGAIN/EWOULDBLOCK from SO_RCVTIMEO is the periodic wakeup
+                // we asked for — re-check shutdown flags and continue.  Any
+                // other error is treated as fatal (the original behaviour).
+                if (err == error.WouldBlock or err == error.Timeout) continue;
                 break;
             };
             if (msg.data.len == 0) continue;

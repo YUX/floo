@@ -211,7 +211,8 @@ write_floo_configs() {
     local psk_value="${PSK}"
     if [[ "${floo_mode}" == "plaintext" ]]; then
         cipher_value="none"
-        psk_value=""
+        # cipher=none still requires a PSK post-S-1 (mutual-auth proof-of-knowledge
+        # runs in plaintext mode too).  Reuse the same PSK as the encrypted runs.
     fi
 
     # New config format for server
@@ -260,7 +261,8 @@ write_floo_reverse_configs() {
     local psk_value="${PSK}"
     if [[ "${floo_mode}" == "plaintext" ]]; then
         cipher_value="none"
-        psk_value=""
+        # cipher=none still requires a PSK post-S-1 (mutual-auth proof-of-knowledge
+        # runs in plaintext mode too).  Reuse the same PSK as the encrypted runs.
     fi
 
     # Server config for reverse mode

@@ -141,8 +141,32 @@ pub const Channel = struct {
             );
 
             control_buffer = try params.allocator.alloc(u8, common.CONTROL_MSG_BUFFER_SIZE + noise.TAG_LEN);
-        } else if (params.handshake_metrics) |metrics| {
-            metrics.elapsed_ns = 0;
+        } else {
+            // S-1: cipher="none" path.  Encryption is off, but mutual PSK
+            // authentication is NOT.  Without this, anyone reachable at the
+            // server's port could speak the protocol and per-service tokens
+            // would leak in cleartext.  We run a small nonce-exchange + HMAC
+            // proof-of-PSK so the connection drops cleanly when either side
+            // doesn't know the PSK.
+            //
+            // Frame integrity / confidentiality remain absent — that's the
+            // *documented* meaning of cipher=none.  This change only fixes
+            // the silent-auth-bypass aspect of the prior behaviour.
+            var handshake_timer_start: i128 = 0;
+            if (params.handshake_metrics) |_| {
+                handshake_timer_start = common.nanoTimestamp();
+            }
+            try noise.plaintextPskHandshake(
+                params.io,
+                params.reader,
+                params.writer,
+                params.role == .client,
+                params.psk,
+            );
+            if (params.handshake_metrics) |metrics| {
+                const stop = common.nanoTimestamp();
+                metrics.elapsed_ns = stop - handshake_timer_start;
+            }
         }
 
         return Channel{

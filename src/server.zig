@@ -478,6 +478,8 @@ const ReverseListener = struct {
                 stream.releaseRef(); // drop create ref → destroys
                 continue;
             };
+            // Bump generation so the recv-loop poll-rebuild caches invalidate.
+            _ = self.tunnel_conn.streams_generation.fetchAdd(1, .acq_rel);
 
             std.debug.print("[REVERSE] Stream {} registered and ready\n", .{stream_id});
         }
@@ -690,6 +692,13 @@ const TunnelConnection = struct {
     /// rationale. Held briefly per recv-DATA, send-DATA, CONNECT, CLOSE
     /// — every cycle of the data path.
     streams_mutex: common.HotMutex,
+    /// Generation counter bumped under `streams_mutex` on every insert
+    /// or remove from `streams`.  The recv-loop poll-rebuild path
+    /// caches its `poll_fds` array and only rebuilds when this counter
+    /// changes — see audit P-1 for the rationale.  `.acq_rel` so the
+    /// reader (poll loop, no lock) sees the structural state of `streams`
+    /// that produced the new value.
+    streams_generation: std.atomic.Value(u64),
     channel: transport.Channel,
     running: std.atomic.Value(bool),
 
@@ -726,6 +735,7 @@ const TunnelConnection = struct {
             .tunnel_writer = undefined,
             .streams = std.HashMap(StreamKey, *Stream, StreamKeyContext, 80).init(allocator),
             .streams_mutex = .{},
+            .streams_generation = std.atomic.Value(u64).init(0),
             .channel = undefined,
             .running = std.atomic.Value(bool).init(true),
             .udp_forwarder = null,
@@ -822,51 +832,74 @@ const TunnelConnection = struct {
         var poll_fds = std.ArrayListUnmanaged(posix.pollfd).empty;
         defer poll_fds.deinit(global_allocator);
         var poll_entries = std.ArrayListUnmanaged(PollEntry).empty;
-        defer poll_entries.deinit(global_allocator);
+        // Borrow refs held by the cached poll_entries are released either on
+        // rebuild (below) or here at scope exit if we break out mid-loop.
+        defer {
+            for (poll_entries.items) |entry| switch (entry) {
+                .stream => |stream_ptr| stream_ptr.releaseRef(),
+                .tunnel => {},
+            };
+            poll_entries.deinit(global_allocator);
+        }
         const poll_timeout_ms: i32 = 1000;
 
+        // P-1: cache the poll_fds + poll_entries arrays.  The pre-fix code
+        // rebuilt both on every poll cycle (O(streams) under streams_mutex
+        // every wakeup) even though streams change rarely (per CONNECT/CLOSE).
+        // Now we rebuild only when `streams_generation` changes — every
+        // insert/remove bumps the counter under the same lock.  Borrow refs
+        // taken during a build are kept until the next build (or scope exit).
+        var last_built_generation: u64 = 0;
+        var have_built = false;
+
         while (self.running.load(.acquire) and !shutdown_flag.load(.acquire)) {
-            poll_fds.clearRetainingCapacity();
-            poll_entries.clearRetainingCapacity();
-
-            poll_fds.append(global_allocator, .{
-                .fd = self.tunnel_stream.socket.handle,
-                .events = posix.POLL.IN,
-                .revents = 0,
-            }) catch unreachable;
-            poll_entries.append(global_allocator, .{ .tunnel = {} }) catch unreachable;
-
-            self.streams_mutex.lock();
-            var iter = self.streams.iterator();
-            while (iter.next()) |entry| {
-                const stream_ptr = entry.value_ptr.*;
-                stream_ptr.acquireRef();
-                poll_entries.append(global_allocator, .{ .stream = stream_ptr }) catch {
-                    stream_ptr.releaseRef();
-                    continue;
+            const current_generation = self.streams_generation.load(.acquire);
+            if (!have_built or current_generation != last_built_generation) {
+                // Release refs held by the previous build.
+                for (poll_entries.items) |entry| switch (entry) {
+                    .stream => |stream_ptr| stream_ptr.releaseRef(),
+                    .tunnel => {},
                 };
+                poll_fds.clearRetainingCapacity();
+                poll_entries.clearRetainingCapacity();
+
                 poll_fds.append(global_allocator, .{
-                    .fd = stream_ptr.target_stream.socket.handle,
+                    .fd = self.tunnel_stream.socket.handle,
                     .events = posix.POLL.IN,
                     .revents = 0,
                 }) catch unreachable;
+                poll_entries.append(global_allocator, .{ .tunnel = {} }) catch unreachable;
+
+                self.streams_mutex.lock();
+                // If a writer raced ahead of our generation read above, capture
+                // the value we actually built against so we don't spuriously
+                // rebuild next cycle.  Read it inside the lock so we and the
+                // writer agree about which insertions/removals are reflected.
+                last_built_generation = self.streams_generation.load(.acquire);
+                var iter = self.streams.iterator();
+                while (iter.next()) |entry| {
+                    const stream_ptr = entry.value_ptr.*;
+                    stream_ptr.acquireRef();
+                    poll_entries.append(global_allocator, .{ .stream = stream_ptr }) catch {
+                        stream_ptr.releaseRef();
+                        continue;
+                    };
+                    poll_fds.append(global_allocator, .{
+                        .fd = stream_ptr.target_stream.socket.handle,
+                        .events = posix.POLL.IN,
+                        .revents = 0,
+                    }) catch unreachable;
+                }
+                self.streams_mutex.unlock();
+                have_built = true;
             }
-            self.streams_mutex.unlock();
 
             const ready = posix.poll(poll_fds.items, poll_timeout_ms) catch |err| {
                 std.debug.print("[TUNNEL] Poll error: {}\n", .{err});
                 break;
             };
 
-            if (ready == 0) {
-                for (poll_entries.items) |entry| {
-                    switch (entry) {
-                        .stream => |stream_ptr| stream_ptr.releaseRef(),
-                        .tunnel => {},
-                    }
-                }
-                continue;
-            }
+            if (ready == 0) continue;
 
             var fatal_error = false;
             var idx: usize = 0;
@@ -916,24 +949,19 @@ const TunnelConnection = struct {
                         }
                     },
                     .stream => {
+                        // Stream entries hold a cached borrow ref — DON'T
+                        // releaseRef per-iteration.  The ref stays alive
+                        // until the next rebuild (which fires when
+                        // handleStreamPollEvent → completeStream bumps the
+                        // generation) or scope exit.
                         if (fd_info.revents != 0) {
                             self.handleStreamPollEvent(entry.stream, fd_info.revents);
                         }
-                        entry.stream.releaseRef();
                     },
                 }
             }
 
-            if (fatal_error) {
-                var release_idx = idx + 1;
-                while (release_idx < poll_entries.items.len) : (release_idx += 1) {
-                    switch (poll_entries.items[release_idx]) {
-                        .stream => |stream_ptr| stream_ptr.releaseRef(),
-                        .tunnel => {},
-                    }
-                }
-                break;
-            }
+            if (fatal_error) break;
         }
 
         std.debug.print("[TUNNEL] Connection handler stopping\n", .{});
@@ -1023,6 +1051,9 @@ const TunnelConnection = struct {
                 const key = StreamKey{ .service_id = close_msg.service_id, .stream_id = close_msg.stream_id };
                 self.streams_mutex.lock();
                 const maybe_stream = self.streams.fetchRemove(key);
+                if (maybe_stream != null) {
+                    _ = self.streams_generation.fetchAdd(1, .acq_rel);
+                }
                 self.streams_mutex.unlock();
 
                 if (maybe_stream) |entry| {
@@ -1058,6 +1089,9 @@ const TunnelConnection = struct {
                 const key = StreamKey{ .service_id = err_msg.service_id, .stream_id = err_msg.stream_id };
                 self.streams_mutex.lock();
                 const maybe_stream = self.streams.fetchRemove(key);
+                if (maybe_stream != null) {
+                    _ = self.streams_generation.fetchAdd(1, .acq_rel);
+                }
                 self.streams_mutex.unlock();
 
                 if (maybe_stream) |entry| {
@@ -1169,6 +1203,9 @@ const TunnelConnection = struct {
         self.streams_mutex.lock();
         const key = StreamKey{ .service_id = stream.service_id, .stream_id = stream.stream_id };
         const removed = self.streams.fetchRemove(key);
+        if (removed != null) {
+            _ = self.streams_generation.fetchAdd(1, .acq_rel);
+        }
         self.streams_mutex.unlock();
         if (removed) |_| {
             stream.releaseRef();
@@ -1228,6 +1265,7 @@ const TunnelConnection = struct {
                     stream.releaseRef(); // drop create ref → destroys
                     return err;
                 };
+                _ = self.streams_generation.fetchAdd(1, .acq_rel);
             },
             .udp => {
                 if (self.udp_forwarder == null) {
@@ -1778,6 +1816,7 @@ fn reverseServiceListener(ctx_ptr: *anyopaque) void {
             stream.releaseRef(); // drop create ref → destroys
             continue;
         };
+        _ = ctx.tunnel_conn.streams_generation.fetchAdd(1, .acq_rel);
         ctx.tunnel_conn.streams_mutex.unlock();
 
         std.debug.print("[REVERSE-SERVICE] Stream {} created for reverse connection\n", .{stream_id});
