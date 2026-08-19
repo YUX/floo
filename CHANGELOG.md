@@ -146,6 +146,29 @@ See [MIGRATION_NOTES.md](MIGRATION_NOTES.md) for the 0.2 → 0.3 cut. Both sides
   1M dropped ~15% (fatter HOL write); 1-tunnel P≥4 still kills the
   iperf3 control socket.
 
+- **Default `io_batch_bytes` 128K → 512K** (still under the 1 MiB frame
+  cap after the 9-byte DATA header + 16-byte AEAD tag). Side-read and
+  per-stream send buffers follow the setting; the decoder grew to
+  `12 + MAX_FRAME_SIZE + 64K` so a max-size encrypted frame plus the
+  next read fits. Inbound `writeAllToHandle` leftover + side POLL.OUT
+  was tried and reverted: 1-tunnel P≥4 still dies on the iperf3
+  control socket.
+
+  Focused A/B vs `bench/baseline.json` and coalesce HEAD
+  (`/tmp/floo-bench-0.3-inbound`, Darwin arm64, ReleaseFast, 5 s × 2):
+
+  | Cell (forward)            | baseline | coalesce | 512K | vs coal |
+  |---------------------------|---------:|---------:|-----:|--------:|
+  | aegis128l 128K P=1 t=10   |    10.51 |    10.51 | **11.86** | **+12.8 %** |
+  | aes128gcm 128K P=1 t=10   |    10.21 |    11.59 | 11.60 | +0.1 % |
+  | aes128gcm 1M P=1 t=10     |    10.51 |    11.46 | 11.68 | +1.9 % |
+  | none 128K P=1 t=10        |     9.97 |     9.49 |  9.86 | +3.9 % |
+  | chacha20 128K P=1 t=10    |     2.83 |     2.99 |  2.93 | −2.0 % |
+
+  AEGIS was paying per-frame poll/`writev` overhead that 512K frames
+  amortize. `none` P=1 is still ~10 Gbps vs raw ~40: copy-sized
+  `writev` dominates, so fatter frames do not raise that ceiling.
+
 ### Changed (perf hygiene + correctness, post-0.2.0 audit)
 Cooldown-controlled A/B vs the 0.2.0 baseline (M1, 4 streams ×
 8 tunnels, 5 s iperf3 trials, alternating order):

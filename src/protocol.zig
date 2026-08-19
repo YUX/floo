@@ -3,6 +3,10 @@ const std = @import("std");
 /// Maximum ciphertext/plaintext size after the frame prefix.
 pub const MAX_FRAME_SIZE: u32 = 1 * 1024 * 1024;
 
+/// Largest DATA payload (app bytes) that still fits in one frame after the
+/// 9-byte stream header and 16-byte AEAD tag. `io_batch_bytes` is clamped to this.
+pub const MAX_DATA_PAYLOAD: usize = MAX_FRAME_SIZE - 9 - 16;
+
 pub const LENGTH_SIZE: usize = 4;
 pub const SEQ_SIZE: usize = 8;
 pub const AAD_SIZE: usize = LENGTH_SIZE + SEQ_SIZE;
@@ -90,7 +94,8 @@ pub const FrameDecoder = struct {
     read_pos: usize,
     write_pos: usize,
 
-    const BUFFER_SIZE = 1024 * 1024;
+    /// Room for one max encrypted frame plus the next read / a partial prefix.
+    const BUFFER_SIZE = ENCRYPTED_PREFIX_SIZE + MAX_FRAME_SIZE + 64 * 1024;
 
     pub fn init(allocator: std.mem.Allocator) error{OutOfMemory}!FrameDecoder {
         const buffer = try allocator.alloc(u8, BUFFER_SIZE);

@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const tunnel = @import("../tunnel.zig");
 const noise = @import("../noise.zig");
+const protocol = @import("../protocol.zig");
 const transport = @import("../transport/channel.zig");
 
 /// Shared DATA-header + queueDataInPlace path for both roles.
@@ -19,7 +20,9 @@ pub fn forwardSideData(
     const header_len = tunnel.DATA_HEADER_SIZE;
     if (frame_buffer.len <= header_len + noise.TAG_LEN) return error.BufferTooSmall;
 
-    const max_read = @min(io_batch, frame_buffer.len - header_len - noise.TAG_LEN);
+    const room = frame_buffer.len - header_len - noise.TAG_LEN;
+    const max_payload = @min(protocol.MAX_DATA_PAYLOAD, room);
+    const max_read = @min(io_batch, max_payload);
     const recv_slice = frame_buffer[header_len..][0..max_read];
     const n = posix.read(fd, recv_slice) catch |err| switch (err) {
         error.WouldBlock => return 0,

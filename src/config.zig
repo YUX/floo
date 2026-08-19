@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const tunnel = @import("tunnel.zig");
 const common = @import("common.zig");
+const protocol = @import("protocol.zig");
 
 // Simple defaults that users can understand
 pub const DEFAULT_PSK = "change-me-psk";
@@ -41,7 +42,7 @@ pub const AdvancedSettings = struct {
     // Network tuning
     socket_buffer_size: u32 = 4 * 1024 * 1024, // 4MB default
     udp_timeout_seconds: u64 = 60,
-    io_batch_bytes: usize = 128 * 1024, // size of per-stream IO buffers
+    io_batch_bytes: usize = 512 * 1024, // side→tunnel read / DATA frame size
     pin_threads: bool = true, // pin tunnel threads to CPU cores when available
 
     // TCP tuning
@@ -170,10 +171,7 @@ pub const ServerConfig = struct {
             std.debug.print("[CONFIG] Warning: no services or reverse_services configured\n", .{});
         }
 
-        if (self.advanced.io_batch_bytes < 4096) {
-            std.debug.print("[CONFIG] Error: io_batch_bytes must be at least 4096\n", .{});
-            return error.InvalidBatchSize;
-        }
+        try validateIoBatch(self.advanced.io_batch_bytes);
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, io: Io, path: []const u8) !ServerConfig {
@@ -454,10 +452,7 @@ pub const ClientConfig = struct {
 
         try validateHeartbeat(&self.advanced);
 
-        if (self.advanced.io_batch_bytes < 4096) {
-            std.debug.print("[CONFIG] Error: io_batch_bytes must be at least 4096\n", .{});
-            return error.InvalidBatchSize;
-        }
+        try validateIoBatch(self.advanced.io_batch_bytes);
     }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, io: Io, path: []const u8) !ClientConfig {
@@ -955,6 +950,20 @@ fn isLowEntropyCredential(value: []const u8) bool {
     if (value.len < 16) return false; // Already caught by the length gate
     const distinct = distinctByteCount(value);
     return distinct < 8;
+}
+
+fn validateIoBatch(io_batch: usize) !void {
+    if (io_batch < 4096) {
+        std.debug.print("[CONFIG] Error: io_batch_bytes must be at least 4096\n", .{});
+        return error.InvalidBatchSize;
+    }
+    if (io_batch > protocol.MAX_DATA_PAYLOAD) {
+        std.debug.print("[CONFIG] Error: io_batch_bytes cannot exceed {} (max DATA payload in a {}-byte frame)\n", .{
+            protocol.MAX_DATA_PAYLOAD,
+            protocol.MAX_FRAME_SIZE,
+        });
+        return error.InvalidBatchSize;
+    }
 }
 
 fn validateHeartbeat(advanced: *const AdvancedSettings) !void {
