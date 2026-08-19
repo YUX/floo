@@ -1014,6 +1014,11 @@ const TunnelClient = struct {
     }
 
     fn handleLocalPollEvent(self: *TunnelClient, conn: *LocalConnection, revents: i16) void {
+        // Peer CLOSE is handled on the tunnel fd first in the same poll
+        // wakeup and already called stop(). Reading the closed fd returns
+        // EBADF → handleSendFailure → every multiplexed stream dies.
+        if (conn.fd_closed.load(.acquire)) return;
+
         var closed = false;
         if ((revents & posix.POLL.IN) != 0) {
             self.forwardLocalData(conn) catch |err| switch (err) {
@@ -1043,7 +1048,7 @@ const TunnelClient = struct {
             &self.channel,
             self.cfg.advanced.io_batch_bytes,
         ) catch |err| switch (err) {
-            error.ConnectionClosed => {
+            error.StreamClosed => {
                 self.sendCloseFrame(conn.service_id, conn.stream_id);
                 return error.ConnectionClosed;
             },

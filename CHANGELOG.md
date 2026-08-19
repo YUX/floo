@@ -61,6 +61,14 @@ See [MIGRATION_NOTES.md](MIGRATION_NOTES.md) for the 0.2 → 0.3 cut. Both sides
 
 ### Fixed
 
+- **Side-socket RST / already-closed fd no longer tear down the tunnel.**
+  `posix.read` `ECONNRESET`/`ENOTCONN` on a forwarded stream is now
+  `error.StreamClosed` (same as EOF) so only that stream is closed.
+  A peer `CLOSE` processed earlier in the same poll wakeup already
+  `stop()`s the fd; the leftover side `POLL.IN` is ignored instead of
+  reading a closed fd (`EBADF` → `handleSendFailure`). That was the
+  1-tunnel iperf3 P≥4 control-socket death: one data stream finishing
+  reset every multiplexed stream, including the control socket.
 - **UDP server `sessionRecvThread` socket recv timeout.** S-2. A target
   server that never replied previously pinned the thread + its UDP socket
   + its `Session` struct for the lifetime of the process — the only exit
@@ -143,16 +151,17 @@ See [MIGRATION_NOTES.md](MIGRATION_NOTES.md) for the 0.2 → 0.3 cut. Both sides
 
   `none` P=1 is unchanged (~10 Gbps vs raw 128K P=1 ~36 Gbps): the
   remaining wall is still a blocking `writev` per poll wakeup. AES P=4
-  1M dropped ~15% (fatter HOL write); 1-tunnel P≥4 still kills the
-  iperf3 control socket.
+  1M dropped ~15% (fatter HOL write). 1-tunnel P≥4 used to kill the
+  iperf3 control socket (side RST / closed-fd `EBADF` mapped to
+  `handleSendFailure`); that is fixed above.
 
 - **Default `io_batch_bytes` 128K → 512K** (still under the 1 MiB frame
   cap after the 9-byte DATA header + 16-byte AEAD tag). Side-read and
   per-stream send buffers follow the setting; the decoder grew to
   `12 + MAX_FRAME_SIZE + 64K` so a max-size encrypted frame plus the
   next read fits. Inbound `writeAllToHandle` leftover + side POLL.OUT
-  was tried and reverted: 1-tunnel P≥4 still dies on the iperf3
-  control socket.
+  was tried and reverted. The P≥4 control-socket death was the
+  side-close mapping above, not leftover/POLL.OUT.
 
   Focused A/B vs `bench/baseline.json` and coalesce HEAD
   (`/tmp/floo-bench-0.3-inbound`, Darwin arm64, ReleaseFast, 5 s × 2):

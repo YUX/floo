@@ -8,7 +8,8 @@ const transport = @import("../transport/channel.zig");
 /// Shared DATA-header + queueDataInPlace path for both roles.
 /// One side-read per poll wakeup; the poll loop flushes queued frames
 /// in one writev after the side-event sweep.
-/// Returns bytes read. `error.ConnectionClosed` on EOF.
+/// Returns bytes read. `error.StreamClosed` on side-socket EOF/RST — not
+/// `error.ConnectionClosed`, which `queueDataInPlace` uses for a dead tunnel.
 pub fn forwardSideData(
     fd: posix.fd_t,
     service_id: tunnel.ServiceId,
@@ -26,9 +27,12 @@ pub fn forwardSideData(
     const recv_slice = frame_buffer[header_len..][0..max_read];
     const n = posix.read(fd, recv_slice) catch |err| switch (err) {
         error.WouldBlock => return 0,
+        // Per-stream close. Must not become handleSendFailure — that
+        // tears down every multiplexed stream (iperf3 control included).
+        error.ConnectionResetByPeer, error.SocketUnconnected => return error.StreamClosed,
         else => return err,
     };
-    if (n == 0) return error.ConnectionClosed;
+    if (n == 0) return error.StreamClosed;
 
     tunnel.writeStreamHeader(frame_buffer, .data, service_id, stream_id);
     const payload_len = header_len + n;
