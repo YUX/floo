@@ -57,7 +57,8 @@ pub const ChannelInit = struct {
 /// Bidirectional encrypted transport over a TCP Stream.
 ///
 /// Encrypt is lock-free: send seq is a `fetchAdd`, then AEAD runs without
-/// the write mutex. `writev` stays under `send_mutex` so bytes stay ordered.
+/// the write mutex. Prepared frames queue under `send_mutex` and flush in
+/// one `writev` so several ready streams share a syscall. Bytes stay ordered.
 pub const Channel = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -68,6 +69,12 @@ pub const Channel = struct {
     send_cipher: ?noise.TransportCipher,
     recv_cipher: ?noise.TransportCipher,
     send_mutex: common.HotMutex,
+    /// Already-encrypted frames waiting for one coalesced `writev`.
+    /// Payloads must stay valid until `flushSendBatch`.
+    pending_payloads: [common.MAX_WRITEV_FRAMES][]const u8 = undefined,
+    pending_seqs: [common.MAX_WRITEV_FRAMES]?u64 = undefined,
+    pending_tx: [common.MAX_WRITEV_FRAMES]usize = undefined,
+    pending_count: u8 = 0,
     stats: ?EncryptionStats,
     throughput: ?ThroughputStats,
 
@@ -160,14 +167,13 @@ pub const Channel = struct {
     }
 
     /// Send an immutable payload. Encrypt is lock-free; writev is serialized.
+    /// Flushes any queued DATA first so control frames stay in order.
     pub fn sendCopy(self: *Channel, payload: []const u8) !void {
-        const fd = self.stream.socket.handle;
-
         if (!self.encryption_enabled) {
             self.send_mutex.lock();
             defer self.send_mutex.unlock();
-            try common.writeFrameDirect(fd, payload, null);
-            self.recordTx(payload.len);
+            try self.enqueueLocked(payload, null, payload.len);
+            try self.flushLocked();
             return;
         }
 
@@ -187,17 +193,60 @@ pub const Channel = struct {
         const seq, const encrypted_slice = try self.encryptInPlace(target_buf, payload.len);
         self.send_mutex.lock();
         defer self.send_mutex.unlock();
-        try common.writeFrameDirect(fd, encrypted_slice, seq);
-        self.recordTx(payload.len);
+        try self.enqueueLocked(encrypted_slice, seq, payload.len);
+        try self.flushLocked();
     }
 
-    /// Encrypt (lock-free) then write under the mutex.
+    /// Encrypt (lock-free), queue, then flush. Used by UDP and one-shot sends.
     pub fn sendDataInPlace(self: *Channel, buffer: []u8, payload_len: usize) !void {
+        try self.queueDataInPlace(buffer, payload_len);
+        try self.flushSendBatch();
+    }
+
+    /// Encrypt (lock-free) then append under `send_mutex` without writev.
+    /// Caller must `flushSendBatch` before mutating `buffer`.
+    pub fn queueDataInPlace(self: *Channel, buffer: []u8, payload_len: usize) !void {
         const slice, const seq = try self.prepareSendSlice(buffer, payload_len);
         self.send_mutex.lock();
         defer self.send_mutex.unlock();
-        try common.writeFrameDirect(self.stream.socket.handle, slice, seq);
-        self.recordTx(payload_len);
+        try self.enqueueLocked(slice, seq, payload_len);
+    }
+
+    /// Write every queued frame in one `writev` (or a short-write resume).
+    pub fn flushSendBatch(self: *Channel) !void {
+        self.send_mutex.lock();
+        defer self.send_mutex.unlock();
+        try self.flushLocked();
+    }
+
+    fn enqueueLocked(self: *Channel, payload: []const u8, seq: ?u64, tx_len: usize) !void {
+        if (self.pending_count == common.MAX_WRITEV_FRAMES) {
+            try self.flushLocked();
+        }
+        const i = self.pending_count;
+        self.pending_payloads[i] = payload;
+        self.pending_seqs[i] = seq;
+        self.pending_tx[i] = tx_len;
+        self.pending_count = i + 1;
+    }
+
+    fn flushLocked(self: *Channel) !void {
+        const n = self.pending_count;
+        if (n == 0) return;
+
+        var frames: [common.MAX_WRITEV_FRAMES]common.OutgoingFrame = undefined;
+        var txs: [common.MAX_WRITEV_FRAMES]usize = undefined;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            frames[i] = .{ .payload = self.pending_payloads[i], .seq = self.pending_seqs[i] };
+            txs[i] = self.pending_tx[i];
+        }
+        self.pending_count = 0;
+        try common.writeFramesDirect(self.stream.socket.handle, frames[0..n]);
+        i = 0;
+        while (i < n) : (i += 1) {
+            self.recordTx(txs[i]);
+        }
     }
 
     /// Decrypt a decoded wire frame in place. Plaintext path records Rx.

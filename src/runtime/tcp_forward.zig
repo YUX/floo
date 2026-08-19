@@ -4,7 +4,9 @@ const tunnel = @import("../tunnel.zig");
 const noise = @import("../noise.zig");
 const transport = @import("../transport/channel.zig");
 
-/// Shared DATA-header + sendDataInPlace path for both roles.
+/// Shared DATA-header + queueDataInPlace path for both roles.
+/// One side-read per poll wakeup; the poll loop flushes queued frames
+/// in one writev after the side-event sweep.
 /// Returns bytes read. `error.ConnectionClosed` on EOF.
 pub fn forwardSideData(
     fd: posix.fd_t,
@@ -28,9 +30,9 @@ pub fn forwardSideData(
     tunnel.writeStreamHeader(frame_buffer, .data, service_id, stream_id);
     const payload_len = header_len + n;
     if (channel.isEncrypted()) {
-        try channel.sendDataInPlace(frame_buffer[0 .. payload_len + noise.TAG_LEN], payload_len);
+        try channel.queueDataInPlace(frame_buffer[0 .. payload_len + noise.TAG_LEN], payload_len);
     } else {
-        try channel.sendDataInPlace(frame_buffer[0..payload_len], payload_len);
+        try channel.queueDataInPlace(frame_buffer[0..payload_len], payload_len);
     }
     return n;
 }

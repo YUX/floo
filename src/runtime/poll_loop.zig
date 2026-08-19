@@ -11,6 +11,9 @@ pub fn PollCallbacks(comptime StreamT: type) type {
         release: *const fn (*StreamT) void,
         onFrame: *const fn (*anyopaque, protocol.WireFrame) anyerror!void,
         onSide: *const fn (*anyopaque, *StreamT, i16) void,
+        /// Flush queued tunnel writes after the side-event sweep so several
+        /// streams can share one writev. Optional: no-op if null.
+        onFlushSend: ?*const fn (*anyopaque) anyerror!void = null,
         shouldStop: ?*const fn (*anyopaque) bool = null,
     };
 }
@@ -158,6 +161,13 @@ pub fn run(
                     }
                 },
             }
+        }
+
+        if (cbs.onFlushSend) |flush| {
+            flush(cbs.ctx) catch |err| {
+                std.debug.print("[{s}] Send flush error: {}\n", .{ label, err });
+                fatal_error = true;
+            };
         }
 
         if (fatal_error) {

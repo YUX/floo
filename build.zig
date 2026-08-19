@@ -165,6 +165,16 @@ pub fn build(b: *std.Build) void {
     });
     tunnel_tests.root_module.addOptions("build_options", build_options);
 
+    const stream_table_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/stream_table_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    stream_table_tests.root_module.addOptions("build_options", build_options);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(protocol_tests).step);
     test_step.dependOn(&b.addRunArtifact(config_tests).step);
@@ -173,6 +183,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(udp_session_tests).step);
     test_step.dependOn(&b.addRunArtifact(common_tests).step);
     test_step.dependOn(&b.addRunArtifact(tunnel_tests).step);
+    test_step.dependOn(&b.addRunArtifact(stream_table_tests).step);
 
     // Cross-platform release matrix
     const ReleaseTarget = struct {

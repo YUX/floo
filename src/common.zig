@@ -298,43 +298,81 @@ pub fn writeFrame(writer: *Io.Writer, payload: []const u8, seq: ?u64) !void {
     try writer.writeAll(payload);
 }
 
+/// Max frames packed into one `writev`. 16 frames → 32 iovecs, well under
+/// POSIX `IOV_MAX` (1024 on Darwin/Linux). Channel's send batch uses this.
+pub const MAX_WRITEV_FRAMES: usize = 16;
+
+/// One already-encrypted (or plaintext) payload plus optional v2 seq.
+/// `payload` must stay valid until `writeFramesDirect` returns.
+pub const OutgoingFrame = struct {
+    payload: []const u8,
+    seq: ?u64,
+};
+
 /// Write a length-prefixed frame DIRECTLY via writev, bypassing any Io
 /// buffered Writer.
 ///
 /// This is the hot data path. The std.Io.Stream.Writer interface adds 2-3
 /// vtable hops + buffering per frame, which costs us roughly 3x throughput
 /// vs the original posix.writev-based path. This helper restores the original
-/// scatter-gather behavior: one syscall per frame regardless of header/payload
-/// split. libc's writev is consistent across macOS and Linux (we link libc).
+/// scatter-gather behavior. libc's writev is consistent across macOS and
+/// Linux (we link libc).
 pub fn writeFrameDirect(handle: posix.fd_t, payload: []const u8, seq: ?u64) !void {
-    var header_buf: [12]u8 = undefined;
-    const header: []const u8 = if (seq) |s| blk: {
-        std.mem.writeInt(u32, header_buf[0..4], @intCast(payload.len), .big);
-        std.mem.writeInt(u64, header_buf[4..12], s, .big);
-        break :blk header_buf[0..12];
-    } else blk: {
-        std.mem.writeInt(u32, header_buf[0..4], @intCast(payload.len), .big);
-        break :blk header_buf[0..4];
-    };
+    var frames = [_]OutgoingFrame{.{ .payload = payload, .seq = seq }};
+    try writeFramesDirect(handle, &frames);
+}
 
-    var header_sent: usize = 0;
-    var payload_sent: usize = 0;
+/// Write 0–N length-prefixed frames in as few `writev` syscalls as possible
+/// (one, unless the kernel short-writes). Blocking sockets only: EAGAIN is
+/// a programming error, same as `writeFrameDirect`.
+pub fn writeFramesDirect(handle: posix.fd_t, frames: []const OutgoingFrame) !void {
+    var offset: usize = 0;
+    while (offset < frames.len) {
+        const end = @min(offset + MAX_WRITEV_FRAMES, frames.len);
+        try writeFramesDirectChunk(handle, frames[offset..end]);
+        offset = end;
+    }
+}
 
-    while (header_sent < header.len or payload_sent < payload.len) {
-        var iovecs_buf: [2]std.c.iovec_const = undefined;
+fn writeFramesDirectChunk(handle: posix.fd_t, frames: []const OutgoingFrame) !void {
+    if (frames.len == 0) return;
+    std.debug.assert(frames.len <= MAX_WRITEV_FRAMES);
+
+    var headers: [MAX_WRITEV_FRAMES][12]u8 = undefined;
+    var parts: [MAX_WRITEV_FRAMES * 2][]const u8 = undefined;
+    var nparts: usize = 0;
+
+    for (frames, 0..) |frame, i| {
+        if (frame.seq) |s| {
+            std.mem.writeInt(u32, headers[i][0..4], @intCast(frame.payload.len), .big);
+            std.mem.writeInt(u64, headers[i][4..12], s, .big);
+            parts[nparts] = headers[i][0..12];
+        } else {
+            std.mem.writeInt(u32, headers[i][0..4], @intCast(frame.payload.len), .big);
+            parts[nparts] = headers[i][0..4];
+        }
+        nparts += 1;
+        if (frame.payload.len > 0) {
+            parts[nparts] = frame.payload;
+            nparts += 1;
+        }
+    }
+
+    var part_idx: usize = 0;
+    var part_off: usize = 0;
+    while (part_idx < nparts) {
+        var iovecs_buf: [MAX_WRITEV_FRAMES * 2]std.c.iovec_const = undefined;
         var iovec_count: c_uint = 0;
-
-        if (header_sent < header.len) {
-            const remaining = header[header_sent..];
+        var i = part_idx;
+        var off = part_off;
+        while (i < nparts) : (i += 1) {
+            const remaining = parts[i][off..];
+            off = 0;
+            if (remaining.len == 0) continue;
             iovecs_buf[iovec_count] = .{ .base = remaining.ptr, .len = remaining.len };
             iovec_count += 1;
         }
-
-        if (payload_sent < payload.len) {
-            const remaining = payload[payload_sent..];
-            iovecs_buf[iovec_count] = .{ .base = remaining.ptr, .len = remaining.len };
-            iovec_count += 1;
-        }
+        if (iovec_count == 0) return;
 
         const written = std.c.writev(handle, &iovecs_buf, iovec_count);
         if (written < 0) {
@@ -356,18 +394,16 @@ pub fn writeFrameDirect(handle: posix.fd_t, payload: []const u8, seq: ?u64) !voi
         if (written == 0) return error.ConnectionClosed;
 
         var remaining: usize = @intCast(written);
-        if (header_sent < header.len) {
-            const header_remaining = header.len - header_sent;
-            if (remaining >= header_remaining) {
-                remaining -= header_remaining;
-                header_sent = header.len;
+        while (remaining > 0 and part_idx < nparts) {
+            const avail = parts[part_idx].len - part_off;
+            if (remaining >= avail) {
+                remaining -= avail;
+                part_idx += 1;
+                part_off = 0;
             } else {
-                header_sent += remaining;
+                part_off += remaining;
                 remaining = 0;
             }
-        }
-        if (remaining > 0 and payload_sent < payload.len) {
-            payload_sent += @min(remaining, payload.len - payload_sent);
         }
     }
 }
@@ -743,4 +779,28 @@ test "parseHostPort handles IPv4, names, and bracketed IPv6" {
 
     try std.testing.expectError(error.InvalidHostPort, parseHostPort("::1:9000"));
     try std.testing.expectError(error.InvalidHostPort, parseHostPort("localhost"));
+}
+
+test "writeFramesDirect coalesces plaintext and seq-prefixed frames" {
+    var fds: [2]posix.fd_t = undefined;
+    const rc = std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds);
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+
+    const hello = "hello";
+    const world = "world!!";
+    try writeFramesDirect(fds[0], &.{
+        .{ .payload = hello, .seq = null },
+        .{ .payload = world, .seq = 7 },
+    });
+
+    var buf: [64]u8 = undefined;
+    const n = try posix.read(fds[1], &buf);
+    try std.testing.expectEqual(@as(usize, 28), n);
+    try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, buf[0..4], .big));
+    try std.testing.expectEqualStrings("hello", buf[4..9]);
+    try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, buf[9..13], .big));
+    try std.testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, buf[13..21], .big));
+    try std.testing.expectEqualStrings("world!!", buf[21..28]);
 }

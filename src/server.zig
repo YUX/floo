@@ -742,6 +742,7 @@ const TunnelConnection = struct {
             .release = Stream.releaseRef,
             .onFrame = onTunnelFrame,
             .onSide = onStreamSide,
+            .onFlushSend = onFlushSend,
         });
 
         std.debug.print("[TUNNEL] Connection handler stopping\n", .{});
@@ -761,6 +762,14 @@ const TunnelConnection = struct {
     fn onStreamSide(ctx: *anyopaque, stream: *Stream, revents: i16) void {
         const self: *TunnelConnection = @ptrCast(@alignCast(ctx));
         self.handleStreamPollEvent(stream, revents);
+    }
+
+    fn onFlushSend(ctx: *anyopaque) anyerror!void {
+        const self: *TunnelConnection = @ptrCast(@alignCast(ctx));
+        self.channel.flushSendBatch() catch |err| {
+            self.handleSendFailure(err);
+            return err;
+        };
     }
 
     fn handleMessage(self: *TunnelConnection, frame: protocol.WireFrame) !void {

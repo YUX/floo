@@ -121,6 +121,31 @@ See [MIGRATION_NOTES.md](MIGRATION_NOTES.md) for the 0.2 → 0.3 cut. Both sides
   budget; ChaCha20 (software-only AEAD) and plaintext are AEAD-bound /
   data-path-bound so the poll-loop savings are absorbed in noise.
 
+- **Coalesce already-encrypted frames into one `writev` under the send
+  lock.** Phase 3 stacks showed `writev` at 46–76% of the client hot path.
+  `Channel` now queues prepared frames and the poll loop flushes them once
+  per wakeup (`common.writeFramesDirect`), so several ready streams share
+  one syscall. Still blocking; no non-blocking sockets / POLL.OUT.
+
+  Same-machine A/B vs `bench/baseline.json` (Darwin arm64, ReleaseFast,
+  5 s × 2, receiver-side SUM, 10 tunnels). Side-read drain was tried and
+  reverted: 8K P=1 stayed inside ±5%, and the AES P=1 win survived
+  drain-off.
+
+  | Cell (forward)            | baseline | post | Δ |
+  |---------------------------|---------:|-----:|---|
+  | aes128gcm 128K P=1 t=10   |    10.21 | **11.59** | **+13.5 %** |
+  | aes128gcm 1M P=1 t=10     |    10.51 | **11.46** | **+9.0 %** |
+  | none 128K P=1 t=10        |     9.97 |  9.49 | −4.8 % (noise) |
+  | aegis128l 128K P=1 t=10   |    10.51 | 10.51 |  0.0 % |
+  | chacha20 128K P=1 t=10    |     2.83 |  2.99 | +5.7 % |
+  | chacha20 128K P=4 t=10    |     7.89 |  8.96 | +13.5 % |
+
+  `none` P=1 is unchanged (~10 Gbps vs raw 128K P=1 ~36 Gbps): the
+  remaining wall is still a blocking `writev` per poll wakeup. AES P=4
+  1M dropped ~15% (fatter HOL write); 1-tunnel P≥4 still kills the
+  iperf3 control socket.
+
 ### Changed (perf hygiene + correctness, post-0.2.0 audit)
 Cooldown-controlled A/B vs the 0.2.0 baseline (M1, 4 streams ×
 8 tunnels, 5 s iperf3 trials, alternating order):

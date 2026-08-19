@@ -703,6 +703,7 @@ const TunnelClient = struct {
             .release = LocalConnection.releaseRef,
             .onFrame = onTunnelFrame,
             .onSide = onLocalSide,
+            .onFlushSend = onFlushSend,
             .shouldStop = shouldStopHeartbeat,
         });
 
@@ -723,6 +724,14 @@ const TunnelClient = struct {
     fn onLocalSide(ctx: *anyopaque, conn: *LocalConnection, revents: i16) void {
         const self: *TunnelClient = @ptrCast(@alignCast(ctx));
         self.handleLocalPollEvent(conn, revents);
+    }
+
+    fn onFlushSend(ctx: *anyopaque) anyerror!void {
+        const self: *TunnelClient = @ptrCast(@alignCast(ctx));
+        self.channel.flushSendBatch() catch |err| {
+            self.handleSendFailure(err);
+            return err;
+        };
     }
 
     fn shouldStopHeartbeat(ctx: *anyopaque) bool {
