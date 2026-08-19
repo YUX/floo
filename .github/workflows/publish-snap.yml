@@ -13,6 +13,8 @@ jobs:
   build-snap:
     name: Build and Publish Snap
     runs-on: ubuntu-latest
+    env:
+      SNAPCRAFT_TOKEN: ${{ secrets.SNAPCRAFT_TOKEN }}
 
     strategy:
       matrix:
@@ -53,10 +55,10 @@ jobs:
           path: ${{ steps.build-snap.outputs.snap }}
 
       - name: Publish to Snap Store
-        if: github.event_name == 'release' && secrets.SNAPCRAFT_TOKEN != ''
+        if: github.event_name == 'release' && env.SNAPCRAFT_TOKEN != ''
         uses: snapcore/action-publish@v1
         env:
-          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_TOKEN }}
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ env.SNAPCRAFT_TOKEN }}
         with:
           snap: ${{ steps.build-snap.outputs.snap }}
           release: stable
@@ -66,6 +68,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-snap
     if: always()
+    env:
+      SNAPCRAFT_TOKEN: ${{ secrets.SNAPCRAFT_TOKEN }}
 
     steps:
       - name: Summary
@@ -75,7 +79,7 @@ jobs:
           echo "Version: ${{ needs.build-snap.outputs.version || github.event.inputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ "${{ secrets.SNAPCRAFT_TOKEN }}" != "" ]; then
+          if [ "$SNAPCRAFT_TOKEN" != "" ]; then
             echo "Published to Snap Store" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "Users can install with:" >> $GITHUB_STEP_SUMMARY

@@ -748,20 +748,24 @@ test "RateLimiter refill amount matches configured rate" {
     while (i < 100) : (i += 1) {
         try std.testing.expect(rl.tryAcquire());
     }
+    // Drain can exceed one refill interval on a loaded CI runner.
+    // Pin last_refill so the exhaust check cannot race a refill.
+    rl.last_refill.store(@intCast(nanoTimestamp()), .monotonic);
     try std.testing.expect(!rl.tryAcquire());
 
-    var req = posix.timespec{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
-    _ = std.c.nanosleep(&req, null);
+    // 25 ms at 100/s = 2 intervals. Drive elapsed via last_refill
+    // instead of nanosleep — macOS CI overslept past the old <=15 bound.
+    const rewind: i64 = 25 * std.time.ns_per_ms;
+    rl.last_refill.store(@intCast(nanoTimestamp() - rewind), .monotonic);
 
     var got: u32 = 0;
     while (rl.tryAcquire()) {
         got += 1;
         if (got > 40) break;
     }
-    // 25 ms at 100/s ≈ 2.5 tokens. Slack covers scheduler jitter; the
-    // pre-fix bug published the whole bucket (~99) after one interval.
+    // The pre-fix bug published the whole bucket (~99) after one interval.
     try std.testing.expect(got >= 1);
-    try std.testing.expect(got <= 15);
+    try std.testing.expect(got <= 8);
 }
 
 test "parseHostPort handles IPv4, names, and bracketed IPv6" {

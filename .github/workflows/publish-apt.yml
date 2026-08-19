@@ -50,6 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-deb
     if: github.repository == 'YUX/floo' # Only run on main repo
+    env:
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
     steps:
       - name: Checkout code
@@ -128,14 +130,14 @@ jobs:
 
       # Optional: Sign with GPG if GPG_PRIVATE_KEY secret is set
       - name: Import GPG key
-        if: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+        if: env.GPG_PRIVATE_KEY != ''
         run: |
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --import
+          echo "$GPG_PRIVATE_KEY" | gpg --import
           GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format=long | grep sec | awk '{print $2}' | cut -d'/' -f2)
           echo "GPG_KEY_ID=${GPG_KEY_ID}" >> $GITHUB_ENV
 
       - name: Sign Release
-        if: ${{ secrets.GPG_PRIVATE_KEY != '' }}
+        if: env.GPG_PRIVATE_KEY != ''
         run: |
           cd apt-repo/dists/stable
           gpg --default-key ${{ env.GPG_KEY_ID }} -abs -o Release.gpg Release
