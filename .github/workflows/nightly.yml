@@ -60,8 +60,9 @@ jobs:
             done
 
             cp README.md "dist/${target}/"
-            cp configs/flooc.example.toml "dist/${target}/flooc.toml.example"
-            cp configs/floos.example.toml "dist/${target}/floos.toml.example"
+            cp LICENSE "dist/${target}/"
+            mkdir -p "dist/${target}/configs"
+            cp configs/*.toml "dist/${target}/configs/"
 
             if [[ "$target" == *"windows"* ]]; then
               (cd dist && zip -rq "../release-assets/floo-${target}.zip" "${target}")
@@ -99,10 +100,10 @@ jobs:
 
           ---
 
-          ### Performance
-          - **29.4 Gbps** encrypted throughput (AEGIS-128L)
-          - **671 KB** total binary size
-          - **Zero dependencies**
+          ### Notes
+          - Protocol v2 (no 0.2.x interop)
+          - Zero dependencies
+          - Example configs in `configs/*.toml`
 
           ### Downloads
 

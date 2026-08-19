@@ -62,4 +62,4 @@ jobs:
 
       - name: Check formatting
         run: |
-          zig fmt --check src/*.zig build.zig
+          zig fmt --check src build.zig

@@ -1,9 +1,14 @@
+floo (0.3.0-1) stable; urgency=medium
+
+  * Protocol v2: u32 ServiceId, explicit frame seq, length+seq AAD
+  * License consistency: Apache-2.0
+  * Example configs from configs/*.toml
+  * 9 AEAD ciphers plus cipher=none (PSK still required)
+
+ -- Your Name <your.email@example.com>  Wed, 19 Aug 2026 00:00:00 +0000
+
 floo (0.1.2-1) stable; urgency=medium
 
   * Initial release
-  * High-performance tunneling with 29.4 Gbps throughput
-  * Zero dependencies, 671 KB total binary size
-  * Noise XX + PSK authentication with 5 AEAD ciphers
-  * Built-in diagnostics and hot config reload
 
  -- Your Name <your.email@example.com>  Thu, 07 Nov 2024 00:00:00 +0000

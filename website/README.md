@@ -102,4 +102,4 @@ Edit the CSS variables in `src/index.css`:
 
 ## License
 
-MIT License - Same as the main Floo project
+Apache-2.0 — same as the main Floo project

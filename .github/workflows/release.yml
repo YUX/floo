@@ -90,8 +90,9 @@ jobs:
             done
 
             cp README.md "$out_dir/"
-            cp configs/flooc.example.toml "$out_dir/flooc.toml.example"
-            cp configs/floos.example.toml "$out_dir/floos.toml.example"
+            cp LICENSE "$out_dir/"
+            mkdir -p "$out_dir/configs"
+            cp configs/*.toml "$out_dir/configs/"
             cp CHANGELOG.md "$out_dir/" 2>/dev/null || true
 
             if [[ "$target" == *"windows"* ]]; then
@@ -166,25 +167,20 @@ jobs:
 
             **High-throughput tunneling in Zig - Zero dependencies, maximum performance**
 
-            ### Performance (Apple M1 MacBook Air)
-            - **29.4 Gbps** encrypted throughput (AEGIS-128L cipher)
-            - **62% faster** than Rathole
-            - **194% faster** than FRP
-
-            ### Binary Sizes
-            - Client (`flooc`): 394 KB
-            - Server (`floos`): 277 KB
-            - **Total: 671 KB**
+            ### Protocol v2
+            - Encrypted frames carry an explicit seq bound as AEAD AAD (`length || seq`)
+            - `ServiceId` is u32; no 0.2.x wire interop
+            - 9 AEAD ciphers plus `cipher=none` (PSK still required)
 
             ### Key Features
-            - Noise XX + PSK authentication (5 AEAD ciphers)
+            - Noise XX + PSK authentication
             - Multi-service multiplexing
-            - Parallel tunnels with round-robin load balancing
+            - Parallel tunnels with round-robin load balancing (1–64)
             - Proxy support (SOCKS5 + HTTP CONNECT)
             - Heartbeat supervision & auto-reconnect
-            - Hot config reload (SIGHUP)
             - Built-in diagnostics (`--doctor`, `--ping`)
             - Per-service token authentication
+            - Example configs in `configs/*.toml`
 
             ### Installation
 

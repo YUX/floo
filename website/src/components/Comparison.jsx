@@ -4,11 +4,11 @@ export default function Comparison() {
   const comparisonData = [
     { feature: 'Language', floo: 'Zig', rathole: 'Rust', frp: 'Go' },
     { feature: 'Dependencies', floo: '0 ⭐', rathole: '27+ crates', frp: '34+ packages', highlight: 'floo' },
-    { feature: 'Max Throughput (M1)', floo: '29.4 Gbps ⭐', rathole: '18.1 Gbps', frp: '10.0 Gbps', highlight: 'floo' },
+    { feature: 'Max Throughput (M1, historical v0.1.4)', floo: '29.4 Gbps', rathole: '18.1 Gbps', frp: '10.0 Gbps' },
     { feature: 'Binary Size', floo: '671 KB ⭐', rathole: '~2-4 MB', frp: '~24+ MB', highlight: 'floo' },
     { feature: 'Encryption', floo: 'Noise XX + PSK', rathole: 'Noise NK, TLS', frp: 'TLS' },
-    { feature: 'Ciphers', floo: '5 AEAD', rathole: 'ChaCha20-Poly1305', frp: 'TLS standard' },
-    { feature: 'Parallel Tunnels', floo: '✅ Round-robin (1-16)', rathole: '🔶 Not documented', frp: '✅ Connection pool' },
+    { feature: 'Ciphers', floo: '9 AEAD + none', rathole: 'ChaCha20-Poly1305', frp: 'TLS standard', highlight: 'floo' },
+    { feature: 'Parallel Tunnels', floo: '✅ Round-robin (1–64)', rathole: '🔶 Not documented', frp: '✅ Connection pool', highlight: 'floo' },
   { feature: 'Hot Config Reload', floo: '🔶 Restart (planned)', rathole: '✅ Dynamic services', frp: '✅ Admin API' },
     { feature: 'Built-in Diagnostics', floo: '✅ --doctor, --ping', rathole: '🔶 Logging only', frp: '✅ Dashboard, Prometheus' },
     { feature: 'Proxy Client', floo: '✅ SOCKS5, HTTP', rathole: '✅ SOCKS5, HTTP', frp: '✅ HTTP, SOCKS5' },
@@ -57,9 +57,9 @@ export default function Comparison() {
           </div>
           <div className="highlight-card">
             <div className="highlight-icon">⚡</div>
-            <div className="highlight-title">62% Faster</div>
+            <div className="highlight-title">Protocol v2</div>
             <div className="highlight-text">
-              Outperforms Rathole with AEGIS-128L cipher
+              Explicit frame seq, u32 ServiceId, 9 AEAD ciphers + none
             </div>
           </div>
           <div className="highlight-card">

@@ -2,13 +2,13 @@
 #
 # Build .deb packages from GitHub release artifacts
 # Usage: ./build-deb.sh VERSION
-# Example: ./build-deb.sh 0.1.2
+# Example: ./build-deb.sh 0.3.0
 
 set -e
 
 if [ -z "$1" ]; then
  echo "Usage: $0 VERSION"
- echo "Example: $0 0.1.2"
+ echo "Example: $0 0.3.0"
  exit 1
 fi
 
@@ -52,8 +52,15 @@ chmod 755 usr/bin/flooc usr/bin/floos
 
 # Move documentation
 mv README.md usr/share/doc/floo/
-mv flooc.toml.example usr/share/doc/floo/examples/
-mv floos.toml.example usr/share/doc/floo/examples/
+if [ -f LICENSE ]; then
+  mv LICENSE usr/share/doc/floo/
+fi
+if [ -d configs ]; then
+  cp configs/*.toml usr/share/doc/floo/examples/
+elif [ -f flooc.toml.example ]; then
+  mv flooc.toml.example usr/share/doc/floo/examples/
+  mv floos.toml.example usr/share/doc/floo/examples/
+fi
 
 # Create control file
 cat > DEBIAN/control << EOF
@@ -70,7 +77,7 @@ Description: Secure, high-performance tunneling in Zig
  multiple AEAD ciphers.
  .
  Features:
- - 29.4 Gbps throughput with AEGIS-128L cipher
+ - Noise XX + PSK with 9 AEAD ciphers plus cipher=none
  - Zero runtime dependencies
  - Reverse and forward tunneling modes
  - SOCKS5 and HTTP CONNECT proxy support
@@ -112,8 +119,15 @@ chmod 755 usr/bin/flooc usr/bin/floos
 
 # Move documentation
 mv README.md usr/share/doc/floo/
-mv flooc.toml.example usr/share/doc/floo/examples/
-mv floos.toml.example usr/share/doc/floo/examples/
+if [ -f LICENSE ]; then
+  mv LICENSE usr/share/doc/floo/
+fi
+if [ -d configs ]; then
+  cp configs/*.toml usr/share/doc/floo/examples/
+elif [ -f flooc.toml.example ]; then
+  mv flooc.toml.example usr/share/doc/floo/examples/
+  mv floos.toml.example usr/share/doc/floo/examples/
+fi
 
 # Create control file
 cat > DEBIAN/control << EOF
@@ -130,7 +144,7 @@ Description: Secure, high-performance tunneling in Zig
  multiple AEAD ciphers.
  .
  Features:
- - 29.4 Gbps throughput with AEGIS-128L cipher
+ - Noise XX + PSK with 9 AEAD ciphers plus cipher=none
  - Zero runtime dependencies
  - Reverse and forward tunneling modes
  - SOCKS5 and HTTP CONNECT proxy support

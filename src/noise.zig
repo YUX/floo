@@ -2,6 +2,7 @@ const std = @import("std");
 const crypto = std.crypto;
 const Io = std.Io;
 const common = @import("common.zig");
+const protocol = @import("protocol.zig");
 
 /// Debug logging for Noise protocol (disable in production for performance)
 const enable_noise_debug = false;
@@ -28,11 +29,10 @@ test "transport cipher advances nonce and output" {
     var ct1: [32 + TAG_LEN]u8 = undefined;
     var ct2: [32 + TAG_LEN]u8 = undefined;
 
-    try cipher.encrypt(plaintext[0..], ct1[0..]);
-    try cipher.encrypt(plaintext[0..], ct2[0..]);
+    try cipher.encrypt(plaintext[0..], ct1[0..], 0, &[_]u8{});
+    try cipher.encrypt(plaintext[0..], ct2[0..], 1, &[_]u8{});
 
     try std.testing.expect(!std.mem.eql(u8, ct1[0..], ct2[0..]));
-    try std.testing.expectEqual(@as(u64, 2), cipher.nonce.load(.monotonic));
 }
 
 test "AEGIS-128X2 encrypt/decrypt roundtrip" {
@@ -46,8 +46,8 @@ test "AEGIS-128X2 encrypt/decrypt roundtrip" {
     var ciphertext: [plaintext.len + TAG_LEN]u8 = undefined;
     var decrypted: [plaintext.len]u8 = undefined;
 
-    try cipher_enc.encrypt(plaintext, &ciphertext);
-    try cipher_dec.decrypt(&ciphertext, &decrypted);
+    try cipher_enc.encrypt(plaintext, &ciphertext, 0, &[_]u8{});
+    try cipher_dec.decrypt(&ciphertext, &decrypted, 0, &[_]u8{});
 
     try std.testing.expectEqualStrings(plaintext, &decrypted);
 }
@@ -63,8 +63,8 @@ test "AEGIS-128X4 encrypt/decrypt roundtrip" {
     var ciphertext: [plaintext.len + TAG_LEN]u8 = undefined;
     var decrypted: [plaintext.len]u8 = undefined;
 
-    try cipher_enc.encrypt(plaintext, &ciphertext);
-    try cipher_dec.decrypt(&ciphertext, &decrypted);
+    try cipher_enc.encrypt(plaintext, &ciphertext, 0, &[_]u8{});
+    try cipher_dec.decrypt(&ciphertext, &decrypted, 0, &[_]u8{});
 
     try std.testing.expectEqualStrings(plaintext, &decrypted);
 }
@@ -87,8 +87,8 @@ test "AEGIS-256X2 encrypt/decrypt roundtrip" {
     var ciphertext: [plaintext.len + TAG_LEN]u8 = undefined;
     var decrypted: [plaintext.len]u8 = undefined;
 
-    try cipher_enc.encrypt(plaintext, &ciphertext);
-    try cipher_dec.decrypt(&ciphertext, &decrypted);
+    try cipher_enc.encrypt(plaintext, &ciphertext, 0, &[_]u8{});
+    try cipher_dec.decrypt(&ciphertext, &decrypted, 0, &[_]u8{});
 
     try std.testing.expectEqualStrings(plaintext, &decrypted);
 }
@@ -104,8 +104,8 @@ test "AEGIS-256X4 encrypt/decrypt roundtrip" {
     var ciphertext: [plaintext.len + TAG_LEN]u8 = undefined;
     var decrypted: [plaintext.len]u8 = undefined;
 
-    try cipher_enc.encrypt(plaintext, &ciphertext);
-    try cipher_dec.decrypt(&ciphertext, &decrypted);
+    try cipher_enc.encrypt(plaintext, &ciphertext, 0, &[_]u8{});
+    try cipher_dec.decrypt(&ciphertext, &decrypted, 0, &[_]u8{});
 
     try std.testing.expectEqualStrings(plaintext, &decrypted);
 }
@@ -148,19 +148,37 @@ test "AEAD decrypt is safe in-place across all cipher types" {
         // Encrypt into a fresh buffer so we know the ciphertext.
         const ct_len = plaintext_in.len + TAG_LEN;
         var ct_buf: [200]u8 = undefined;
-        try cipher_enc.encrypt(plaintext_in, ct_buf[0..ct_len]);
+        try cipher_enc.encrypt(plaintext_in, ct_buf[0..ct_len], 0, &[_]u8{});
 
         // Out-of-place decrypt as the reference.
         var pt_oop: [plaintext_in.len]u8 = undefined;
-        try cipher_dec_oop.decrypt(ct_buf[0..ct_len], &pt_oop);
+        try cipher_dec_oop.decrypt(ct_buf[0..ct_len], &pt_oop, 0, &[_]u8{});
         try std.testing.expectEqualSlices(u8, plaintext_in, &pt_oop);
 
         // In-place decrypt: source and dest alias the same backing storage.
         var ct_alias: [200]u8 = undefined;
         @memcpy(ct_alias[0..ct_len], ct_buf[0..ct_len]);
-        try cipher_dec_in.decrypt(ct_alias[0..ct_len], ct_alias[0..plaintext_in.len]);
+        try cipher_dec_in.decrypt(ct_alias[0..ct_len], ct_alias[0..plaintext_in.len], 0, &[_]u8{});
         try std.testing.expectEqualSlices(u8, plaintext_in, ct_alias[0..plaintext_in.len]);
     }
+}
+
+test "AAD binds length||seq; wrong AAD fails closed" {
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x11);
+    var enc = TransportCipher.init(key, .aes128gcm);
+    var dec = TransportCipher.init(key, .aes128gcm);
+
+    const plaintext = "aad-bound payload";
+    var ciphertext: [plaintext.len + TAG_LEN]u8 = undefined;
+    const aad = protocol.makeAad(@intCast(plaintext.len + TAG_LEN), 9);
+    try enc.encrypt(plaintext, &ciphertext, 9, &aad);
+    var out: [plaintext.len]u8 = undefined;
+    try dec.decrypt(&ciphertext, &out, 9, &aad);
+    try std.testing.expectEqualSlices(u8, plaintext, &out);
+
+    const bad_aad = protocol.makeAad(@intCast(plaintext.len + TAG_LEN), 10);
+    try std.testing.expectError(error.AuthenticationFailed, dec.decrypt(&ciphertext, &out, 9, &bad_aad));
 }
 
 /// Cipher type for Noise transport
@@ -258,250 +276,27 @@ pub const TransportCipher = struct {
         return nonce;
     }
 
-    /// Encrypt plaintext into ciphertext (includes 16-byte tag)
-    pub fn encrypt(self: *TransportCipher, plaintext: []const u8, ciphertext: []u8) !void {
+    /// Encrypt plaintext into ciphertext (includes 16-byte tag).
+    /// `seq` is the wire/nonce counter; the receiver must use the same value.
+    pub fn encrypt(self: *TransportCipher, plaintext: []const u8, ciphertext: []u8, seq: u64, aad: []const u8) !void {
         if (ciphertext.len != plaintext.len + TAG_LEN) return error.InvalidLength;
-        const nonce_val = self.nonce.fetchAdd(1, .monotonic);
-        if (nonce_val >= MAX_NONCE) return error.NonceExhausted;
-
-        switch (self.cipher_type) {
-            .chacha20poly1305 => {
-                const nonce = makeNonce12(nonce_val);
-                crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(
-                    ciphertext[0..plaintext.len],
-                    ciphertext[plaintext.len..][0..TAG_LEN],
-                    plaintext,
-                    &[_]u8{},
-                    nonce,
-                    self.key,
-                );
-            },
-            .aes256gcm => {
-                const nonce = makeNonce12(nonce_val);
-                crypto.aead.aes_gcm.Aes256Gcm.encrypt(
-                    ciphertext[0..plaintext.len],
-                    ciphertext[plaintext.len..][0..TAG_LEN],
-                    plaintext,
-                    &[_]u8{},
-                    nonce,
-                    self.key,
-                );
-            },
-            .aes128gcm => {
-                const nonce = makeNonce12(nonce_val);
-                const key128 = self.key[0..16].*;
-                crypto.aead.aes_gcm.Aes128Gcm.encrypt(
-                    ciphertext[0..plaintext.len],
-                    ciphertext[plaintext.len..][0..TAG_LEN],
-                    plaintext,
-                    &[_]u8{},
-                    nonce,
-                    key128,
-                );
-            },
-            .aegis128l => {
-                const nonce = makeNonce16(nonce_val);
-                const key128 = self.key[0..16].*;
-                crypto.aead.aegis.Aegis128L.encrypt(
-                    ciphertext[0..plaintext.len],
-                    ciphertext[plaintext.len..][0..TAG_LEN],
-                    plaintext,
-                    &[_]u8{},
-                    nonce,
-                    key128,
-                );
-            },
-            .aegis128x2 => {
-                const nonce = makeNonce16(nonce_val);
-                const key128 = self.key[0..16].*;
-                crypto.aead.aegis.Aegis128X2.encrypt(
-                    ciphertext[0..plaintext.len],
-                    ciphertext[plaintext.len..][0..TAG_LEN],
-                    plaintext,
-                    &[_]u8{},
-                    nonce,
-                    key128,
-                );
-            },
-            .aegis128x4 => {
-                const nonce = makeNonce16(nonce_val);
-                const key128 = self.key[0..16].*;
-                crypto.aead.aegis.Aegis128X4.encrypt(
-                    ciphertext[0..plaintext.len],
-                    ciphertext[plaintext.len..][0..TAG_LEN],
-                    plaintext,
-                    &[_]u8{},
-                    nonce,
-                    key128,
-                );
-            },
-            .aegis256 => {
-                const nonce = makeNonce32(nonce_val);
-                crypto.aead.aegis.Aegis256.encrypt(
-                    ciphertext[0..plaintext.len],
-                    ciphertext[plaintext.len..][0..TAG_LEN],
-                    plaintext,
-                    &[_]u8{},
-                    nonce,
-                    self.key,
-                );
-            },
-            .aegis256x2 => {
-                const nonce = makeNonce32(nonce_val);
-                crypto.aead.aegis.Aegis256X2.encrypt(
-                    ciphertext[0..plaintext.len],
-                    ciphertext[plaintext.len..][0..TAG_LEN],
-                    plaintext,
-                    &[_]u8{},
-                    nonce,
-                    self.key,
-                );
-            },
-            .aegis256x4 => {
-                const nonce = makeNonce32(nonce_val);
-                crypto.aead.aegis.Aegis256X4.encrypt(
-                    ciphertext[0..plaintext.len],
-                    ciphertext[plaintext.len..][0..TAG_LEN],
-                    plaintext,
-                    &[_]u8{},
-                    nonce,
-                    self.key,
-                );
-            },
-        }
+        if (seq >= MAX_NONCE) return error.NonceExhausted;
+        aeadDispatch(.encrypt, self.cipher_type, ciphertext[0..plaintext.len], ciphertext[plaintext.len..][0..TAG_LEN], plaintext, aad, .fromSeq(seq), self.key) catch unreachable;
     }
 
-    /// Decrypt ciphertext into plaintext
-    pub fn decrypt(self: *TransportCipher, ciphertext: []const u8, plaintext: []u8) !void {
+    /// Decrypt ciphertext into plaintext using the frame's seq (never a guessed counter).
+    pub fn decrypt(self: *TransportCipher, ciphertext: []const u8, plaintext: []u8, seq: u64, aad: []const u8) !void {
         if (ciphertext.len < TAG_LEN) return error.InvalidLength;
         if (plaintext.len != ciphertext.len - TAG_LEN) return error.InvalidLength;
-        const nonce_val = self.nonce.fetchAdd(1, .monotonic);
-        if (nonce_val >= MAX_NONCE) return error.NonceExhausted;
-
+        if (seq >= MAX_NONCE) return error.NonceExhausted;
         const ct = ciphertext[0..plaintext.len];
-        const tag = ciphertext[plaintext.len..][0..TAG_LEN];
-
-        switch (self.cipher_type) {
-            .chacha20poly1305 => {
-                const nonce = makeNonce12(nonce_val);
-                crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(
-                    plaintext,
-                    ct,
-                    tag.*,
-                    &[_]u8{},
-                    nonce,
-                    self.key,
-                ) catch return error.AuthenticationFailed;
-            },
-            .aes256gcm => {
-                const nonce = makeNonce12(nonce_val);
-                crypto.aead.aes_gcm.Aes256Gcm.decrypt(
-                    plaintext,
-                    ct,
-                    tag.*,
-                    &[_]u8{},
-                    nonce,
-                    self.key,
-                ) catch return error.AuthenticationFailed;
-            },
-            .aes128gcm => {
-                const nonce = makeNonce12(nonce_val);
-                const key128 = self.key[0..16].*;
-                crypto.aead.aes_gcm.Aes128Gcm.decrypt(
-                    plaintext,
-                    ct,
-                    tag.*,
-                    &[_]u8{},
-                    nonce,
-                    key128,
-                ) catch return error.AuthenticationFailed;
-            },
-            .aegis128l => {
-                const nonce = makeNonce16(nonce_val);
-                const key128 = self.key[0..16].*;
-                crypto.aead.aegis.Aegis128L.decrypt(
-                    plaintext,
-                    ct,
-                    tag.*,
-                    &[_]u8{},
-                    nonce,
-                    key128,
-                ) catch return error.AuthenticationFailed;
-            },
-            .aegis128x2 => {
-                const nonce = makeNonce16(nonce_val);
-                const key128 = self.key[0..16].*;
-                crypto.aead.aegis.Aegis128X2.decrypt(
-                    plaintext,
-                    ct,
-                    tag.*,
-                    &[_]u8{},
-                    nonce,
-                    key128,
-                ) catch return error.AuthenticationFailed;
-            },
-            .aegis128x4 => {
-                const nonce = makeNonce16(nonce_val);
-                const key128 = self.key[0..16].*;
-                crypto.aead.aegis.Aegis128X4.decrypt(
-                    plaintext,
-                    ct,
-                    tag.*,
-                    &[_]u8{},
-                    nonce,
-                    key128,
-                ) catch return error.AuthenticationFailed;
-            },
-            .aegis256 => {
-                const nonce = makeNonce32(nonce_val);
-                crypto.aead.aegis.Aegis256.decrypt(
-                    plaintext,
-                    ct,
-                    tag.*,
-                    &[_]u8{},
-                    nonce,
-                    self.key,
-                ) catch return error.AuthenticationFailed;
-            },
-            .aegis256x2 => {
-                const nonce = makeNonce32(nonce_val);
-                crypto.aead.aegis.Aegis256X2.decrypt(
-                    plaintext,
-                    ct,
-                    tag.*,
-                    &[_]u8{},
-                    nonce,
-                    self.key,
-                ) catch return error.AuthenticationFailed;
-            },
-            .aegis256x4 => {
-                const nonce = makeNonce32(nonce_val);
-                crypto.aead.aegis.Aegis256X4.decrypt(
-                    plaintext,
-                    ct,
-                    tag.*,
-                    &[_]u8{},
-                    nonce,
-                    self.key,
-                ) catch return error.AuthenticationFailed;
-            },
-        }
+        var tag: [TAG_LEN]u8 = undefined;
+        @memcpy(&tag, ciphertext[plaintext.len..][0..TAG_LEN]);
+        aeadDispatch(.decrypt, self.cipher_type, plaintext, &tag, ct, aad, .fromSeq(seq), self.key) catch return error.AuthenticationFailed;
     }
 };
 
-/// HKDF-SHA256 key derivation
-fn hkdf(output: *[HASH_LEN]u8, chaining_key: [HASH_LEN]u8, input_key_material: []const u8) void {
-    // HKDF-Extract
-    var temp_key: [HASH_LEN]u8 = undefined;
-    crypto.auth.hmac.sha2.HmacSha256.create(&temp_key, input_key_material, &chaining_key);
-
-    // HKDF-Expand (single output block)
-    var hmac = crypto.auth.hmac.sha2.HmacSha256.init(&temp_key);
-    hmac.update(&[_]u8{1}); // output block counter = 1
-    hmac.final(output);
-}
-
-/// HKDF with two outputs
+/// HKDF-SHA256 with two outputs (Noise MixKey / Split)
 fn hkdf2(output1: *[HASH_LEN]u8, output2: *[KEY_LEN]u8, chaining_key: [HASH_LEN]u8, input_key_material: []const u8) void {
     // HKDF-Extract
     var temp_key: [HASH_LEN]u8 = undefined;
@@ -519,31 +314,160 @@ fn hkdf2(output1: *[HASH_LEN]u8, output2: *[KEY_LEN]u8, chaining_key: [HASH_LEN]
     hmac2.final(output2);
 }
 
-/// HKDF with three outputs
-fn hkdf3(output1: []u8, output2: []u8, output3: []u8, chaining_key: [HASH_LEN]u8, input_key_material: []const u8) void {
-    // HKDF-Extract
-    var temp_key: [HASH_LEN]u8 = undefined;
-    crypto.auth.hmac.sha2.HmacSha256.create(&temp_key, input_key_material, &chaining_key);
+const NonceSource = union(enum) {
+    seq: u64,
+    handshake: [12]u8,
 
-    // HKDF-Expand - first output
-    var hmac1 = crypto.auth.hmac.sha2.HmacSha256.init(&temp_key);
-    hmac1.update(&[_]u8{1});
-    hmac1.final(output1);
+    fn fromSeq(seq: u64) NonceSource {
+        return .{ .seq = seq };
+    }
+};
 
-    // HKDF-Expand - second output
-    var hmac2 = crypto.auth.hmac.sha2.HmacSha256.init(&temp_key);
-    hmac2.update(output1);
-    hmac2.update(&[_]u8{2});
-    hmac2.final(output2);
+fn aeadDispatch(
+    comptime op: enum { encrypt, decrypt },
+    cipher_type: CipherType,
+    dest: []u8,
+    tag: []u8,
+    src: []const u8,
+    ad: []const u8,
+    nonce_src: NonceSource,
+    key: [KEY_LEN]u8,
+) !void {
+    if (tag.len != TAG_LEN) return error.InvalidLength;
 
-    // HKDF-Expand - third output
-    var hmac3 = crypto.auth.hmac.sha2.HmacSha256.init(&temp_key);
-    hmac3.update(output2);
-    hmac3.update(&[_]u8{3});
-    hmac3.final(output3);
+    const aead = crypto.aead;
+    switch (cipher_type) {
+        .chacha20poly1305 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce12(n),
+                .handshake => |n| n,
+            };
+            if (op == .encrypt) {
+                aead.chacha_poly.ChaCha20Poly1305.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key);
+            } else {
+                aead.chacha_poly.ChaCha20Poly1305.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key) catch return error.DecryptionFailed;
+            }
+        },
+        .aes256gcm => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce12(n),
+                .handshake => |n| n,
+            };
+            if (op == .encrypt) {
+                aead.aes_gcm.Aes256Gcm.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key);
+            } else {
+                aead.aes_gcm.Aes256Gcm.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key) catch return error.DecryptionFailed;
+            }
+        },
+        .aes128gcm => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce12(n),
+                .handshake => |n| n,
+            };
+            const key128 = key[0..16].*;
+            if (op == .encrypt) {
+                aead.aes_gcm.Aes128Gcm.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key128);
+            } else {
+                aead.aes_gcm.Aes128Gcm.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key128) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis128l => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce16(n),
+                .handshake => |n12| padHandshakeNonce16(n12),
+            };
+            const key128 = key[0..16].*;
+            if (op == .encrypt) {
+                aead.aegis.Aegis128L.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key128);
+            } else {
+                aead.aegis.Aegis128L.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key128) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis128x2 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce16(n),
+                .handshake => |n12| padHandshakeNonce16(n12),
+            };
+            const key128 = key[0..16].*;
+            if (op == .encrypt) {
+                aead.aegis.Aegis128X2.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key128);
+            } else {
+                aead.aegis.Aegis128X2.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key128) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis128x4 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce16(n),
+                .handshake => |n12| padHandshakeNonce16(n12),
+            };
+            const key128 = key[0..16].*;
+            if (op == .encrypt) {
+                aead.aegis.Aegis128X4.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key128);
+            } else {
+                aead.aegis.Aegis128X4.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key128) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis256 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce32(n),
+                .handshake => |n12| padHandshakeNonce32(n12),
+            };
+            if (op == .encrypt) {
+                aead.aegis.Aegis256.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key);
+            } else {
+                aead.aegis.Aegis256.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis256x2 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce32(n),
+                .handshake => |n12| padHandshakeNonce32(n12),
+            };
+            if (op == .encrypt) {
+                aead.aegis.Aegis256X2.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key);
+            } else {
+                aead.aegis.Aegis256X2.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key) catch return error.DecryptionFailed;
+            }
+        },
+        .aegis256x4 => {
+            const nonce = switch (nonce_src) {
+                .seq => |n| TransportCipher.makeNonce32(n),
+                .handshake => |n12| padHandshakeNonce32(n12),
+            };
+            if (op == .encrypt) {
+                aead.aegis.Aegis256X4.encrypt(dest, tag[0..TAG_LEN], src, ad, nonce, key);
+            } else {
+                aead.aegis.Aegis256X4.decrypt(dest, src, tag[0..TAG_LEN].*, ad, nonce, key) catch return error.DecryptionFailed;
+            }
+        },
+    }
 }
 
-/// AEAD encryption helper for handshake
+fn padHandshakeNonce16(n12: [12]u8) [16]u8 {
+    var out: [16]u8 = @splat(0);
+    @memcpy(out[0..12], &n12);
+    return out;
+}
+
+fn padHandshakeNonce32(n12: [12]u8) [32]u8 {
+    var out: [32]u8 = @splat(0);
+    @memcpy(out[0..12], &n12);
+    return out;
+}
+
+fn nextHandshakeNonce(n: *u64) [12]u8 {
+    const nonce = TransportCipher.makeNonce12(n.*);
+    n.* += 1;
+    return nonce;
+}
+
+fn mixHash(h: *[HASH_LEN]u8, data: []const u8) void {
+    var hasher = crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(h);
+    hasher.update(data);
+    hasher.final(h);
+}
+
 fn aeadEncrypt(
     cipher_type: CipherType,
     ciphertext: []u8,
@@ -553,111 +477,9 @@ fn aeadEncrypt(
     nonce: [12]u8,
     key: [KEY_LEN]u8,
 ) void {
-    switch (cipher_type) {
-        .chacha20poly1305 => {
-            crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(
-                ciphertext,
-                tag,
-                plaintext,
-                ad,
-                nonce,
-                key,
-            );
-        },
-        .aes256gcm => {
-            crypto.aead.aes_gcm.Aes256Gcm.encrypt(
-                ciphertext,
-                tag,
-                plaintext,
-                ad,
-                nonce,
-                key,
-            );
-        },
-        .aes128gcm => {
-            const key128 = key[0..16].*;
-            crypto.aead.aes_gcm.Aes128Gcm.encrypt(
-                ciphertext,
-                tag,
-                plaintext,
-                ad,
-                nonce,
-                key128,
-            );
-        },
-        .aegis128l => {
-            const nonce16 = [_]u8{0} ** 16;
-            const key128 = key[0..16].*;
-            crypto.aead.aegis.Aegis128L.encrypt(
-                ciphertext,
-                tag,
-                plaintext,
-                ad,
-                nonce16,
-                key128,
-            );
-        },
-        .aegis128x2 => {
-            const nonce16 = [_]u8{0} ** 16;
-            const key128 = key[0..16].*;
-            crypto.aead.aegis.Aegis128X2.encrypt(
-                ciphertext,
-                tag,
-                plaintext,
-                ad,
-                nonce16,
-                key128,
-            );
-        },
-        .aegis128x4 => {
-            const nonce16 = [_]u8{0} ** 16;
-            const key128 = key[0..16].*;
-            crypto.aead.aegis.Aegis128X4.encrypt(
-                ciphertext,
-                tag,
-                plaintext,
-                ad,
-                nonce16,
-                key128,
-            );
-        },
-        .aegis256 => {
-            const nonce32 = [_]u8{0} ** 32;
-            crypto.aead.aegis.Aegis256.encrypt(
-                ciphertext,
-                tag,
-                plaintext,
-                ad,
-                nonce32,
-                key,
-            );
-        },
-        .aegis256x2 => {
-            const nonce32 = [_]u8{0} ** 32;
-            crypto.aead.aegis.Aegis256X2.encrypt(
-                ciphertext,
-                tag,
-                plaintext,
-                ad,
-                nonce32,
-                key,
-            );
-        },
-        .aegis256x4 => {
-            const nonce32 = [_]u8{0} ** 32;
-            crypto.aead.aegis.Aegis256X4.encrypt(
-                ciphertext,
-                tag,
-                plaintext,
-                ad,
-                nonce32,
-                key,
-            );
-        },
-    }
+    aeadDispatch(.encrypt, cipher_type, ciphertext, tag, plaintext, ad, .{ .handshake = nonce }, key) catch unreachable;
 }
 
-/// AEAD decryption helper for handshake
 fn aeadDecrypt(
     cipher_type: CipherType,
     plaintext: []u8,
@@ -667,108 +489,8 @@ fn aeadDecrypt(
     nonce: [12]u8,
     key: [KEY_LEN]u8,
 ) !void {
-    switch (cipher_type) {
-        .chacha20poly1305 => {
-            crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(
-                plaintext,
-                ciphertext,
-                tag,
-                ad,
-                nonce,
-                key,
-            ) catch return error.DecryptionFailed;
-        },
-        .aes256gcm => {
-            crypto.aead.aes_gcm.Aes256Gcm.decrypt(
-                plaintext,
-                ciphertext,
-                tag,
-                ad,
-                nonce,
-                key,
-            ) catch return error.DecryptionFailed;
-        },
-        .aes128gcm => {
-            const key128 = key[0..16].*;
-            crypto.aead.aes_gcm.Aes128Gcm.decrypt(
-                plaintext,
-                ciphertext,
-                tag,
-                ad,
-                nonce,
-                key128,
-            ) catch return error.DecryptionFailed;
-        },
-        .aegis128l => {
-            const nonce16 = [_]u8{0} ** 16;
-            const key128 = key[0..16].*;
-            crypto.aead.aegis.Aegis128L.decrypt(
-                plaintext,
-                ciphertext,
-                tag,
-                ad,
-                nonce16,
-                key128,
-            ) catch return error.DecryptionFailed;
-        },
-        .aegis128x2 => {
-            const nonce16 = [_]u8{0} ** 16;
-            const key128 = key[0..16].*;
-            crypto.aead.aegis.Aegis128X2.decrypt(
-                plaintext,
-                ciphertext,
-                tag,
-                ad,
-                nonce16,
-                key128,
-            ) catch return error.DecryptionFailed;
-        },
-        .aegis128x4 => {
-            const nonce16 = [_]u8{0} ** 16;
-            const key128 = key[0..16].*;
-            crypto.aead.aegis.Aegis128X4.decrypt(
-                plaintext,
-                ciphertext,
-                tag,
-                ad,
-                nonce16,
-                key128,
-            ) catch return error.DecryptionFailed;
-        },
-        .aegis256 => {
-            const nonce32 = [_]u8{0} ** 32;
-            crypto.aead.aegis.Aegis256.decrypt(
-                plaintext,
-                ciphertext,
-                tag,
-                ad,
-                nonce32,
-                key,
-            ) catch return error.DecryptionFailed;
-        },
-        .aegis256x2 => {
-            const nonce32 = [_]u8{0} ** 32;
-            crypto.aead.aegis.Aegis256X2.decrypt(
-                plaintext,
-                ciphertext,
-                tag,
-                ad,
-                nonce32,
-                key,
-            ) catch return error.DecryptionFailed;
-        },
-        .aegis256x4 => {
-            const nonce32 = [_]u8{0} ** 32;
-            crypto.aead.aegis.Aegis256X4.decrypt(
-                plaintext,
-                ciphertext,
-                tag,
-                ad,
-                nonce32,
-                key,
-            ) catch return error.DecryptionFailed;
-        },
-    }
+    var tag_buf = tag;
+    try aeadDispatch(.decrypt, cipher_type, plaintext, &tag_buf, ciphertext, ad, .{ .handshake = nonce }, key);
 }
 
 /// Handshake helpers
@@ -962,6 +684,7 @@ pub fn noiseXXHandshake(
         defer crypto.secureZero(u8, &temp_k);
         var rs: [DH_LEN]u8 = undefined;
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_ee);
+        var n: u64 = 0;
 
         const encrypted_rs_ct = encrypted_rs[0..DH_LEN];
         const encrypted_rs_tag = encrypted_rs[DH_LEN .. DH_LEN + TAG_LEN].*;
@@ -971,15 +694,12 @@ pub fn noiseXXHandshake(
             encrypted_rs_ct,
             encrypted_rs_tag,
             &h,
-            [_]u8{0} ** 12,
+            nextHandshakeNonce(&n),
             temp_k,
         );
 
         // Mix encrypted_rs into h
-        h_hash = crypto.hash.sha2.Sha256.init(.{});
-        h_hash.update(&h);
-        h_hash.update(encrypted_rs);
-        h_hash.final(&h);
+        mixHash(&h, encrypted_rs);
 
         // es - MixKey(dh_es): Updates ck and derives temp_k from DH output
         const dh_es = X25519.scalarmult(e_keypair.secret_key, rs) catch return error.DHFailed;
@@ -987,6 +707,7 @@ pub fn noiseXXHandshake(
 
         // Verify empty payload tag from msg2
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_es);
+        n = 0;
         const payload_tag_from_msg2 = msg2[DH_LEN + DH_LEN + TAG_LEN ..].*;
         var decrypted_payload: [0]u8 = undefined;
         try aeadDecrypt(
@@ -995,15 +716,15 @@ pub fn noiseXXHandshake(
             &[_]u8{},
             payload_tag_from_msg2,
             &h,
-            [_]u8{0} ** 12,
+            nextHandshakeNonce(&n),
             temp_k,
         );
-        // Note: For empty payloads, nothing is mixed into h after verification
+        mixHash(&h, &payload_tag_from_msg2);
 
         // -> s, se
         var msg3: [DH_LEN + TAG_LEN + TAG_LEN]u8 = undefined;
 
-        // Encrypt s (using temp_k from previous es operation)
+        // Encrypt s (same temp_k as the empty decrypt; n already incremented)
         var encrypted_s: [DH_LEN + TAG_LEN]u8 = undefined;
         aeadEncrypt(
             cipher_type,
@@ -1011,21 +732,19 @@ pub fn noiseXXHandshake(
             encrypted_s[DH_LEN..][0..TAG_LEN],
             &s_keypair.public_key,
             &h,
-            [_]u8{0} ** 12,
+            nextHandshakeNonce(&n),
             temp_k,
         );
         @memcpy(msg3[0 .. DH_LEN + TAG_LEN], &encrypted_s);
 
         // Mix encrypted_s into h
-        h_hash = crypto.hash.sha2.Sha256.init(.{});
-        h_hash.update(&h);
-        h_hash.update(&encrypted_s);
-        h_hash.final(&h);
+        mixHash(&h, &encrypted_s);
 
         // se - MixKey(dh_se): Updates ck and derives temp_k from DH output
         const dh_se = X25519.scalarmult(s_keypair.secret_key, re.*) catch return error.DHFailed;
         defer crypto.secureZero(u8, @constCast(&dh_se));
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_se);
+        n = 0;
 
         // Encrypt empty payload (using temp_k from se operation)
         var payload_tag: [TAG_LEN]u8 = undefined;
@@ -1035,9 +754,10 @@ pub fn noiseXXHandshake(
             &payload_tag,
             &[_]u8{},
             &h,
-            [_]u8{0} ** 12,
+            nextHandshakeNonce(&n),
             temp_k,
         );
+        mixHash(&h, &payload_tag);
         @memcpy(msg3[DH_LEN + TAG_LEN ..], &payload_tag);
 
         debugPrint("[NOISE] Initiator: sending msg3 ({} bytes)\n", .{msg3.len});
@@ -1103,6 +823,7 @@ pub fn noiseXXHandshake(
         var temp_k: [KEY_LEN]u8 = undefined;
         defer crypto.secureZero(u8, &temp_k);
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_ee);
+        var n: u64 = 0;
 
         // Encrypt s (using temp_k from ee operation)
         var encrypted_s: [DH_LEN + TAG_LEN]u8 = undefined;
@@ -1112,21 +833,19 @@ pub fn noiseXXHandshake(
             encrypted_s[DH_LEN..][0..TAG_LEN],
             &s_keypair.public_key,
             &h,
-            [_]u8{0} ** 12,
+            nextHandshakeNonce(&n),
             temp_k,
         );
         @memcpy(msg2[DH_LEN .. DH_LEN + DH_LEN + TAG_LEN], &encrypted_s);
 
         // Mix encrypted_s into h
-        h_hash = crypto.hash.sha2.Sha256.init(.{});
-        h_hash.update(&h);
-        h_hash.update(&encrypted_s);
-        h_hash.final(&h);
+        mixHash(&h, &encrypted_s);
 
         // es - MixKey(dh_es): Updates ck and derives temp_k from DH output
         const dh_es = X25519.scalarmult(s_keypair.secret_key, re) catch return error.DHFailed;
         defer crypto.secureZero(u8, @constCast(&dh_es));
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_es);
+        n = 0;
 
         // Encrypt empty payload (using temp_k from es operation)
         var payload_tag: [TAG_LEN]u8 = undefined;
@@ -1136,9 +855,10 @@ pub fn noiseXXHandshake(
             &payload_tag,
             &[_]u8{},
             &h,
-            [_]u8{0} ** 12,
+            nextHandshakeNonce(&n),
             temp_k,
         );
+        mixHash(&h, &payload_tag);
         @memcpy(msg2[DH_LEN + DH_LEN + TAG_LEN ..], &payload_tag);
 
         debugPrint("[NOISE] Responder: sending msg2 ({} bytes)\n", .{msg2.len});
@@ -1165,7 +885,7 @@ pub fn noiseXXHandshake(
             encrypted_rs_ct,
             encrypted_rs_tag,
             &h,
-            [_]u8{0} ** 12,
+            nextHandshakeNonce(&n),
             temp_k,
         ) catch |err| {
             debugPrint("[NOISE] Responder: static key decryption failed: {}\n", .{err});
@@ -1174,15 +894,13 @@ pub fn noiseXXHandshake(
         debugPrint("[NOISE] Responder: static key decrypted successfully\n", .{});
 
         // Mix encrypted_rs into h
-        h_hash = crypto.hash.sha2.Sha256.init(.{});
-        h_hash.update(&h);
-        h_hash.update(encrypted_rs);
-        h_hash.final(&h);
+        mixHash(&h, encrypted_rs);
 
         // se - MixKey(dh_se): Updates ck and derives temp_k from DH output
         const dh_se = X25519.scalarmult(e_keypair.secret_key, rs) catch return error.DHFailed;
         defer crypto.secureZero(u8, @constCast(&dh_se));
         hkdf2(&chaining_key, &temp_k, chaining_key, &dh_se);
+        n = 0;
 
         // Decrypt empty payload (verify tag using temp_k from se operation)
         const payload_tag2 = msg3[DH_LEN + TAG_LEN ..].*;
@@ -1193,9 +911,10 @@ pub fn noiseXXHandshake(
             &[_]u8{},
             payload_tag2,
             &h,
-            [_]u8{0} ** 12,
+            nextHandshakeNonce(&n),
             temp_k,
         );
+        mixHash(&h, &payload_tag2);
 
         // Split into transport keys (reversed for responder)
         var key1: [KEY_LEN]u8 = undefined;
@@ -1228,4 +947,32 @@ pub fn noiseXXHandshake(
 
         return result;
     }
+}
+
+test "handshake AEAD nonce is unique per op on a key" {
+    var key: [KEY_LEN]u8 = undefined;
+    @memset(&key, 0x11);
+    const ad = "handshake-hash-associated-data!";
+
+    var n: u64 = 0;
+    var tag0: [TAG_LEN]u8 = undefined;
+    var tag1: [TAG_LEN]u8 = undefined;
+    aeadEncrypt(.chacha20poly1305, &[_]u8{}, &tag0, &[_]u8{}, ad, nextHandshakeNonce(&n), key);
+    aeadEncrypt(.chacha20poly1305, &[_]u8{}, &tag1, &[_]u8{}, ad, nextHandshakeNonce(&n), key);
+    try std.testing.expectEqual(@as(u64, 2), n);
+    try std.testing.expect(!std.mem.eql(u8, &tag0, &tag1));
+
+    n = 0;
+    var aegis0: [TAG_LEN]u8 = undefined;
+    var aegis1: [TAG_LEN]u8 = undefined;
+    aeadEncrypt(.aegis128l, &[_]u8{}, &aegis0, &[_]u8{}, ad, nextHandshakeNonce(&n), key);
+    aeadEncrypt(.aegis128l, &[_]u8{}, &aegis1, &[_]u8{}, ad, nextHandshakeNonce(&n), key);
+    try std.testing.expect(!std.mem.eql(u8, &aegis0, &aegis1));
+
+    const n12 = TransportCipher.makeNonce12(1);
+    const n16 = padHandshakeNonce16(n12);
+    const n32 = padHandshakeNonce32(n12);
+    try std.testing.expect(std.mem.eql(u8, n16[0..12], &n12));
+    try std.testing.expect(std.mem.eql(u8, n32[0..12], &n12));
+    try std.testing.expect(!std.mem.eql(u8, n16[0..12], &([_]u8{0} ** 12)));
 }

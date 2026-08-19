@@ -32,6 +32,7 @@ pub const UdpForwarder = struct {
     /// reverse-direction send.  See transport/Channel.send_mutex for
     /// rationale.
     sessions_mutex: common.HotMutex,
+    last_prune_ns: std.atomic.Value(i64),
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -56,6 +57,7 @@ pub const UdpForwarder = struct {
             .timeout_ns = @as(i64, @intCast(timeout_seconds * std.time.ns_per_s)),
             .sessions = std.AutoHashMap(tunnel.StreamId, *Session).init(allocator),
             .sessions_mutex = .{},
+            .last_prune_ns = std.atomic.Value(i64).init(0),
         };
         return forwarder;
     }
@@ -66,7 +68,7 @@ pub const UdpForwarder = struct {
         }
 
         const now = @as(i64, @intCast(common.nanoTimestamp()));
-        self.pruneExpiredSessions(now);
+        self.maybePrune(now);
 
         const session = try self.ensureSession(udp_msg.stream_id, udp_msg.source_addr, udp_msg.source_port, now);
 
@@ -256,6 +258,15 @@ pub const UdpForwarder = struct {
         }
 
         forwarder.removeSession(session.stream_id, true);
+    }
+
+    const PRUNE_INTERVAL_NS: i64 = std.time.ns_per_s;
+
+    fn maybePrune(self: *UdpForwarder, now: i64) void {
+        const last = self.last_prune_ns.load(.monotonic);
+        if (last != 0 and now - last < PRUNE_INTERVAL_NS) return;
+        if (self.last_prune_ns.cmpxchgStrong(last, now, .monotonic, .monotonic) != null) return;
+        self.pruneExpiredSessions(now);
     }
 
     fn pruneExpiredSessions(self: *UdpForwarder, now: i64) void {

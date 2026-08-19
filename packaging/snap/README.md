@@ -15,10 +15,10 @@ sudo snap install floo
 ```bash
 # Build the snap
 cd packaging
-./build-snap.sh 0.1.2
+./build-snap.sh 0.3.0
 
 # Install
-sudo snap install snap/floo_0.1.2_amd64.snap --dangerous
+sudo snap install snap/floo_0.3.0_amd64.snap --dangerous
 ```
 
 ## Usage
@@ -44,7 +44,7 @@ Example configs are located at:
 
 Copy them to your home directory:
 ```bash
-cp /snap/floo/current/share/doc/floo/examples/*.toml.example ~/
+cp /snap/floo/current/share/doc/floo/examples/*.toml ~/
 ```
 
 ### Running as a Service (Server)
@@ -127,10 +127,10 @@ This creates `floo_VERSION_ARCH.snap` in the packaging/snap directory.
 cd packaging/snap
 
 # Upload and release to stable channel
-snapcraft upload floo_0.1.2_amd64.snap --release=stable
+snapcraft upload floo_0.3.0_amd64.snap --release=stable
 
 # Or upload to edge for testing first
-snapcraft upload floo_0.1.2_amd64.snap --release=edge
+snapcraft upload floo_0.3.0_amd64.snap --release=edge
 ```
 
 ### Automated Publishing

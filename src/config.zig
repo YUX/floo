@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const tunnel = @import("tunnel.zig");
+const common = @import("common.zig");
 
 // Simple defaults that users can understand
 pub const DEFAULT_PSK = "change-me-psk";
@@ -79,6 +80,7 @@ pub const ServerConfig = struct {
     // Part 2: Services to expose
     services: std.StringHashMap(Service),
     reverse_services: std.StringHashMap(Service),
+    service_by_id: std.AutoHashMap(tunnel.ServiceId, *Service),
 
     // Part 3: Advanced settings (optional)
     advanced: AdvancedSettings,
@@ -89,6 +91,8 @@ pub const ServerConfig = struct {
 
         var reverse_services = std.StringHashMap(Service).init(allocator);
         errdefer reverse_services.deinit();
+        var service_by_id = std.AutoHashMap(tunnel.ServiceId, *Service).init(allocator);
+        errdefer service_by_id.deinit();
 
         const bind = try dupString(allocator, "0.0.0.0");
         errdefer allocator.free(bind);
@@ -113,6 +117,7 @@ pub const ServerConfig = struct {
             .token = token,
             .services = services,
             .reverse_services = reverse_services,
+            .service_by_id = service_by_id,
             .advanced = advanced,
         };
     }
@@ -129,6 +134,7 @@ pub const ServerConfig = struct {
             service.deinit(self.allocator);
         }
         self.reverse_services.deinit();
+        self.service_by_id.deinit();
 
         self.allocator.free(self.bind);
         self.allocator.free(self.cipher);
@@ -157,11 +163,7 @@ pub const ServerConfig = struct {
             return error.WeakPSK;
         }
 
-        // Validate heartbeat configuration
-        if (self.advanced.heartbeat_timeout_seconds <= self.advanced.heartbeat_interval_seconds) {
-            std.debug.print("[CONFIG] Error: heartbeat_timeout ({}) must be greater than heartbeat_interval ({})\n", .{ self.advanced.heartbeat_timeout_seconds, self.advanced.heartbeat_interval_seconds });
-            return error.InvalidHeartbeatConfig;
-        }
+        try validateHeartbeat(&self.advanced);
 
         // Validate services
         if (self.services.count() == 0 and self.reverse_services.count() == 0) {
@@ -180,12 +182,8 @@ pub const ServerConfig = struct {
         const cwd = Io.Dir.cwd();
         const content = cwd.readFileAlloc(io, path, allocator, @enumFromInt(1024 * 1024)) catch |err| {
             if (err == error.FileNotFound) {
-                std.debug.print("[CONFIG] File not found: {s}. Create it using examples/ templates.\n", .{path});
-                var cfg = try ServerConfig.init(allocator);
-                errdefer cfg.deinit();
-                try cfg.validate();
-                try validateSecurity(&cfg);
-                return cfg;
+                std.debug.print("[CONFIG] File not found: {s}. Create it using examples/ or configs/ templates.\n", .{path});
+                return error.FileNotFound;
             }
             return err;
         };
@@ -265,7 +263,7 @@ pub const ServerConfig = struct {
                     var service = try parseServiceDefinition(allocator, key, value);
 
                     // Generate ID from name hash and ensure uniqueness
-                    service.id = generateServiceId(service.name);
+                    service.id = try generateServiceId(service.name);
                     try registerServiceId(&used_service_ids, service.id, service.name);
 
                     // Use default token if not specified
@@ -285,7 +283,7 @@ pub const ServerConfig = struct {
                     var service = try parseServiceDefinition(allocator, key, value);
 
                     // Generate ID from name hash and ensure uniqueness
-                    service.id = generateServiceId(service.name);
+                    service.id = try generateServiceId(service.name);
                     try registerServiceId(&used_service_ids, service.id, service.name);
 
                     // Use default token if not specified
@@ -298,29 +296,7 @@ pub const ServerConfig = struct {
                 },
 
                 .advanced => {
-                    if (std.mem.eql(u8, key, "socket_buffer_size")) {
-                        config.advanced.socket_buffer_size = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "udp_timeout_seconds")) {
-                        config.advanced.udp_timeout_seconds = try parseAdvancedInt(u64, key, value);
-                    } else if (std.mem.eql(u8, key, "io_batch_bytes")) {
-                        config.advanced.io_batch_bytes = try parseAdvancedInt(usize, key, value);
-                    } else if (std.mem.eql(u8, key, "pin_threads")) {
-                        config.advanced.pin_threads = try parseAdvancedBool(key, value);
-                    } else if (std.mem.eql(u8, key, "tcp_nodelay")) {
-                        config.advanced.tcp_nodelay = try parseAdvancedBool(key, value);
-                    } else if (std.mem.eql(u8, key, "tcp_keepalive")) {
-                        config.advanced.tcp_keepalive = try parseAdvancedBool(key, value);
-                    } else if (std.mem.eql(u8, key, "tcp_keepalive_idle")) {
-                        config.advanced.tcp_keepalive_idle = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "tcp_keepalive_interval")) {
-                        config.advanced.tcp_keepalive_interval = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "tcp_keepalive_count")) {
-                        config.advanced.tcp_keepalive_count = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "heartbeat_interval_seconds")) {
-                        config.advanced.heartbeat_interval_seconds = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "heartbeat_timeout_seconds")) {
-                        config.advanced.heartbeat_timeout_seconds = try parseAdvancedInt(u32, key, value);
-                    }
+                    _ = try applyAdvancedKey(allocator, &config.advanced, key, value, .server);
                 },
             }
         }
@@ -331,16 +307,13 @@ pub const ServerConfig = struct {
         }
 
         try validateSecurity(&config);
+        try indexServices(&config);
 
         return config;
     }
 
     pub fn getServiceById(self: *const ServerConfig, id: tunnel.ServiceId) ?*const Service {
-        var iter = self.services.valueIterator();
-        while (iter.next()) |service| {
-            if (service.id == id) return service;
-        }
-        return null;
+        return self.service_by_id.get(id);
     }
 
     pub fn getServiceByName(self: *const ServerConfig, name: []const u8) ?*const Service {
@@ -362,6 +335,7 @@ pub const ClientConfig = struct {
     services: std.StringHashMap(Service),
     default_service: ?[]const u8, // Default service when single mode
     reverse_services: std.StringHashMap(Service),
+    service_by_id: std.AutoHashMap(tunnel.ServiceId, *Service),
 
     // Part 3: Advanced settings (optional)
     advanced: AdvancedSettings,
@@ -372,6 +346,8 @@ pub const ClientConfig = struct {
 
         var reverse_services = std.StringHashMap(Service).init(allocator);
         errdefer reverse_services.deinit();
+        var service_by_id = std.AutoHashMap(tunnel.ServiceId, *Service).init(allocator);
+        errdefer service_by_id.deinit();
 
         const server = try dupString(allocator, "localhost:8443");
         errdefer allocator.free(server);
@@ -396,6 +372,7 @@ pub const ClientConfig = struct {
             .services = services,
             .default_service = null,
             .reverse_services = reverse_services,
+            .service_by_id = service_by_id,
             .advanced = advanced,
         };
     }
@@ -412,6 +389,7 @@ pub const ClientConfig = struct {
             service.deinit(self.allocator);
         }
         self.reverse_services.deinit();
+        self.service_by_id.deinit();
 
         self.allocator.free(self.server);
         self.allocator.free(self.cipher);
@@ -474,6 +452,8 @@ pub const ClientConfig = struct {
             }
         }
 
+        try validateHeartbeat(&self.advanced);
+
         if (self.advanced.io_batch_bytes < 4096) {
             std.debug.print("[CONFIG] Error: io_batch_bytes must be at least 4096\n", .{});
             return error.InvalidBatchSize;
@@ -486,12 +466,8 @@ pub const ClientConfig = struct {
         const cwd = Io.Dir.cwd();
         const content = cwd.readFileAlloc(io, path, allocator, @enumFromInt(1024 * 1024)) catch |err| {
             if (err == error.FileNotFound) {
-                std.debug.print("[CONFIG] File not found: {s}. Create it using examples/ templates.\n", .{path});
-                var cfg = try ClientConfig.init(allocator);
-                errdefer cfg.deinit();
-                try cfg.validate();
-                try validateSecurity(&cfg);
-                return cfg;
+                std.debug.print("[CONFIG] File not found: {s}. Create it using examples/ or configs/ templates.\n", .{path});
+                return error.FileNotFound;
             }
             return err;
         };
@@ -575,7 +551,7 @@ pub const ClientConfig = struct {
                     var service = try parseClientServiceDefinition(allocator, key, value);
 
                     // Generate ID from name hash (must match server) and ensure uniqueness
-                    service.id = generateServiceId(service.name);
+                    service.id = try generateServiceId(service.name);
                     try registerServiceId(&used_service_ids, service.id, service.name);
 
                     // Use default token if not specified
@@ -600,7 +576,7 @@ pub const ClientConfig = struct {
                     var service = try parseClientServiceDefinition(allocator, key, value);
 
                     // Generate ID from name hash (must match server) and ensure uniqueness
-                    service.id = generateServiceId(service.name);
+                    service.id = try generateServiceId(service.name);
                     try registerServiceId(&used_service_ids, service.id, service.name);
 
                     // Use default token if not specified
@@ -613,81 +589,31 @@ pub const ClientConfig = struct {
                 },
 
                 .advanced => {
-                    if (std.mem.eql(u8, key, "socket_buffer_size")) {
-                        config.advanced.socket_buffer_size = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "udp_timeout_seconds")) {
-                        config.advanced.udp_timeout_seconds = try parseAdvancedInt(u64, key, value);
-                    } else if (std.mem.eql(u8, key, "io_batch_bytes")) {
-                        config.advanced.io_batch_bytes = try parseAdvancedInt(usize, key, value);
-                    } else if (std.mem.eql(u8, key, "pin_threads")) {
-                        config.advanced.pin_threads = try parseAdvancedBool(key, value);
-                    } else if (std.mem.eql(u8, key, "tcp_nodelay")) {
-                        config.advanced.tcp_nodelay = try parseAdvancedBool(key, value);
-                    } else if (std.mem.eql(u8, key, "tcp_keepalive")) {
-                        config.advanced.tcp_keepalive = try parseAdvancedBool(key, value);
-                    } else if (std.mem.eql(u8, key, "tcp_keepalive_idle")) {
-                        config.advanced.tcp_keepalive_idle = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "tcp_keepalive_interval")) {
-                        config.advanced.tcp_keepalive_interval = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "tcp_keepalive_count")) {
-                        config.advanced.tcp_keepalive_count = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "heartbeat_interval_seconds")) {
-                        // Server heartbeat sender uses this; client carries it for
-                        // symmetry / round-trip when configs are diff'd (B-11).
-                        config.advanced.heartbeat_interval_seconds = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "heartbeat_timeout_seconds")) {
-                        config.advanced.heartbeat_timeout_seconds = try parseAdvancedInt(u32, key, value);
-                    } else if (std.mem.eql(u8, key, "num_tunnels")) {
-                        config.advanced.num_tunnels = try parseAdvancedInt(usize, key, value);
-                    } else if (std.mem.eql(u8, key, "reconnect_enabled")) {
-                        config.advanced.reconnect_enabled = try parseAdvancedBool(key, value);
-                    } else if (std.mem.eql(u8, key, "reconnect_initial_delay_ms")) {
-                        config.advanced.reconnect_initial_delay_ms = try parseAdvancedInt(u64, key, value);
-                    } else if (std.mem.eql(u8, key, "reconnect_max_delay_ms")) {
-                        config.advanced.reconnect_max_delay_ms = try parseAdvancedInt(u64, key, value);
-                    } else if (std.mem.eql(u8, key, "reconnect_backoff_multiplier")) {
-                        config.advanced.reconnect_backoff_multiplier = try parseAdvancedInt(u64, key, value);
-                    } else if (std.mem.eql(u8, key, "proxy_url")) {
-                        allocator.free(config.advanced.proxy_url);
-                        config.advanced.proxy_url = try dupString(allocator, value);
-                    }
+                    _ = try applyAdvancedKey(allocator, &config.advanced, key, value, .client);
                 },
             }
         }
 
         try validateSecurity(&config);
+        try indexServices(&config);
 
         return config;
     }
 
     pub fn getServiceById(self: *const ClientConfig, id: tunnel.ServiceId) ?*const Service {
-        var iter = self.services.valueIterator();
-        while (iter.next()) |service| {
-            if (service.id == id) return service;
-        }
-        return null;
+        return self.service_by_id.get(id);
     }
 
     pub fn getServiceByName(self: *const ClientConfig, name: []const u8) ?*const Service {
         return self.services.getPtr(name);
     }
 
-    // Parse server address:port
     pub fn getServerHost(self: *const ClientConfig) ![]const u8 {
-        const colon_pos = std.mem.lastIndexOfScalar(u8, self.server, ':');
-        if (colon_pos) |pos| {
-            return self.server[0..pos];
-        }
-        return self.server;
+        return (try common.parseHostPort(self.server)).host;
     }
 
     pub fn getServerPort(self: *const ClientConfig) !u16 {
-        const colon_pos = std.mem.lastIndexOfScalar(u8, self.server, ':');
-        if (colon_pos) |pos| {
-            const port_str = self.server[pos + 1 ..];
-            return std.fmt.parseInt(u16, port_str, 10) catch DEFAULT_PORT;
-        }
-        return DEFAULT_PORT;
+        return (try common.parseHostPort(self.server)).port;
     }
 };
 
@@ -747,6 +673,54 @@ fn parseAdvancedInt(comptime T: type, key: []const u8, value: []const u8) !T {
     };
 }
 
+fn applyAdvancedKey(
+    allocator: std.mem.Allocator,
+    advanced: *AdvancedSettings,
+    key: []const u8,
+    value: []const u8,
+    role: enum { server, client },
+) !bool {
+    if (std.mem.eql(u8, key, "socket_buffer_size")) {
+        advanced.socket_buffer_size = try parseAdvancedInt(u32, key, value);
+    } else if (std.mem.eql(u8, key, "udp_timeout_seconds")) {
+        advanced.udp_timeout_seconds = try parseAdvancedInt(u64, key, value);
+    } else if (std.mem.eql(u8, key, "io_batch_bytes")) {
+        advanced.io_batch_bytes = try parseAdvancedInt(usize, key, value);
+    } else if (std.mem.eql(u8, key, "pin_threads")) {
+        advanced.pin_threads = try parseAdvancedBool(key, value);
+    } else if (std.mem.eql(u8, key, "tcp_nodelay")) {
+        advanced.tcp_nodelay = try parseAdvancedBool(key, value);
+    } else if (std.mem.eql(u8, key, "tcp_keepalive")) {
+        advanced.tcp_keepalive = try parseAdvancedBool(key, value);
+    } else if (std.mem.eql(u8, key, "tcp_keepalive_idle")) {
+        advanced.tcp_keepalive_idle = try parseAdvancedInt(u32, key, value);
+    } else if (std.mem.eql(u8, key, "tcp_keepalive_interval")) {
+        advanced.tcp_keepalive_interval = try parseAdvancedInt(u32, key, value);
+    } else if (std.mem.eql(u8, key, "tcp_keepalive_count")) {
+        advanced.tcp_keepalive_count = try parseAdvancedInt(u32, key, value);
+    } else if (std.mem.eql(u8, key, "heartbeat_interval_seconds")) {
+        advanced.heartbeat_interval_seconds = try parseAdvancedInt(u32, key, value);
+    } else if (std.mem.eql(u8, key, "heartbeat_timeout_seconds")) {
+        advanced.heartbeat_timeout_seconds = try parseAdvancedInt(u32, key, value);
+    } else if (role == .client and std.mem.eql(u8, key, "num_tunnels")) {
+        advanced.num_tunnels = try parseAdvancedInt(usize, key, value);
+    } else if (role == .client and std.mem.eql(u8, key, "reconnect_enabled")) {
+        advanced.reconnect_enabled = try parseAdvancedBool(key, value);
+    } else if (role == .client and std.mem.eql(u8, key, "reconnect_initial_delay_ms")) {
+        advanced.reconnect_initial_delay_ms = try parseAdvancedInt(u64, key, value);
+    } else if (role == .client and std.mem.eql(u8, key, "reconnect_max_delay_ms")) {
+        advanced.reconnect_max_delay_ms = try parseAdvancedInt(u64, key, value);
+    } else if (role == .client and std.mem.eql(u8, key, "reconnect_backoff_multiplier")) {
+        advanced.reconnect_backoff_multiplier = try parseAdvancedInt(u64, key, value);
+    } else if (role == .client and std.mem.eql(u8, key, "proxy_url")) {
+        allocator.free(advanced.proxy_url);
+        advanced.proxy_url = try dupString(allocator, value);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 fn parseAdvancedBool(key: []const u8, value: []const u8) !bool {
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
@@ -791,15 +765,30 @@ pub fn canonicalCipher(config: anytype) []const u8 {
 }
 
 // Generate service ID from name using cryptographic hash to prevent collisions
-fn generateServiceId(name: []const u8) tunnel.ServiceId {
+fn generateServiceId(name: []const u8) !tunnel.ServiceId {
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update(name);
     var hash: [32]u8 = undefined;
     hasher.final(&hash);
 
-    // Use first 2 bytes of hash, ensure non-zero
-    const id = std.mem.readInt(u16, hash[0..2], .little);
-    return if (id == 0) 1 else id;
+    const id = std.mem.readInt(u32, hash[0..4], .little);
+    if (id == 0) {
+        std.debug.print("[CONFIG] Error: service '{s}' hashed to reserved id 0\n", .{name});
+        return error.InvalidServiceId;
+    }
+    return id;
+}
+
+fn indexServices(config: anytype) !void {
+    config.service_by_id.clearRetainingCapacity();
+    var iter = config.services.iterator();
+    while (iter.next()) |entry| {
+        try config.service_by_id.put(entry.value_ptr.id, entry.value_ptr);
+    }
+    var rev = config.reverse_services.iterator();
+    while (rev.next()) |entry| {
+        try config.service_by_id.put(entry.value_ptr.id, entry.value_ptr);
+    }
 }
 
 fn registerServiceId(
@@ -837,17 +826,12 @@ fn parseServiceDefinition(allocator: std.mem.Allocator, name: []const u8, value:
         addr_port = value[0..slash_pos];
     }
 
-    // Parse address:port
-    const colon_pos = std.mem.lastIndexOfScalar(u8, addr_port, ':') orelse {
+    const parsed = common.parseHostPort(addr_port) catch {
+        std.debug.print("[CONFIG] Invalid address:port '{s}' for service '{s}'\n", .{ addr_port, name });
         return error.InvalidServiceDefinition;
     };
-
-    const address = addr_port[0..colon_pos];
-    const port_str = addr_port[colon_pos + 1 ..];
-    const port = std.fmt.parseInt(u16, port_str, 10) catch |err| {
-        std.debug.print("[DEBUG] Failed to parse port '{s}' from service '{s}': {}\n", .{ port_str, name, err });
-        return error.InvalidPort;
-    };
+    const address = parsed.host;
+    const port = parsed.port;
 
     // Audit B-15: build dupes step-by-step with errdefer so a late OOM
     // doesn't leak earlier dupes. The previous struct-literal `try` chain
@@ -973,6 +957,20 @@ fn isLowEntropyCredential(value: []const u8) bool {
     return distinct < 8;
 }
 
+fn validateHeartbeat(advanced: *const AdvancedSettings) !void {
+    if (advanced.heartbeat_interval_seconds == 0) {
+        std.debug.print("[CONFIG] Error: heartbeat_interval_seconds must be greater than 0\n", .{});
+        return error.InvalidHeartbeatConfig;
+    }
+    if (advanced.heartbeat_timeout_seconds <= advanced.heartbeat_interval_seconds) {
+        std.debug.print("[CONFIG] Error: heartbeat_timeout ({}) must be greater than heartbeat_interval ({})\n", .{
+            advanced.heartbeat_timeout_seconds,
+            advanced.heartbeat_interval_seconds,
+        });
+        return error.InvalidHeartbeatConfig;
+    }
+}
+
 fn validateSecurity(config: anytype) !void {
     const canonical = canonicalizeCipher(config.cipher) orelse return error.InvalidCipher;
     const encryption_enabled = !std.mem.eql(u8, canonical, "none");
@@ -1035,108 +1033,20 @@ fn validateSecurity(config: anytype) !void {
             break;
         }
     }
+    if (!needs_token) {
+        var rev = config.reverse_services.valueIterator();
+        while (rev.next()) |service| {
+            if (service.token.len == 0) {
+                needs_token = true;
+                break;
+            }
+        }
+    }
 
     if (needs_token and config.token.len == 0) {
         return error.MissingToken;
     }
 }
-
-// Compatibility layer for existing code
-// These structures map old config to new simplified format
-
-pub const ServerCore = struct {
-    host: []const u8,
-    port: u16,
-    transport: Transport,
-};
-
-pub const TunnelSettings = struct {
-    cipher: []const u8,
-    psk: []const u8,
-    default_token: []const u8,
-};
-
-pub const TcpSettings = struct {
-    nodelay: bool,
-    keepalive: bool,
-    keepalive_idle: u32,
-    keepalive_interval: u32,
-    keepalive_count: u32,
-};
-
-pub const ServerTuning = struct {
-    udp_timeout_seconds: u64,
-    socket_buffer_size: u32,
-    tcp: TcpSettings,
-    heartbeat_interval_seconds: u32,
-};
-
-pub const ClientCore = struct {
-    local_host: []const u8,
-    local_port: u16,
-    remote_host: []const u8,
-    remote_port: u16,
-    service_id: tunnel.ServiceId,
-    transport: Transport,
-};
-
-pub const ClientTuning = struct {
-    udp_timeout_seconds: u64,
-    num_tunnels: usize,
-    socket_buffer_size: u32,
-    tcp: TcpSettings,
-    heartbeat_timeout_seconds: u32,
-};
-
-pub const ClientReconnect = struct {
-    enabled: bool,
-    initial_delay_ms: u64,
-    max_delay_ms: u64,
-    backoff_multiplier: u64,
-};
-
-// Compatibility wrappers for old-style configs
-pub const ServerServiceConfig = struct {
-    name: []const u8,
-    service_id: tunnel.ServiceId,
-    transport: Transport,
-    mode: ServiceMode,
-    target_host: []const u8,
-    target_port: u16,
-    local_port: u16,
-    token: []const u8,
-
-    fn deinit(self: *ServerServiceConfig, allocator: std.mem.Allocator) void {
-        _ = self;
-        _ = allocator;
-    }
-};
-
-pub const ClientServiceConfig = struct {
-    name: []const u8,
-    service_id: tunnel.ServiceId,
-    transport: Transport,
-    mode: ServiceMode,
-    local_host: []const u8,
-    local_port: u16,
-    token: []const u8,
-
-    fn deinit(self: *ClientServiceConfig, allocator: std.mem.Allocator) void {
-        _ = self;
-        _ = allocator;
-    }
-};
-
-pub const ServiceMode = enum {
-    forward,
-    reverse,
-
-    pub fn fromString(value: []const u8) ?ServiceMode {
-        if (std.mem.eql(u8, value, "forward")) return .forward;
-        if (std.mem.eql(u8, value, "reverse")) return .reverse;
-        return null;
-    }
-};
 
 // Tests
 
@@ -1195,14 +1105,40 @@ test "parse simplified client config" {
 }
 
 test "service ID generation is consistent" {
-    const id1 = generateServiceId("web");
-    const id2 = generateServiceId("web");
-    const id3 = generateServiceId("database");
+    const id1 = try generateServiceId("web");
+    const id2 = try generateServiceId("web");
+    const id3 = try generateServiceId("database");
 
     try std.testing.expectEqual(id1, id2);
     try std.testing.expect(id1 != id3);
     try std.testing.expect(id1 > 0);
     try std.testing.expect(id3 > 0);
+}
+
+test "service definition parses bracketed IPv6" {
+    const allocator = std.testing.allocator;
+    var service = try parseServiceDefinition(allocator, "v6", "[::1]:8080");
+    defer service.deinit(allocator);
+    try std.testing.expectEqualStrings("::1", service.address);
+    try std.testing.expectEqual(@as(u16, 8080), service.port);
+}
+
+test "getServiceById covers reverse_services" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\[tunnel]
+        \\port = 8443
+        \\psk = "my-secret-key-123456"
+        \\token = "my-auth-token"
+        \\
+        \\[reverse_services]
+        \\media = "0.0.0.0:8096"
+    ;
+    var cfg = try ServerConfig.parseServerConfig(allocator, content);
+    defer cfg.deinit();
+    const media = cfg.reverse_services.get("media").?;
+    try std.testing.expect(cfg.getServiceById(media.id) != null);
+    try std.testing.expectEqualStrings("media", cfg.getServiceById(media.id).?.name);
 }
 
 test "canonicalize cipher names is case-insensitive" {
@@ -1272,4 +1208,23 @@ test "validateSecurity rejects low-entropy PSK" {
     cfg.allocator.free(cfg.token);
     cfg.token = try dupString(cfg.allocator, "a-real-token-that-passes-checks");
     try std.testing.expectError(error.WeakPSK, validateSecurity(&cfg));
+}
+
+test "validateHeartbeat rejects interval 0 and timeout <= interval" {
+    var ok = AdvancedSettings{};
+    try validateHeartbeat(&ok);
+
+    var zero = AdvancedSettings{};
+    zero.heartbeat_interval_seconds = 0;
+    try std.testing.expectError(error.InvalidHeartbeatConfig, validateHeartbeat(&zero));
+
+    var inverted = AdvancedSettings{};
+    inverted.heartbeat_interval_seconds = 40;
+    inverted.heartbeat_timeout_seconds = 30;
+    try std.testing.expectError(error.InvalidHeartbeatConfig, validateHeartbeat(&inverted));
+
+    var equal = AdvancedSettings{};
+    equal.heartbeat_interval_seconds = 30;
+    equal.heartbeat_timeout_seconds = 30;
+    try std.testing.expectError(error.InvalidHeartbeatConfig, validateHeartbeat(&equal));
 }

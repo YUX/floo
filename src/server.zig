@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const posix = std.posix;
 const Io = std.Io;
 const build_options = @import("build_options");
@@ -11,12 +10,16 @@ const udp_server = @import("udp_server.zig");
 const diagnostics = @import("diagnostics.zig");
 const common = @import("common.zig");
 const transport = @import("transport/channel.zig");
+const stream_table = @import("runtime/stream_table.zig");
+const poll_loop = @import("runtime/poll_loop.zig");
+const tcp_forward = @import("runtime/tcp_forward.zig");
 
 const tracePrint = common.tracePrint;
 const tcpOptionsFromSettings = common.tcpOptionsFromSettings;
 const tuneSocketBuffers = common.tuneSocketBuffers;
 const applyTcpOptions = common.applyTcpOptions;
 const formatAddress = common.formatAddress;
+const StreamKey = stream_table.StreamKey;
 
 const CheckStatus = diagnostics.CheckStatus;
 
@@ -26,78 +29,11 @@ const enable_tunnel_trace = false;
 
 var global_allocator: std.mem.Allocator = undefined;
 var global_io: std.Io = undefined;
-var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var config_path_global: []const u8 = undefined; // Store config path for reload
 var encrypt_total_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var encrypt_calls: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var tunnel_tx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var tunnel_rx_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-var flush_stats_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-/// Per-process gate for the encryption time profile.  Resolved on first
-/// read into module-scope statics so we don't hit `getenv` per
-/// Channel.init.  Set `FLOO_PROFILE_ENCRYPT=1` in the environment to
-/// opt in.
-var encrypt_profile_checked: std.atomic.Value(bool) = .init(false);
-var encrypt_profile_value: bool = false;
-
-fn encrypt_profile_enabled() bool {
-    if (!encrypt_profile_checked.load(.acquire)) {
-        const cstr = std.c.getenv("FLOO_PROFILE_ENCRYPT");
-        encrypt_profile_value = if (cstr) |c| (c[0] != 0 and c[0] != '0') else false;
-        encrypt_profile_checked.store(true, .release);
-        std.debug.print("[PROFILE] encrypt-time profile {s}\n", .{if (encrypt_profile_value) "ENABLED via FLOO_PROFILE_ENCRYPT" else "disabled (set FLOO_PROFILE_ENCRYPT=1 to enable)"});
-    }
-    return encrypt_profile_value;
-}
-var sighup_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-var cpu_assigner: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
-var cached_cpu_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
-
-// Signal-pipe stubs (kept as no-ops so call sites in main don't have to gate).
-// Zig 0.16 removed posix.pipe2; the self-pipe optimization is gone. Signals
-// now just set atomic flags that the next 1s poll iteration picks up.
-fn setupSignalPipe() !void {}
-fn cleanupSignalPipe() void {}
-fn drainSignalPipe() void {}
-fn notifySignalPipe(sig: c_int) void {
-    _ = sig;
-}
-
-fn cpuCountCached() usize {
-    const cached = cached_cpu_count.load(.acquire);
-    if (cached != 0) return cached;
-    const detected = std.Thread.getCpuCount() catch 1;
-    cached_cpu_count.store(detected, .release);
-    return detected;
-}
-
-fn nextCpuIndex() usize {
-    const count = cpuCountCached();
-    const idx = cpu_assigner.fetchAdd(1, .acq_rel);
-    return idx % @max(count, 1);
-}
-
-fn applyThreadAffinity(index_opt: ?usize) void {
-    if (index_opt == null) return;
-    if (builtin.target.os.tag == .linux) {
-        setThreadAffinityLinux(index_opt.?);
-    }
-}
-
-fn setThreadAffinityLinux(cpu_index: usize) void {
-    if (builtin.target.os.tag != .linux) return;
-    const linux = std.os.linux;
-    // cpu_set_t is an array of ulongs, zero it manually since CPU_ZERO macro not available
-    var mask: linux.cpu_set_t = [_]c_ulong{0} ** 16;
-    // Set the bit for this CPU (cpu_set_t is bit array)
-    const limited = cpu_index % (16 * @bitSizeOf(c_ulong));
-    const word_idx = limited / @bitSizeOf(c_ulong);
-    const bit_idx = limited % @bitSizeOf(c_ulong);
-    mask[word_idx] |= @as(c_ulong, 1) << @intCast(bit_idx);
-    // sched_setaffinity in Zig takes (pid, mask_ptr) - size is implicit
-    _ = linux.sched_setaffinity(0, &mask) catch {};
-}
 
 const CliMode = enum { run, help, version, doctor, ping };
 
@@ -210,8 +146,8 @@ fn runServerPing(allocator: std.mem.Allocator, opts: *CliOptions) !bool {
 
     std.debug.print("Probing configured services...\n", .{});
     var had_fail = false;
-    var service_iter = cfg.services.valueIterator();
     var service_count: usize = 0;
+    var service_iter = cfg.services.valueIterator();
     while (service_iter.next()) |service| {
         service_count += 1;
         if (service.transport == .tcp) {
@@ -255,8 +191,30 @@ fn runServerPing(allocator: std.mem.Allocator, opts: *CliOptions) !bool {
         }
     }
 
+    var rev_iter = cfg.reverse_services.valueIterator();
+    while (rev_iter.next()) |service| {
+        service_count += 1;
+        _ = common.resolveHostPort(global_io, service.address, service.port) catch |err| {
+            diagnostics.reportCheck(.fail, "Reverse service '{s}' ({}) listen target {s}:{d} not resolvable: {}", .{
+                service.name,
+                service.id,
+                service.address,
+                service.port,
+                err,
+            });
+            had_fail = true;
+            continue;
+        };
+        diagnostics.reportCheck(.ok, "Reverse service '{s}' ({}) listen target {s}:{d} resolves", .{
+            service.name,
+            service.id,
+            service.address,
+            service.port,
+        });
+    }
+
     if (service_count == 0) {
-        diagnostics.reportCheck(.warn, "No services configured; nothing to probe", .{});
+        diagnostics.reportCheck(.warn, "No services or reverse_services configured; nothing to probe", .{});
     }
 
     return !had_fail;
@@ -272,7 +230,7 @@ fn runServerDoctor(allocator: std.mem.Allocator, opts: *CliOptions) !bool {
     if (config_exists) {
         diagnostics.reportCheck(.ok, "Config file accessible at {s}", .{opts.config_path});
     } else {
-        diagnostics.reportCheck(.warn, "Config file {s} not found; defaults will be used", .{opts.config_path});
+        diagnostics.reportCheck(.fail, "Config file {s} not found", .{opts.config_path});
     }
 
     var cfg = loadServerConfigWithOverrides(allocator, opts) catch |err| {
@@ -282,12 +240,12 @@ fn runServerDoctor(allocator: std.mem.Allocator, opts: *CliOptions) !bool {
     defer cfg.deinit();
 
     var had_fail = false;
-    diagnostics.reportCheck(.ok, "Configuration parsed (services: {})", .{cfg.services.count()});
+    diagnostics.reportCheck(.ok, "Configuration parsed (services: {}, reverse_services: {})", .{ cfg.services.count(), cfg.reverse_services.count() });
     diagnostics.reportCheck(.ok, "Server version: {s}", .{build_options.version});
 
     const canonical_cipher = config.canonicalCipher(&cfg);
     if (std.mem.eql(u8, canonical_cipher, "none")) {
-        diagnostics.reportCheck(.warn, "Encryption disabled; relying solely on tokens", .{});
+        diagnostics.reportCheck(.warn, "Encryption disabled (cipher=none); PSK still required for mutual authentication", .{});
     } else if (cfg.psk.len == 0) {
         diagnostics.reportCheck(.fail, "PSK is empty; clients cannot authenticate", .{});
         had_fail = true;
@@ -303,7 +261,16 @@ fn runServerDoctor(allocator: std.mem.Allocator, opts: *CliOptions) !bool {
             break;
         }
     }
-    if ((require_default_token or cfg.services.count() == 0) and cfg.token.len == 0) {
+    if (!require_default_token) {
+        var rev_tok = cfg.reverse_services.valueIterator();
+        while (rev_tok.next()) |service| {
+            if (service.token.len == 0) {
+                require_default_token = true;
+                break;
+            }
+        }
+    }
+    if ((require_default_token or (cfg.services.count() == 0 and cfg.reverse_services.count() == 0)) and cfg.token.len == 0) {
         diagnostics.reportCheck(.warn, "Default token is empty; unauthenticated clients may connect", .{});
     } else if (cfg.token.len > 0 and std.mem.eql(u8, cfg.token, config.DEFAULT_TOKEN)) {
         diagnostics.reportCheck(.warn, "Default token uses placeholder value; update to a secret", .{});
@@ -341,36 +308,6 @@ fn runServerDoctor(allocator: std.mem.Allocator, opts: *CliOptions) !bool {
         std.debug.print("\nDiagnostics complete.\n", .{});
     }
     return !had_fail;
-}
-/// Composite key for routing streams in multi-service mode
-const StreamKey = struct {
-    service_id: tunnel.ServiceId,
-    stream_id: tunnel.StreamId,
-};
-
-const StreamKeyContext = struct {
-    pub fn hash(_: StreamKeyContext, key: StreamKey) u64 {
-        // Fast hash: combine service_id (16 bits) and stream_id (32 bits) into u64
-        // This is much faster than Wyhash for such small keys
-        return (@as(u64, key.service_id) << 32) | @as(u64, key.stream_id);
-    }
-
-    pub fn eql(_: StreamKeyContext, a: StreamKey, b: StreamKey) bool {
-        return a.service_id == b.service_id and a.stream_id == b.stream_id;
-    }
-};
-
-fn handleSignal(sig: posix.SIG) callconv(.c) void {
-    if (sig == posix.SIG.INT or sig == posix.SIG.TERM) {
-        shutdown_flag.store(true, .release);
-    } else if (@hasDecl(posix.SIG, "HUP") and sig == posix.SIG.HUP) {
-        sighup_requested.store(true, .release);
-    } else if (@hasDecl(posix.SIG, "USR1") and sig == posix.SIG.USR1) {
-        flush_stats_requested.store(true, .release);
-    }
-    if (builtin.target.os.tag != .windows) {
-        notifySignalPipe(@intCast(@intFromEnum(sig)));
-    }
 }
 
 /// Reverse service listener - accepts connections and forwards through tunnel to client
@@ -434,57 +371,58 @@ const ReverseListener = struct {
 
             std.debug.print("[REVERSE] Accepted connection on {s}:{}\n", .{ self.service.address, self.service.port });
 
-            // Allocate stream ID
             const stream_id = self.tunnel_conn.next_stream_id.fetchAdd(1, .acq_rel);
 
-            // Send REVERSE_CONNECT to client
-            const msg = tunnel.ReverseConnectMsg{
-                .service_id = self.service.id,
-                .stream_id = stream_id,
-            };
-
-            var encode_buf: [64]u8 = undefined;
-            const encoded_len = msg.encodeInto(&encode_buf) catch {
-                std.debug.print("[REVERSE] Failed to encode REVERSE_CONNECT\n", .{});
-                client_stream.close(global_io);
-                continue;
-            };
-
-            self.tunnel_conn.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
-                std.debug.print("[REVERSE] Failed to send REVERSE_CONNECT: {}\n", .{err});
-                client_stream.close(global_io);
-                continue;
-            };
-
-            std.debug.print("[REVERSE] Sent REVERSE_CONNECT service_id={} stream_id={}\n", .{ self.service.id, stream_id });
-
-            // Create Stream for this connection
+            // Reserve the stream before REVERSE_CONNECT so a fast ACK+DATA
+            // cannot miss the map.
             const stream = Stream.create(self.allocator, self.service.id, stream_id, client_stream, self.tunnel_conn) catch |err| {
                 std.debug.print("[REVERSE] Failed to create stream: {}\n", .{err});
                 client_stream.close(global_io);
                 continue;
             };
-
-            // Add stream to tunnel's streams map (CRITICAL for reverse routing).
-            // The create ref IS the map ref — no extra acquireRef. On put failure,
-            // explicit releaseRef takes the count to 0 and destroys the stream.
             const key = StreamKey{ .service_id = self.service.id, .stream_id = stream_id };
-            self.tunnel_conn.streams_mutex.lock();
-            defer self.tunnel_conn.streams_mutex.unlock();
-
+            self.tunnel_conn.streams.mutex.lock();
             self.tunnel_conn.streams.put(key, stream) catch |err| {
+                self.tunnel_conn.streams.mutex.unlock();
                 std.debug.print("[REVERSE] Failed to register stream: {}\n", .{err});
                 stream.stop();
-                stream.releaseRef(); // drop create ref → destroys
+                stream.releaseRef();
                 continue;
             };
-            // Bump generation so the recv-loop poll-rebuild caches invalidate.
-            _ = self.tunnel_conn.streams_generation.fetchAdd(1, .acq_rel);
+            self.tunnel_conn.streams.mutex.unlock();
 
+            const msg = tunnel.ReverseConnectMsg{
+                .service_id = self.service.id,
+                .stream_id = stream_id,
+            };
+            var encode_buf: [64]u8 = undefined;
+            const encoded_len = msg.encodeInto(&encode_buf) catch {
+                std.debug.print("[REVERSE] Failed to encode REVERSE_CONNECT\n", .{});
+                self.unreserveReverseStream(key, stream);
+                continue;
+            };
+
+            self.tunnel_conn.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
+                std.debug.print("[REVERSE] Failed to send REVERSE_CONNECT: {}\n", .{err});
+                self.unreserveReverseStream(key, stream);
+                continue;
+            };
+
+            std.debug.print("[REVERSE] Sent REVERSE_CONNECT service_id={} stream_id={}\n", .{ self.service.id, stream_id });
             std.debug.print("[REVERSE] Stream {} registered and ready\n", .{stream_id});
         }
 
         std.debug.print("[REVERSE] Acceptor thread for {s}:{} exiting\n", .{ self.service.address, self.service.port });
+    }
+
+    fn unreserveReverseStream(self: *ReverseListener, key: StreamKey, stream: *Stream) void {
+        self.tunnel_conn.streams.mutex.lock();
+        const removed = self.tunnel_conn.streams.fetchRemove(key);
+        self.tunnel_conn.streams.mutex.unlock();
+        if (removed) |_| {
+            stream.releaseRef();
+        }
+        stream.stop();
     }
 
     fn stop(self: *ReverseListener) void {
@@ -582,7 +520,7 @@ const HeartbeatTicker = struct {
 
     fn tickerMain(self: *HeartbeatTicker) void {
         const tick_ms: u32 = 100;
-        while (!shutdown_flag.load(.acquire)) {
+        while (!common.signals.shutdown.load(.acquire)) {
             const ns = @as(u64, tick_ms) * std.time.ns_per_ms;
             Io.sleep(global_io, .fromNanoseconds(@intCast(ns)), .awake) catch {};
 
@@ -629,7 +567,7 @@ const Stream = struct {
     fn create(allocator: std.mem.Allocator, service_id: tunnel.ServiceId, stream_id: tunnel.StreamId, target_stream: Io.net.Stream, tunnel_conn: *TunnelConnection) !*Stream {
         const io_batch = tunnel_conn.cfg.advanced.io_batch_bytes;
 
-        const header_len: usize = 7;
+        const header_len: usize = tunnel.DATA_HEADER_SIZE;
         const frame_capacity = header_len + io_batch + noise.TAG_LEN + 32;
         const frame_buffer = try allocator.alignedAlloc(u8, .@"64", frame_capacity);
         errdefer allocator.free(frame_buffer);
@@ -686,25 +624,12 @@ const TunnelConnection = struct {
     tunnel_writer_buf: [8192]u8,
     tunnel_reader: Io.net.Stream.Reader,
     tunnel_writer: Io.net.Stream.Writer,
-    streams: std.HashMap(StreamKey, *Stream, StreamKeyContext, 80),
-    /// common.HotMutex (os_unfair_lock on Darwin, raw futex on Linux)
-    /// instead of Io.Mutex; see transport/Channel.send_mutex for
-    /// rationale. Held briefly per recv-DATA, send-DATA, CONNECT, CLOSE
-    /// — every cycle of the data path.
-    streams_mutex: common.HotMutex,
-    /// Generation counter bumped under `streams_mutex` on every insert
-    /// or remove from `streams`.  The recv-loop poll-rebuild path
-    /// caches its `poll_fds` array and only rebuilds when this counter
-    /// changes — see audit P-1 for the rationale.  `.acq_rel` so the
-    /// reader (poll loop, no lock) sees the structural state of `streams`
-    /// that produced the new value.
-    streams_generation: std.atomic.Value(u64),
+    streams: stream_table.StreamTable(Stream),
     channel: transport.Channel,
     running: std.atomic.Value(bool),
 
-    // UDP support (only one forwarder per tunnel connection)
-    udp_forwarder: ?*udp_server.UdpForwarder,
-    udp_service_id: ?tunnel.ServiceId,
+    // UDP support: one forwarder per service_id on this tunnel
+    udp_forwarders: std.AutoHashMap(tunnel.ServiceId, *udp_server.UdpForwarder),
 
     // Heartbeat support
     heartbeat_interval_ms: u32, // Heartbeat interval in milliseconds (0 = disabled)
@@ -733,13 +658,10 @@ const TunnelConnection = struct {
             .tunnel_writer_buf = undefined,
             .tunnel_reader = undefined,
             .tunnel_writer = undefined,
-            .streams = std.HashMap(StreamKey, *Stream, StreamKeyContext, 80).init(allocator),
-            .streams_mutex = .{},
-            .streams_generation = std.atomic.Value(u64).init(0),
+            .streams = stream_table.StreamTable(Stream).init(allocator),
             .channel = undefined,
             .running = std.atomic.Value(bool).init(true),
-            .udp_forwarder = null,
-            .udp_service_id = null,
+            .udp_forwarders = std.AutoHashMap(tunnel.ServiceId, *udp_server.UdpForwarder).init(allocator),
             .heartbeat_interval_ms = cfg.advanced.heartbeat_interval_seconds * 1000,
             .next_stream_id = std.atomic.Value(u32).init(1),
             .cfg = cfg,
@@ -766,7 +688,7 @@ const TunnelConnection = struct {
             // the per-process `[PROFILE] server encryption ...` line at
             // exit.  Throughput byte counters stay on unconditionally
             // (single `.monotonic` fetchAdd per frame).
-            .stats = if (encrypt_profile_enabled())
+            .stats = if (common.encryptProfileEnabled())
                 transport.EncryptionStats{
                     .total_ns = &encrypt_total_ns,
                     .calls = &encrypt_calls,
@@ -798,184 +720,56 @@ const TunnelConnection = struct {
     }
 
     fn setSockOpts(fd: posix.fd_t, cfg: *const config.ServerConfig) void {
-        const tcp_options = common.TcpOptions{
-            .nodelay = cfg.advanced.tcp_nodelay,
-            .keepalive = cfg.advanced.tcp_keepalive,
-            .keepalive_idle = cfg.advanced.tcp_keepalive_idle,
-            .keepalive_interval = cfg.advanced.tcp_keepalive_interval,
-            .keepalive_count = cfg.advanced.tcp_keepalive_count,
-        };
-        applyTcpOptions(fd, tcp_options);
+        applyTcpOptions(fd, tcpOptionsFromSettings(&cfg.advanced));
         tuneSocketBuffers(fd, cfg.advanced.socket_buffer_size);
     }
 
     fn run(self: *TunnelConnection) void {
-        // Recv hot path reads directly into the decoder buffer via
-        // pendingTail/commitWrite — no intermediate stack buffer + memcpy.
-        var decoder = protocol.FrameDecoder.init(global_allocator);
-        defer decoder.deinit();
-
-        // Check if decoder buffer was allocated
-        if (decoder.buffer.len == 0) {
+        var decoder = protocol.FrameDecoder.init(global_allocator) catch {
             std.debug.print("[TUNNEL] Failed to allocate decoder buffer!\n", .{});
             self.cleanup();
             self.running.store(false, .release);
             return;
-        }
+        };
+        defer decoder.deinit();
 
         std.debug.print("[TUNNEL] Connection handler started (buffer size: {})\n", .{decoder.buffer.len});
 
-        const PollEntry = union(enum) {
-            tunnel,
-            stream: *Stream,
-        };
-        var poll_fds = std.ArrayListUnmanaged(posix.pollfd).empty;
-        defer poll_fds.deinit(global_allocator);
-        var poll_entries = std.ArrayListUnmanaged(PollEntry).empty;
-        // Borrow refs held by the cached poll_entries are released either on
-        // rebuild (below) or here at scope exit if we break out mid-loop.
-        defer {
-            for (poll_entries.items) |entry| switch (entry) {
-                .stream => |stream_ptr| stream_ptr.releaseRef(),
-                .tunnel => {},
-            };
-            poll_entries.deinit(global_allocator);
-        }
-        const poll_timeout_ms: i32 = 1000;
-
-        // P-1: cache the poll_fds + poll_entries arrays.  The pre-fix code
-        // rebuilt both on every poll cycle (O(streams) under streams_mutex
-        // every wakeup) even though streams change rarely (per CONNECT/CLOSE).
-        // Now we rebuild only when `streams_generation` changes — every
-        // insert/remove bumps the counter under the same lock.  Borrow refs
-        // taken during a build are kept until the next build (or scope exit).
-        var last_built_generation: u64 = 0;
-        var have_built = false;
-
-        while (self.running.load(.acquire) and !shutdown_flag.load(.acquire)) {
-            const current_generation = self.streams_generation.load(.acquire);
-            if (!have_built or current_generation != last_built_generation) {
-                // Release refs held by the previous build.
-                for (poll_entries.items) |entry| switch (entry) {
-                    .stream => |stream_ptr| stream_ptr.releaseRef(),
-                    .tunnel => {},
-                };
-                poll_fds.clearRetainingCapacity();
-                poll_entries.clearRetainingCapacity();
-
-                poll_fds.append(global_allocator, .{
-                    .fd = self.tunnel_stream.socket.handle,
-                    .events = posix.POLL.IN,
-                    .revents = 0,
-                }) catch unreachable;
-                poll_entries.append(global_allocator, .{ .tunnel = {} }) catch unreachable;
-
-                self.streams_mutex.lock();
-                // If a writer raced ahead of our generation read above, capture
-                // the value we actually built against so we don't spuriously
-                // rebuild next cycle.  Read it inside the lock so we and the
-                // writer agree about which insertions/removals are reflected.
-                last_built_generation = self.streams_generation.load(.acquire);
-                var iter = self.streams.iterator();
-                while (iter.next()) |entry| {
-                    const stream_ptr = entry.value_ptr.*;
-                    stream_ptr.acquireRef();
-                    poll_entries.append(global_allocator, .{ .stream = stream_ptr }) catch {
-                        stream_ptr.releaseRef();
-                        continue;
-                    };
-                    poll_fds.append(global_allocator, .{
-                        .fd = stream_ptr.target_stream.socket.handle,
-                        .events = posix.POLL.IN,
-                        .revents = 0,
-                    }) catch unreachable;
-                }
-                self.streams_mutex.unlock();
-                have_built = true;
-            }
-
-            const ready = posix.poll(poll_fds.items, poll_timeout_ms) catch |err| {
-                std.debug.print("[TUNNEL] Poll error: {}\n", .{err});
-                break;
-            };
-
-            if (ready == 0) continue;
-
-            var fatal_error = false;
-            var idx: usize = 0;
-            loop: while (idx < poll_entries.items.len) : (idx += 1) {
-                const entry = poll_entries.items[idx];
-                const fd_info = poll_fds.items[idx];
-                switch (entry) {
-                    .tunnel => {
-                        if ((fd_info.revents & posix.POLL.IN) == 0) continue;
-
-                        // Zero-copy recv: read straight into the decoder's
-                        // internal buffer.
-                        const dst = decoder.pendingTail();
-                        if (dst.len == 0) {
-                            std.debug.print("[TUNNEL] Decoder buffer full; framing stalled\n", .{});
-                            fatal_error = true;
-                            break :loop;
-                        }
-                        const n = posix.read(self.tunnel_stream.socket.handle, dst) catch |err| {
-                            std.debug.print("[TUNNEL] Recv error: {}\n", .{err});
-                            fatal_error = true;
-                            break :loop;
-                        };
-
-                        if (n == 0) {
-                            std.debug.print("[TUNNEL] Client disconnected\n", .{});
-                            fatal_error = true;
-                            break :loop;
-                        }
-
-                        tracePrint(enable_tunnel_trace, "[TUNNEL] Received {} bytes from client\n", .{n});
-                        decoder.commitWrite(n);
-
-                        while (decoder.decodeMut() catch null) |frame_payload| {
-                            self.handleMessage(frame_payload) catch |err| {
-                                std.debug.print("[TUNNEL] Handle message error: {}\n", .{err});
-                                self.running.store(false, .release);
-                                fatal_error = true;
-                                break :loop;
-                            };
-                            if (!self.running.load(.acquire)) break;
-                        }
-
-                        if (!self.running.load(.acquire)) {
-                            fatal_error = true;
-                            break :loop;
-                        }
-                    },
-                    .stream => {
-                        // Stream entries hold a cached borrow ref — DON'T
-                        // releaseRef per-iteration.  The ref stays alive
-                        // until the next rebuild (which fires when
-                        // handleStreamPollEvent → completeStream bumps the
-                        // generation) or scope exit.
-                        if (fd_info.revents != 0) {
-                            self.handleStreamPollEvent(entry.stream, fd_info.revents);
-                        }
-                    },
-                }
-            }
-
-            if (fatal_error) break;
-        }
+        poll_loop.run(Stream, global_allocator, &self.streams, self.tunnel_stream.socket.handle, &decoder, self.channel.isEncrypted(), 1000, &self.running, &common.signals.shutdown, "TUNNEL", .{
+            .ctx = self,
+            .streamFd = streamFd,
+            .acquire = Stream.acquireRef,
+            .release = Stream.releaseRef,
+            .onFrame = onTunnelFrame,
+            .onSide = onStreamSide,
+        });
 
         std.debug.print("[TUNNEL] Connection handler stopping\n", .{});
         self.cleanup();
         self.running.store(false, .release);
     }
 
-    fn handleMessage(self: *TunnelConnection, payload: []u8) !void {
-        if (payload.len == 0) return;
+    fn streamFd(stream: *Stream) posix.fd_t {
+        return stream.target_stream.socket.handle;
+    }
 
-        const message_slice = try self.channel.decryptFrameInPlace(payload);
+    fn onTunnelFrame(ctx: *anyopaque, frame: protocol.WireFrame) anyerror!void {
+        const self: *TunnelConnection = @ptrCast(@alignCast(ctx));
+        try self.handleMessage(frame);
+    }
+
+    fn onStreamSide(ctx: *anyopaque, stream: *Stream, revents: i16) void {
+        const self: *TunnelConnection = @ptrCast(@alignCast(ctx));
+        self.handleStreamPollEvent(stream, revents);
+    }
+
+    fn handleMessage(self: *TunnelConnection, frame: protocol.WireFrame) !void {
+        if (frame.payload.len == 0 and !frame.encrypted) return;
+
+        const message_slice = try self.channel.decryptFrameInPlace(frame);
         if (message_slice.len == 0) return;
 
-        const msg_type: tunnel.MessageType = @enumFromInt(message_slice[0]);
+        const msg_type = try tunnel.MessageType.parse(message_slice[0]);
 
         switch (msg_type) {
             .connect_ack => {
@@ -1027,12 +821,12 @@ const TunnelConnection = struct {
                 const key = StreamKey{ .service_id = data_msg.service_id, .stream_id = data_msg.stream_id };
                 var stream_ref: ?*Stream = null;
 
-                self.streams_mutex.lock();
+                self.streams.mutex.lock();
                 if (self.streams.get(key)) |s| {
                     s.acquireRef();
                     stream_ref = s;
                 }
-                self.streams_mutex.unlock();
+                self.streams.mutex.unlock();
 
                 if (stream_ref) |s| {
                     defer s.releaseRef();
@@ -1049,17 +843,13 @@ const TunnelConnection = struct {
                 tracePrint(enable_tunnel_trace, "[TUNNEL] CLOSE service_id={} stream_id={}\n", .{ close_msg.service_id, close_msg.stream_id });
 
                 const key = StreamKey{ .service_id = close_msg.service_id, .stream_id = close_msg.stream_id };
-                self.streams_mutex.lock();
+                self.streams.mutex.lock();
                 const maybe_stream = self.streams.fetchRemove(key);
-                if (maybe_stream != null) {
-                    _ = self.streams_generation.fetchAdd(1, .acq_rel);
-                }
-                self.streams_mutex.unlock();
+                self.streams.mutex.unlock();
 
-                if (maybe_stream) |entry| {
-                    // Stream still exists, stop and destroy it
-                    entry.value.stop();
-                    entry.value.releaseRef(); // drop map reference
+                if (maybe_stream) |removed| {
+                    removed.stop();
+                    removed.releaseRef();
                     std.debug.print("[TUNNEL] Stream {} cleaned up after CLOSE message\n", .{close_msg.stream_id});
                 } else {
                     // Stream already cleaned itself up
@@ -1073,12 +863,12 @@ const TunnelConnection = struct {
                 // session's [16]u8 source_addr field on insert).
                 const udp_msg = try tunnel.UdpDataMsg.decodeRef(message_slice);
 
-                if (self.udp_forwarder) |forwarder| {
+                if (self.udp_forwarders.get(udp_msg.service_id)) |forwarder| {
                     forwarder.handleUdpData(udp_msg) catch |err| {
                         std.debug.print("[UDP] Failed to forward: {}\n", .{err});
                     };
                 } else {
-                    std.debug.print("[UDP] Received UDP data but no forwarder exists\n", .{});
+                    std.debug.print("[UDP] Received UDP data but no forwarder for service_id={}\n", .{udp_msg.service_id});
                 }
             },
             .connect_error => {
@@ -1087,16 +877,13 @@ const TunnelConnection = struct {
                 std.debug.print("[TUNNEL-REVERSE] CONNECT_ERROR from client: stream_id={} error={s}\n", .{ err_msg.stream_id, err_msg.error_msg });
 
                 const key = StreamKey{ .service_id = err_msg.service_id, .stream_id = err_msg.stream_id };
-                self.streams_mutex.lock();
+                self.streams.mutex.lock();
                 const maybe_stream = self.streams.fetchRemove(key);
-                if (maybe_stream != null) {
-                    _ = self.streams_generation.fetchAdd(1, .acq_rel);
-                }
-                self.streams_mutex.unlock();
+                self.streams.mutex.unlock();
 
-                if (maybe_stream) |entry| {
-                    entry.value.stop();
-                    entry.value.releaseRef();
+                if (maybe_stream) |removed| {
+                    removed.stop();
+                    removed.releaseRef();
                     std.debug.print("[TUNNEL-REVERSE] Stream {} cleaned up after CONNECT_ERROR\n", .{err_msg.stream_id});
                 }
             },
@@ -1135,63 +922,30 @@ const TunnelConnection = struct {
             };
         }
 
-        const extra_error_mask: i16 = if (@hasDecl(posix.POLL, "NVAL")) posix.POLL.NVAL else 0;
-        const error_mask: i16 = posix.POLL.HUP | posix.POLL.ERR | extra_error_mask;
-        if (!closed and (revents & error_mask) != 0) {
+        if (!closed and (revents & tcp_forward.pollErrorMask()) != 0) {
             self.completeStream(stream, true);
         }
     }
 
     fn forwardTargetData(self: *TunnelConnection, stream: *Stream) anyerror!void {
-        @setRuntimeSafety(false);
-        const message_header_len: usize = 7;
-        const io_batch = self.cfg.advanced.io_batch_bytes;
-
-        // Ensure we don't overflow the buffer
-        const max_read = @min(io_batch, stream.frame_buffer.len - message_header_len - noise.TAG_LEN);
-
-        // Read directly into frame buffer at offset 7
-        const recv_slice = stream.frame_buffer[message_header_len..][0..max_read];
-        const n = posix.read(stream.target_stream.socket.handle, recv_slice) catch |err| switch (err) {
-            error.WouldBlock => return,
-            else => return err,
-        };
-        tracePrint(enable_stream_trace, "[STREAM {}] recv() returned {} bytes\n", .{ stream.stream_id, n });
-
-        if (n == 0) {
-            self.sendStreamClose(stream);
-            return error.ConnectionClosed;
-        }
-
-        if (!self.channel.isEncrypted()) {
-            stream.frame_buffer[0] = @intFromEnum(tunnel.MessageType.data);
-            std.mem.writeInt(u16, stream.frame_buffer[1..3], stream.service_id, .big);
-            std.mem.writeInt(u32, stream.frame_buffer[3..7], stream.stream_id, .big);
-
-            const slice = stream.frame_buffer[0 .. message_header_len + n];
-            self.channel.sendDataInPlace(slice, message_header_len + n) catch |err| {
-                std.debug.print("[STREAM {}] send() error: {}\n", .{ stream.stream_id, err });
-                self.handleSendFailure(err);
+        const n = tcp_forward.forwardSideData(
+            stream.target_stream.socket.handle,
+            stream.service_id,
+            stream.stream_id,
+            stream.frame_buffer,
+            &self.channel,
+            self.cfg.advanced.io_batch_bytes,
+        ) catch |err| switch (err) {
+            error.ConnectionClosed => {
+                self.sendStreamClose(stream);
                 return error.ConnectionClosed;
-            };
-            return;
-        }
-
-        // For encrypted channel, constructs DataMsg manually in the buffer to avoid copy
-        // DataMsg format: [type:1][service_id:2][stream_id:4][data:n]
-        stream.frame_buffer[0] = @intFromEnum(tunnel.MessageType.data);
-        std.mem.writeInt(u16, stream.frame_buffer[1..3], stream.service_id, .big);
-        std.mem.writeInt(u32, stream.frame_buffer[3..7], stream.stream_id, .big);
-        // Data is already at offset 7
-
-        const payload_len = message_header_len + n;
-        const slice = stream.frame_buffer[0 .. payload_len + noise.TAG_LEN];
-
-        self.channel.sendDataInPlace(slice, payload_len) catch |err| {
-            std.debug.print("[STREAM {}] send() error: {}\n", .{ stream.stream_id, err });
-            self.handleSendFailure(err);
-            return error.ConnectionClosed;
+            },
+            else => {
+                self.handleSendFailure(err);
+                return err;
+            },
         };
+        _ = n;
     }
 
     fn completeStream(self: *TunnelConnection, stream: *Stream, send_close: bool) void {
@@ -1200,13 +954,10 @@ const TunnelConnection = struct {
             self.sendStreamClose(stream);
         }
 
-        self.streams_mutex.lock();
+        self.streams.mutex.lock();
         const key = StreamKey{ .service_id = stream.service_id, .stream_id = stream.stream_id };
         const removed = self.streams.fetchRemove(key);
-        if (removed != null) {
-            _ = self.streams_generation.fetchAdd(1, .acq_rel);
-        }
-        self.streams_mutex.unlock();
+        self.streams.mutex.unlock();
         if (removed) |_| {
             stream.releaseRef();
         }
@@ -1255,20 +1006,18 @@ const TunnelConnection = struct {
                 const stream = try Stream.create(global_allocator, msg.service_id, msg.stream_id, target_stream, self);
                 target_stream_guard = false; // ownership transferred to Stream
 
-                self.streams_mutex.lock();
-                defer self.streams_mutex.unlock();
+                self.streams.mutex.lock();
+                defer self.streams.mutex.unlock();
 
                 const key = StreamKey{ .service_id = msg.service_id, .stream_id = msg.stream_id };
-                // Create ref IS map ref — no extra acquire.
                 self.streams.put(key, stream) catch |err| {
                     stream.stop();
-                    stream.releaseRef(); // drop create ref → destroys
+                    stream.releaseRef();
                     return err;
                 };
-                _ = self.streams_generation.fetchAdd(1, .acq_rel);
             },
             .udp => {
-                if (self.udp_forwarder == null) {
+                if (self.udp_forwarders.get(msg.service_id) == null) {
                     std.debug.print("[UDP] Creating UDP forwarder for target {s}:{}\n", .{ service.address, service.port });
 
                     const forwarder = try udp_server.UdpForwarder.create(
@@ -1281,15 +1030,7 @@ const TunnelConnection = struct {
                         sendTunnelPayload,
                         self.cfg.advanced.udp_timeout_seconds,
                     );
-                    self.udp_forwarder = forwarder;
-                    self.udp_service_id = msg.service_id;
-                } else if (self.udp_service_id) |service_id| {
-                    if (service_id != msg.service_id) {
-                        std.debug.print("[UDP] Forwarder already active for service_id={}, rejecting service_id={}\n", .{ service_id, msg.service_id });
-                        return error.UdpForwarderBusy;
-                    }
-                } else {
-                    self.udp_service_id = msg.service_id;
+                    try self.udp_forwarders.put(msg.service_id, forwarder);
                 }
             },
         }
@@ -1297,7 +1038,7 @@ const TunnelConnection = struct {
         // Send ACK (no allocation - use stack buffer)
         const ack_msg = tunnel.ConnectAckMsg{ .service_id = msg.service_id, .stream_id = msg.stream_id };
 
-        var encode_buf: [16]u8 = undefined; // ACK is 7 bytes
+        var encode_buf: [16]u8 = undefined;
         const encoded_len = try ack_msg.encodeInto(&encode_buf);
 
         try self.channel.sendCopy(encode_buf[0..encoded_len]);
@@ -1333,43 +1074,41 @@ const TunnelConnection = struct {
         //   - handleConnect / handleMessage on the run() loop (exits when
         //     running == false)
         //   - ReverseListener.acceptorThread (checks running every loop)
-        //   - reverseServiceListener (checks running every loop)
         // All check `running` before insert. So the iterative pop here
         // converges; concurrent inserts during teardown are not observed.
         while (true) {
-            self.streams_mutex.lock();
-            var iter = self.streams.iterator();
+            self.streams.mutex.lock();
+            var iter = self.streams.map.iterator();
             const entry = iter.next();
             if (entry) |e| {
                 const key_copy = e.key_ptr.*;
                 const stream_ptr = e.value_ptr.*;
-                _ = self.streams.remove(key_copy);
-                self.streams_mutex.unlock();
+                _ = self.streams.map.remove(key_copy);
+                self.streams.mutex.unlock();
                 stream_ptr.stop();
                 stream_ptr.releaseRef();
             } else {
-                self.streams_mutex.unlock();
+                self.streams.mutex.unlock();
                 break;
             }
         }
         self.streams.deinit();
 
-        if (self.udp_forwarder) |forwarder| {
-            forwarder.stop();
-            forwarder.destroy();
-            self.udp_forwarder = null;
-            self.udp_service_id = null;
+        var udp_iter = self.udp_forwarders.iterator();
+        while (udp_iter.next()) |entry| {
+            entry.value_ptr.*.stop();
+            entry.value_ptr.*.destroy();
         }
+        self.udp_forwarders.clearRetainingCapacity();
     }
 
     fn destroy(self: *TunnelConnection) void {
-        // Cleanup UDP forwarder if exists
-        if (self.udp_forwarder) |forwarder| {
-            forwarder.stop();
-            forwarder.destroy();
-            self.udp_forwarder = null;
-            self.udp_service_id = null;
+        var udp_iter = self.udp_forwarders.iterator();
+        while (udp_iter.next()) |entry| {
+            entry.value_ptr.*.stop();
+            entry.value_ptr.*.destroy();
         }
+        self.udp_forwarders.deinit();
 
         // Channel.deinit only frees its internal buffers — it does not close
         // the underlying stream (the caller owns it).
@@ -1393,17 +1132,6 @@ pub fn main(init: std.process.Init) !void {
     global_io = init.io;
     defer diagnostics.flushEncryptStats("server", &encrypt_total_ns, &encrypt_calls);
     defer diagnostics.flushThroughputStats("server", &tunnel_tx_bytes, &tunnel_rx_bytes);
-    defer cleanupSignalPipe();
-
-    // Ignore SIGPIPE to prevent process termination on write errors
-    if (builtin.os.tag != .windows) {
-        var act = posix.Sigaction{
-            .handler = .{ .handler = posix.SIG.IGN },
-            .mask = std.mem.zeroes(posix.sigset_t),
-            .flags = 0,
-        };
-        posix.sigaction(posix.SIG.PIPE, &act, null);
-    }
 
     var exit_code: u8 = 0;
     defer if (exit_code != 0) std.process.exit(exit_code);
@@ -1472,7 +1200,7 @@ pub fn main(init: std.process.Init) !void {
 
     const canonical_cipher = config.canonicalCipher(&cfg);
     if (std.mem.eql(u8, canonical_cipher, "none")) {
-        std.debug.print("[WARN] Server encryption disabled; relying solely on tokens for authentication.\n", .{});
+        std.debug.print("[WARN] Server encryption disabled (cipher=none); PSK still required for mutual authentication.\n", .{});
     } else if (cfg.psk.len == 0) {
         std.debug.print("[WARN] Server PSK is empty; clients will fail to handshake.\n", .{});
     } else if (std.mem.eql(u8, cfg.psk, config.DEFAULT_PSK)) {
@@ -1487,6 +1215,15 @@ pub fn main(init: std.process.Init) !void {
             break;
         }
     }
+    if (!default_token_required) {
+        var rev_tok = cfg.reverse_services.valueIterator();
+        while (rev_tok.next()) |service| {
+            if (service.token.len == 0) {
+                default_token_required = true;
+                break;
+            }
+        }
+    }
 
     if (default_token_required and cfg.token.len == 0) {
         std.debug.print("[WARN] Server default token is empty; unauthorized clients may connect.\n", .{});
@@ -1494,42 +1231,15 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("[WARN] Server is using the placeholder token '{s}'. Change this before deployment.\n", .{config.DEFAULT_TOKEN});
     }
 
-    std.debug.print("Floo Tunnel Server (floos-blocking)\n", .{});
-    std.debug.print("====================================\n\n", .{});
+    std.debug.print("Floo Tunnel Server (floos)\n", .{});
+    std.debug.print("==========================\n\n", .{});
     std.debug.print("[CONFIG] Port: {}\n", .{port});
     std.debug.print("[CONFIG] Thread Pinning: {s}\n", .{if (cfg.advanced.pin_threads) "enabled" else "disabled"});
     std.debug.print("[CONFIG] IO Batch Bytes: {}\n", .{cfg.advanced.io_batch_bytes});
     std.debug.print("[CONFIG] Mode: Blocking I/O + Threads\n", .{});
     std.debug.print("[CONFIG] Hot Reload: Disabled (restart floos to apply configuration changes)\n\n", .{});
 
-    // Register signal handlers (POSIX only)
-    if (builtin.target.os.tag != .windows and @hasDecl(posix, "Sigaction") and @hasDecl(posix, "sigaction")) {
-        try setupSignalPipe();
-        const sig_action = posix.Sigaction{
-            .handler = .{ .handler = handleSignal },
-            .mask = std.mem.zeroes(posix.sigset_t),
-            .flags = 0,
-        };
-        posix.sigaction(posix.SIG.INT, &sig_action, null);
-        // SIGTERM was previously unbound — the handler at handleSignal()
-        // already accepts it, but without sigaction it took the default
-        // action (process kill, no defers run, no profile/stats flush).
-        posix.sigaction(posix.SIG.TERM, &sig_action, null);
-        if (@hasDecl(posix.SIG, "HUP")) {
-            posix.sigaction(posix.SIG.HUP, &sig_action, null); // Register SIGHUP for hot reload
-        }
-        if (@hasDecl(posix.SIG, "USR1")) {
-            posix.sigaction(posix.SIG.USR1, &sig_action, null);
-        }
-        if (@hasDecl(posix.SIG, "PIPE")) {
-            const ignore = posix.Sigaction{
-                .handler = .{ .handler = posix.SIG.IGN },
-                .mask = std.mem.zeroes(posix.sigset_t),
-                .flags = 0,
-            };
-            posix.sigaction(posix.SIG.PIPE, &ignore, null);
-        }
-    }
+    common.installProcessSignals();
 
     // Create listen Server
     const listen_addr = try common.resolveHostPort(global_io, cfg.bind, port);
@@ -1581,15 +1291,15 @@ pub fn main(init: std.process.Init) !void {
     // Allow up to 100 new connections per second (reasonable for production)
     var rate_limiter = common.RateLimiter.init(100);
     var shutdown_notice_printed = false;
-    while (!shutdown_flag.load(.acquire)) {
-        if (flush_stats_requested.swap(false, .acq_rel)) {
+    while (!common.signals.shutdown.load(.acquire)) {
+        if (common.signals.flush_stats.swap(false, .acq_rel)) {
             diagnostics.flushEncryptStats("server", &encrypt_total_ns, &encrypt_calls);
             diagnostics.flushThroughputStats("server", &tunnel_tx_bytes, &tunnel_rx_bytes);
         }
-        if (sighup_requested.swap(false, .acq_rel)) {
+        if (common.signals.sighup.swap(false, .acq_rel)) {
             std.debug.print("\n[INFO] Configuration reload via SIGHUP is currently disabled; restart floos to apply changes.\n", .{});
         }
-        if (shutdown_flag.load(.acquire) and !shutdown_notice_printed) {
+        if (common.signals.shutdown.load(.acquire) and !shutdown_notice_printed) {
             std.debug.print("\n[SHUTDOWN] Received interrupt, stopping server...\n", .{});
             shutdown_notice_printed = true;
         }
@@ -1642,14 +1352,7 @@ pub fn main(init: std.process.Init) !void {
         const tunnel_fd = tunnel_stream.socket.handle;
         std.debug.print("[SERVER] Accepted tunnel connection: fd={}\n", .{tunnel_fd});
         tuneSocketBuffers(tunnel_fd, cfg.advanced.socket_buffer_size);
-        const tcp_options = common.TcpOptions{
-            .nodelay = cfg.advanced.tcp_nodelay,
-            .keepalive = cfg.advanced.tcp_keepalive,
-            .keepalive_idle = cfg.advanced.tcp_keepalive_idle,
-            .keepalive_interval = cfg.advanced.tcp_keepalive_interval,
-            .keepalive_count = cfg.advanced.tcp_keepalive_count,
-        };
-        applyTcpOptions(tunnel_fd, tcp_options);
+        applyTcpOptions(tunnel_fd, tcpOptionsFromSettings(&cfg.advanced));
 
         // Create tunnel connection (shares static identity across all connections)
         const tunnel_conn = TunnelConnection.create(allocator, tunnel_stream, &cfg, static_keypair) catch |err| {
@@ -1659,7 +1362,7 @@ pub fn main(init: std.process.Init) !void {
         };
 
         // Spawn thread for this connection
-        const cpu_index = if (cfg.advanced.pin_threads) nextCpuIndex() else null;
+        const cpu_index = if (cfg.advanced.pin_threads) common.nextCpuIndex() else null;
         const thread = try std.Thread.spawn(.{
             .stack_size = common.TUNNEL_THREAD_STACK,
         }, tunnelConnectionThread, .{TunnelThreadContext{ .conn = tunnel_conn, .cpu_index = cpu_index }});
@@ -1712,115 +1415,10 @@ const TunnelThreadContext = struct {
 };
 
 fn tunnelConnectionThread(ctx: TunnelThreadContext) void {
-    applyThreadAffinity(ctx.cpu_index);
+    common.applyThreadAffinity(ctx.cpu_index);
     tunnelConnectionThreadMain(ctx.conn);
 }
 
 fn tunnelConnectionThreadMain(conn: *TunnelConnection) void {
     conn.run();
-    // Note: conn.destroy() is called by main thread on shutdown
-}
-
-/// Context for reverse service listener thread
-const ReverseServiceListenerContext = struct {
-    allocator: std.mem.Allocator,
-    service_id: tunnel.ServiceId,
-    listen_host: []const u8,
-    listen_port: u16,
-    tunnel_conn: *TunnelConnection,
-    next_stream_id: std.atomic.Value(u32),
-};
-
-/// Reverse service listener thread - handles one reverse mode service
-/// Listens on a public port, sends CONNECT to client when users connect
-fn reverseServiceListener(ctx_ptr: *anyopaque) void {
-    const ctx: *ReverseServiceListenerContext = @ptrCast(@alignCast(ctx_ptr));
-    defer {
-        ctx.allocator.free(ctx.listen_host);
-        ctx.allocator.destroy(ctx);
-    }
-
-    // Create listener via Io.net
-    const local_addr = common.resolveHostPort(global_io, ctx.listen_host, ctx.listen_port) catch |err| {
-        std.debug.print("[REVERSE-SERVICE] Failed to parse address for service_id={}: {}\n", .{ ctx.service_id, err });
-        return;
-    };
-
-    var server = common.bindListener(local_addr, common.LISTEN_BACKLOG) catch |err| {
-        std.debug.print("[REVERSE-SERVICE] Failed to listen on port {} for service_id={}: {}\n", .{ ctx.listen_port, ctx.service_id, err });
-        return;
-    };
-    defer server.deinit(global_io);
-
-    std.debug.print("[REVERSE-SERVICE] Listening on {s}:{} (service_id={}, reverse mode)\n", .{ ctx.listen_host, ctx.listen_port, ctx.service_id });
-
-    // Accept loop
-    while (!shutdown_flag.load(.acquire) and ctx.tunnel_conn.running.load(.acquire)) {
-        // Poll on the underlying handle so we can honor the 1s shutdown check.
-        var fds = [_]posix.pollfd{
-            .{ .fd = server.socket.handle, .events = posix.POLL.IN, .revents = 0 },
-        };
-        const ready = posix.poll(&fds, 1000) catch continue;
-        if (ready == 0) continue;
-
-        const user_stream = server.accept(global_io) catch |err| {
-            if (err == error.SocketNotListening) break;
-            if (err == error.WouldBlock or err == error.ConnectionAborted) continue;
-            std.debug.print("[REVERSE-SERVICE] Accept error for service_id={}: {}\n", .{ ctx.service_id, err });
-            continue;
-        };
-
-        // Generate stream_id
-        const stream_id = ctx.next_stream_id.fetchAdd(1, .acq_rel);
-
-        std.debug.print("[REVERSE-SERVICE] External user connected, sending CONNECT to client (service_id={}, stream_id={})\n", .{ ctx.service_id, stream_id });
-
-        // Apply socket tuning
-        TunnelConnection.setSockOpts(user_stream.socket.handle, ctx.tunnel_conn.cfg);
-
-        // Send CONNECT message to client through tunnel
-        const connect_msg = tunnel.ConnectMsg{
-            .service_id = ctx.service_id,
-            .stream_id = stream_id,
-            .token = "",
-        };
-
-        var encode_buf: [512]u8 = undefined;
-        const encoded_len = connect_msg.encodeInto(&encode_buf) catch {
-            std.debug.print("[REVERSE-SERVICE] Failed to encode CONNECT message\n", .{});
-            user_stream.close(global_io);
-            continue;
-        };
-
-        ctx.tunnel_conn.channel.sendCopy(encode_buf[0..encoded_len]) catch |err| {
-            std.debug.print("[REVERSE-SERVICE] Failed to send CONNECT to client: {}\n", .{err});
-            ctx.tunnel_conn.handleSendFailure(err);
-            user_stream.close(global_io);
-            continue;
-        };
-
-        // Create Stream to forward user_stream <-> tunnel
-        const stream = Stream.create(global_allocator, ctx.service_id, stream_id, user_stream, ctx.tunnel_conn) catch |err| {
-            std.debug.print("[REVERSE-SERVICE] Failed to create stream: {}\n", .{err});
-            user_stream.close(global_io);
-            continue;
-        };
-
-        ctx.tunnel_conn.streams_mutex.lock();
-        const key = StreamKey{ .service_id = ctx.service_id, .stream_id = stream_id };
-        // Create ref IS map ref — no extra acquire.
-        ctx.tunnel_conn.streams.put(key, stream) catch |err| {
-            ctx.tunnel_conn.streams_mutex.unlock();
-            std.debug.print("[REVERSE-SERVICE] Failed to register stream: {}\n", .{err});
-            stream.stop();
-            stream.releaseRef(); // drop create ref → destroys
-            continue;
-        };
-        _ = ctx.tunnel_conn.streams_generation.fetchAdd(1, .acq_rel);
-        ctx.tunnel_conn.streams_mutex.unlock();
-
-        std.debug.print("[REVERSE-SERVICE] Stream {} created for reverse connection\n", .{stream_id});
-    }
-
-    std.debug.print("[REVERSE-SERVICE] Service listener stopped for service_id={}\n", .{ctx.service_id});
 }

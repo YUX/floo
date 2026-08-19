@@ -2,7 +2,7 @@
 
 [![Language: Zig](https://img.shields.io/badge/language-Zig-orange.svg)](https://ziglang.org/)
 [![Dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](build.zig.zon)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Floo is a small, fast tunneling toolkit for private services.
 
@@ -169,4 +169,4 @@ Template configs live in [configs/](configs/).
 
 - Zig 0.16.0 to build from source
 - Linux or macOS for current release targets
-- MIT License; see [LICENSE](LICENSE)
+- Apache-2.0 License; see [LICENSE](LICENSE)

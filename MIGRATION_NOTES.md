@@ -1,3 +1,32 @@
+# Floo 0.2 → 0.3 (protocol v2)
+
+**Version:** 0.2.0 → 0.3.0  
+**Interop:** none. A 0.2.x peer cannot speak to a 0.3.0 peer.
+
+## Wire changes
+
+- Encrypted frame: `[u32be length][u64be seq][ciphertext || 16-byte tag]`.
+- AEAD AAD is the 12-byte prefix `length || seq` (not empty / not payload-only).
+- Receiver must use the frame `seq` for the nonce. `seq >= 2^40-1` is rejected.
+- `cipher = "none"`: `[u32be length][plaintext]` after the PSK nonce/HMAC exchange. No seq.
+- `ServiceId` is `u32`. Message header is 9 bytes (`type(1) + service(4) + stream(4)`).
+- Version exchange uses v2 encrypted frames and still exact-matches `build.zig.zon` version.
+
+## Config / ops
+
+- `loadFromFile` on a missing file is `error.FileNotFound` (no default-config-then-die).
+- Service `address:port` accepts `[ipv6]:port`. Unbracketed IPv6 is rejected.
+- `getServiceById` and security/token checks include `reverse_services`.
+- License pointers match the existing `LICENSE` file: Apache-2.0 only.
+
+## Upgrade
+
+1. Deploy `floos` 0.3.0 first or at the same time as every `flooc`. Mixed 0.2/0.3 tunnels will not handshake.
+2. Keep the same TOML shape. Service IDs change width on the wire; explicit IDs still work if they fit in `u32` and are non-zero.
+3. Regenerate nothing unless you were on placeholder credentials (still rejected).
+
+---
+
 # Floo — Zig 0.16 / std.Io Migration Notes
 
 **Branch:** `remediation/v0.2.0`

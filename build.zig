@@ -145,12 +145,34 @@ pub fn build(b: *std.Build) void {
     });
     udp_session_tests.root_module.addOptions("build_options", build_options);
 
+    const common_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/common.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    common_tests.root_module.addOptions("build_options", build_options);
+
+    const tunnel_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tunnel.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    tunnel_tests.root_module.addOptions("build_options", build_options);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(protocol_tests).step);
     test_step.dependOn(&b.addRunArtifact(config_tests).step);
     test_step.dependOn(&b.addRunArtifact(noise_tests).step);
     test_step.dependOn(&b.addRunArtifact(proxy_tests).step);
     test_step.dependOn(&b.addRunArtifact(udp_session_tests).step);
+    test_step.dependOn(&b.addRunArtifact(common_tests).step);
+    test_step.dependOn(&b.addRunArtifact(tunnel_tests).step);
 
     // Cross-platform release matrix
     const ReleaseTarget = struct {

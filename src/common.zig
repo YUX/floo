@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const Io = std.Io;
-const config = @import("config.zig");
 
 /// Thread-only mutex, no fiber/Io awareness. Designed for the data path
 /// where every nanosecond matters and we have only OS threads in flight.
@@ -117,8 +116,9 @@ const FutexHotMutex = extern struct {
 /// not a real syscall — ~10–20 ns each.  The cost is real at multi-Gbps
 /// frame rates but smaller than a syscall trap.
 pub fn nanoTimestamp() i128 {
-    var ts: posix.timespec = undefined;
-    _ = posix.system.clock_gettime(.MONOTONIC, &ts);
+    var ts: posix.timespec = .{ .sec = 0, .nsec = 0 };
+    const rc = posix.system.clock_gettime(.MONOTONIC, &ts);
+    if (rc != 0) return 0;
     return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
@@ -138,10 +138,6 @@ pub const LISTEN_BACKLOG: u32 = 128;
 /// Standard buffer size for socket I/O operations (64KB).
 /// Optimal for most network conditions, matches typical TCP window size.
 pub const SOCKET_BUFFER_SIZE: usize = 64 * 1024;
-
-/// Large buffer for high-throughput operations (256KB).
-/// Used for frame decoding and encryption buffers.
-pub const LARGE_BUFFER_SIZE: usize = 256 * 1024;
 
 // ============================================================================
 // Thread Stack Sizes
@@ -208,14 +204,14 @@ pub const TcpOptions = struct {
     keepalive_count: u32,
 };
 
-/// Build a `TcpOptions` struct from tuning settings.
-pub fn tcpOptionsFromSettings(settings: *const config.TcpSettings) TcpOptions {
+/// Build a `TcpOptions` struct from `[advanced]` TCP settings.
+pub fn tcpOptionsFromSettings(settings: anytype) TcpOptions {
     return TcpOptions{
-        .nodelay = settings.nodelay,
-        .keepalive = settings.keepalive,
-        .keepalive_idle = settings.keepalive_idle,
-        .keepalive_interval = settings.keepalive_interval,
-        .keepalive_count = settings.keepalive_count,
+        .nodelay = settings.tcp_nodelay,
+        .keepalive = settings.tcp_keepalive,
+        .keepalive_idle = settings.tcp_keepalive_idle,
+        .keepalive_interval = settings.tcp_keepalive_interval,
+        .keepalive_count = settings.tcp_keepalive_count,
     };
 }
 
@@ -286,24 +282,19 @@ pub fn tuneSocketBuffers(handle: posix.fd_t, buffer_size: u32) void {
     };
 }
 
-/// Send all data through an Io.Writer (typically wrapping a Stream.Writer).
-///
-/// Std.Io's Writer interface handles partial writes internally — this is just
-/// a thin shim so callers don't have to remember the method name.
-pub fn sendAll(writer: *Io.Writer, data: []const u8) !void {
-    return writer.writeAll(data);
-}
-
-/// Write a length-prefixed frame: [4-byte big-endian length][payload].
-///
-/// Two writeAll calls let a buffered Writer coalesce header+payload into a
-/// single syscall (the std.Io equivalent of the old writev()-based path).
-/// Caller must call writer.flush() after a batch of frames if low latency
-/// is required, or rely on the buffered Writer's auto-flush on overflow.
-pub fn writeFrame(writer: *Io.Writer, payload: []const u8) !void {
-    var header: [4]u8 = undefined;
-    std.mem.writeInt(u32, header[0..4], @intCast(payload.len), .big);
-    try writer.writeAll(&header);
+/// Write a length-prefixed frame. When `seq` is set this is a v2 encrypted
+/// prefix (`length || seq`); otherwise it is a plaintext `length` prefix.
+pub fn writeFrame(writer: *Io.Writer, payload: []const u8, seq: ?u64) !void {
+    if (seq) |s| {
+        var header: [12]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], @intCast(payload.len), .big);
+        std.mem.writeInt(u64, header[4..12], s, .big);
+        try writer.writeAll(&header);
+    } else {
+        var header: [4]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], @intCast(payload.len), .big);
+        try writer.writeAll(&header);
+    }
     try writer.writeAll(payload);
 }
 
@@ -315,9 +306,16 @@ pub fn writeFrame(writer: *Io.Writer, payload: []const u8) !void {
 /// vs the original posix.writev-based path. This helper restores the original
 /// scatter-gather behavior: one syscall per frame regardless of header/payload
 /// split. libc's writev is consistent across macOS and Linux (we link libc).
-pub fn writeFrameDirect(handle: posix.fd_t, payload: []const u8) !void {
-    var header: [4]u8 = undefined;
-    std.mem.writeInt(u32, header[0..4], @intCast(payload.len), .big);
+pub fn writeFrameDirect(handle: posix.fd_t, payload: []const u8, seq: ?u64) !void {
+    var header_buf: [12]u8 = undefined;
+    const header: []const u8 = if (seq) |s| blk: {
+        std.mem.writeInt(u32, header_buf[0..4], @intCast(payload.len), .big);
+        std.mem.writeInt(u64, header_buf[4..12], s, .big);
+        break :blk header_buf[0..12];
+    } else blk: {
+        std.mem.writeInt(u32, header_buf[0..4], @intCast(payload.len), .big);
+        break :blk header_buf[0..4];
+    };
 
     var header_sent: usize = 0;
     var payload_sent: usize = 0;
@@ -480,7 +478,7 @@ pub fn writeAllToHandle(handle: posix.fd_t, data: []const u8) !void {
             const errno = std.posix.errno(n);
             switch (errno) {
                 .INTR => continue,
-                .AGAIN => continue,
+                .AGAIN => return error.WriteFailed,
                 .PIPE => return error.ConnectionClosed,
                 .CONNRESET => return error.ConnectionClosed,
                 else => return error.WriteFailed,
@@ -508,17 +506,17 @@ pub const RateLimiter = struct {
 
     /// Create a rate limiter allowing `max_per_second` operations per second.
     pub fn init(max_per_second: u32) RateLimiter {
+        const per_second = @max(max_per_second, 1);
         return .{
-            .tokens = std.atomic.Value(u32).init(max_per_second),
-            .max_tokens = max_per_second,
-            .refill_interval_ns = @intCast(@divTrunc(std.time.ns_per_s, max_per_second)),
+            .tokens = std.atomic.Value(u32).init(per_second),
+            .max_tokens = per_second,
+            .refill_interval_ns = @intCast(@divTrunc(std.time.ns_per_s, per_second)),
             .last_refill = std.atomic.Value(i64).init(@intCast(nanoTimestamp())),
         };
     }
 
     /// Try to consume a token. Returns true if allowed, false if rate limited.
     pub fn tryAcquire(self: *RateLimiter) bool {
-        // Fast path: try to consume an existing token.
         var current = self.tokens.load(.monotonic);
         while (current > 0) {
             if (self.tokens.cmpxchgWeak(
@@ -533,34 +531,159 @@ pub const RateLimiter = struct {
             }
         }
 
-        // Slow path: refill if the interval has elapsed.
-        //
-        // Race: previously, two callers observing `elapsed >= interval`
-        // would both `tokens.store(max_tokens)` then `fetchSub(1)`, briefly
-        // letting through `max_tokens × N_concurrent` rather than just
-        // `max_tokens`.  Fix: use the last_refill timestamp as the lock —
-        // the thread that successfully cmpxchg's the timestamp from `last`
-        // to `now` is the unique winner that gets to refill the bucket.
-        // Losers fall through and return false (or hit the fast path on
-        // their next call).
         const now: i64 = @intCast(nanoTimestamp());
         const last = self.last_refill.load(.monotonic);
         const elapsed = now - last;
+        if (elapsed < self.refill_interval_ns) return false;
 
-        if (elapsed >= self.refill_interval_ns) {
-            if (self.last_refill.cmpxchgStrong(last, now, .monotonic, .monotonic) == null) {
-                // We won the race to refill.  Take one for ourselves and
-                // publish the rest.  Doing the +max-1 in one store avoids
-                // the brief window where `tokens == max_tokens` could let
-                // the fast path race ahead of our own consumption.
-                self.tokens.store(self.max_tokens - 1, .monotonic);
-                return true;
-            }
+        const intervals = @divTrunc(elapsed, self.refill_interval_ns);
+        const new_last = last + intervals * self.refill_interval_ns;
+        if (self.last_refill.cmpxchgStrong(last, new_last, .monotonic, .monotonic) != null) {
+            return false;
         }
 
-        return false;
+        const add: u32 = @intCast(@min(intervals, @as(i64, self.max_tokens)));
+        current = self.tokens.load(.monotonic);
+        const filled = @min(current + add, self.max_tokens);
+        if (filled == 0) return false;
+        self.tokens.store(filled - 1, .monotonic);
+        return true;
     }
 };
+
+/// Host and port parsed from `host:port` or `[ipv6]:port`.
+pub const HostPort = struct {
+    host: []const u8,
+    port: u16,
+};
+
+/// Parse `host:port` with bracketed IPv6. Unbracketed IPv6 is rejected.
+pub fn parseHostPort(value: []const u8) !HostPort {
+    if (value.len == 0) return error.InvalidHostPort;
+    if (value[0] == '[') {
+        const close_idx = std.mem.indexOfScalar(u8, value, ']') orelse return error.InvalidHostPort;
+        const host = value[1..close_idx];
+        if (host.len == 0) return error.InvalidHostPort;
+        if (close_idx + 1 >= value.len or value[close_idx + 1] != ':') return error.InvalidHostPort;
+        const port_str = value[close_idx + 2 ..];
+        if (port_str.len == 0) return error.InvalidHostPort;
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidHostPort;
+        return .{ .host = host, .port = port };
+    }
+
+    const colon = std.mem.lastIndexOfScalar(u8, value, ':') orelse return error.InvalidHostPort;
+    const host = value[0..colon];
+    const port_str = value[colon + 1 ..];
+    if (host.len == 0 or port_str.len == 0) return error.InvalidHostPort;
+    if (std.mem.indexOfScalar(u8, host, ':') != null) return error.InvalidHostPort;
+    const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidHostPort;
+    return .{ .host = host, .port = port };
+}
+
+/// Optional port form used by CLI `-r host` / `-r host:port` / `-r [v6]:port`.
+pub fn parseHostOptionalPort(value: []const u8) !struct { host: []const u8, port: ?u16 } {
+    if (value.len == 0) return error.InvalidHostPort;
+    if (value[0] == '[') {
+        const hp = try parseHostPort(value);
+        return .{ .host = hp.host, .port = hp.port };
+    }
+    if (std.mem.indexOfScalar(u8, value, ':') == null) {
+        return .{ .host = value, .port = null };
+    }
+    const hp = try parseHostPort(value);
+    return .{ .host = hp.host, .port = hp.port };
+}
+
+// ============================================================================
+// Process signals, affinity, encrypt profile
+// ============================================================================
+
+pub const SignalFlags = struct {
+    shutdown: std.atomic.Value(bool) = .init(false),
+    sighup: std.atomic.Value(bool) = .init(false),
+    flush_stats: std.atomic.Value(bool) = .init(false),
+};
+
+pub var signals: SignalFlags = .{};
+
+pub fn handleProcessSignal(sig: posix.SIG) callconv(.c) void {
+    if (sig == posix.SIG.INT or sig == posix.SIG.TERM) {
+        signals.shutdown.store(true, .release);
+    } else if (@hasDecl(posix.SIG, "HUP") and sig == posix.SIG.HUP) {
+        signals.sighup.store(true, .release);
+    } else if (@hasDecl(posix.SIG, "USR1") and sig == posix.SIG.USR1) {
+        signals.flush_stats.store(true, .release);
+    }
+}
+
+pub fn installProcessSignals() void {
+    if (builtin.target.os.tag == .windows) return;
+    if (!@hasDecl(posix, "Sigaction") or !@hasDecl(posix, "sigaction")) return;
+
+    const sig_action = posix.Sigaction{
+        .handler = .{ .handler = handleProcessSignal },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &sig_action, null);
+    posix.sigaction(posix.SIG.TERM, &sig_action, null);
+    if (@hasDecl(posix.SIG, "HUP")) {
+        posix.sigaction(posix.SIG.HUP, &sig_action, null);
+    }
+    if (@hasDecl(posix.SIG, "USR1")) {
+        posix.sigaction(posix.SIG.USR1, &sig_action, null);
+    }
+    if (@hasDecl(posix.SIG, "PIPE")) {
+        const ignore = posix.Sigaction{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = std.mem.zeroes(posix.sigset_t),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.PIPE, &ignore, null);
+    }
+}
+
+var cpu_assigner: std.atomic.Value(usize) = .init(0);
+var cached_cpu_count: std.atomic.Value(usize) = .init(0);
+
+pub fn cpuCountCached() usize {
+    const cached = cached_cpu_count.load(.acquire);
+    if (cached != 0) return cached;
+    const detected = std.Thread.getCpuCount() catch 1;
+    cached_cpu_count.store(detected, .release);
+    return detected;
+}
+
+pub fn nextCpuIndex() usize {
+    const count = cpuCountCached();
+    const idx = cpu_assigner.fetchAdd(1, .acq_rel);
+    return idx % @max(count, 1);
+}
+
+pub fn applyThreadAffinity(index_opt: ?usize) void {
+    if (index_opt == null) return;
+    if (builtin.target.os.tag != .linux) return;
+    const linux = std.os.linux;
+    var mask: linux.cpu_set_t = [_]c_ulong{0} ** 16;
+    const limited = index_opt.? % (16 * @bitSizeOf(c_ulong));
+    const word_idx = limited / @bitSizeOf(c_ulong);
+    const bit_idx = limited % @bitSizeOf(c_ulong);
+    mask[word_idx] |= @as(c_ulong, 1) << @intCast(bit_idx);
+    _ = linux.sched_setaffinity(0, &mask) catch {};
+}
+
+var encrypt_profile_checked: std.atomic.Value(bool) = .init(false);
+var encrypt_profile_value: bool = false;
+
+pub fn encryptProfileEnabled() bool {
+    if (!encrypt_profile_checked.load(.acquire)) {
+        const cstr = std.c.getenv("FLOO_PROFILE_ENCRYPT");
+        encrypt_profile_value = if (cstr) |c| (c[0] != 0 and c[0] != '0') else false;
+        encrypt_profile_checked.store(true, .release);
+        std.debug.print("[PROFILE] encrypt-time profile {s}\n", .{if (encrypt_profile_value) "ENABLED via FLOO_PROFILE_ENCRYPT" else "disabled (set FLOO_PROFILE_ENCRYPT=1 to enable)"});
+    }
+    return encrypt_profile_value;
+}
 
 // Tests
 test "constantTimeEqual" {
@@ -581,4 +704,43 @@ test "RateLimiter exhausts and refills (works in all build modes)" {
     try std.testing.expect(rl.tryAcquire());
     try std.testing.expect(rl.tryAcquire());
     try std.testing.expect(!rl.tryAcquire()); // exhausted
+}
+
+test "RateLimiter refill amount matches configured rate" {
+    var rl = RateLimiter.init(100);
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) {
+        try std.testing.expect(rl.tryAcquire());
+    }
+    try std.testing.expect(!rl.tryAcquire());
+
+    var req = posix.timespec{ .sec = 0, .nsec = 25 * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&req, null);
+
+    var got: u32 = 0;
+    while (rl.tryAcquire()) {
+        got += 1;
+        if (got > 40) break;
+    }
+    // 25 ms at 100/s ≈ 2.5 tokens. Slack covers scheduler jitter; the
+    // pre-fix bug published the whole bucket (~99) after one interval.
+    try std.testing.expect(got >= 1);
+    try std.testing.expect(got <= 15);
+}
+
+test "parseHostPort handles IPv4, names, and bracketed IPv6" {
+    const v4 = try parseHostPort("127.0.0.1:8443");
+    try std.testing.expectEqualStrings("127.0.0.1", v4.host);
+    try std.testing.expectEqual(@as(u16, 8443), v4.port);
+
+    const name = try parseHostPort("example.com:9");
+    try std.testing.expectEqualStrings("example.com", name.host);
+    try std.testing.expectEqual(@as(u16, 9), name.port);
+
+    const v6 = try parseHostPort("[::1]:9000");
+    try std.testing.expectEqualStrings("::1", v6.host);
+    try std.testing.expectEqual(@as(u16, 9000), v6.port);
+
+    try std.testing.expectError(error.InvalidHostPort, parseHostPort("::1:9000"));
+    try std.testing.expectError(error.InvalidHostPort, parseHostPort("localhost"));
 }

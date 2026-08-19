@@ -3,7 +3,7 @@ import './Hero.css'
 
 export default function Hero() {
   const [typedText, setTypedText] = useState('')
-  const fullText = '30.9 Gbps'
+  const fullText = 'v0.3.0'
 
   useEffect(() => {
     let index = 0
@@ -50,7 +50,7 @@ export default function Hero() {
           <div className="metric-value">
             {typedText}<span className="cursor">|</span>
           </div>
-          <div className="metric-label">Peak Throughput</div>
+          <div className="metric-label">Protocol v2</div>
         </div>
 
         <div className="hero-stats">
@@ -63,12 +63,12 @@ export default function Hero() {
             <div className="stat-label">Total Binary Size</div>
           </div>
           <div className="stat">
-            <div className="stat-value">86%</div>
-            <div className="stat-label">Faster than Rathole</div>
+            <div className="stat-value">9+none</div>
+            <div className="stat-label">AEAD Ciphers</div>
           </div>
           <div className="stat">
-            <div className="stat-value">236%</div>
-            <div className="stat-label">Faster than FRP</div>
+            <div className="stat-value">1–64</div>
+            <div className="stat-label">Parallel Tunnels</div>
           </div>
         </div>
 

@@ -36,7 +36,7 @@ export default function Performance() {
         <h2 className="section-title">Performance</h2>
 
         <div className="performance-subtitle">
-          Benchmark: Apple M1 (4 vCPU) | Plaintext | Single Stream | iperf3
+          Historical (v0.1.4 era): Apple M1 (4 vCPU) | Plaintext | Single Stream | iperf3. Not a current 0.3.0 claim.
         </div>
 
         <div className="benchmark-chart">

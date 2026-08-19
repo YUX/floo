@@ -26,8 +26,8 @@ This directory contains package manager configurations for distributing Floo.
 3. **Update SHA256 checksums** after each release:
    ```bash
    # Download release artifacts
-   wget https://github.com/YUX/floo/releases/download/v0.1.2/floo-aarch64-macos-m1.tar.gz
-   wget https://github.com/YUX/floo/releases/download/v0.1.2/floo-x86_64-macos-haswell.tar.gz
+   wget https://github.com/YUX/floo/releases/download/v0.3.0/floo-aarch64-macos-m1.tar.gz
+   wget https://github.com/YUX/floo/releases/download/v0.3.0/floo-x86_64-macos-haswell.tar.gz
 
    # Calculate checksums
    shasum -a 256 floo-aarch64-macos-m1.tar.gz
@@ -70,8 +70,8 @@ Submit a PR to [homebrew-core](https://github.com/Homebrew/homebrew-core):
    cp packaging/aur/PKGBUILD .
 
    # Download release artifacts to calculate checksums
-   wget https://github.com/YUX/floo/releases/download/v0.1.2/floo-x86_64-linux-gnu-haswell.tar.gz
-   wget https://github.com/YUX/floo/releases/download/v0.1.2/floo-aarch64-linux-gnu.tar.gz
+   wget https://github.com/YUX/floo/releases/download/v0.3.0/floo-x86_64-linux-gnu-haswell.tar.gz
+   wget https://github.com/YUX/floo/releases/download/v0.3.0/floo-aarch64-linux-gnu.tar.gz
 
    # Calculate checksums
    sha256sum floo-x86_64-linux-gnu-haswell.tar.gz
@@ -84,7 +84,7 @@ Submit a PR to [homebrew-core](https://github.com/Homebrew/homebrew-core):
 
    # Commit and push
    git add PKGBUILD .SRCINFO
-   git commit -m "Update to version 0.1.2"
+   git commit -m "Update to version 0.3.0"
    git push
    ```
 
@@ -138,7 +138,7 @@ Use the included scripts and GitHub Actions to automatically build and publish .
 The workflow automatically runs when you create a GitHub release. You can also trigger manually:
 ```bash
 # Via GitHub Actions UI or CLI
-gh workflow run publish-apt.yml -f version=0.1.2
+gh workflow run publish-apt.yml -f version=0.3.0
 ```
 
 **Users install with:**
@@ -154,22 +154,22 @@ sudo apt install floo
 **Build .deb packages:**
 ```bash
 cd packaging
-./build-deb.sh 0.1.2
+./build-deb.sh 0.3.0
 ```
 
 This creates:
-- `build-deb/floo_0.1.2-1_amd64.deb`
-- `build-deb/floo_0.1.2-1_arm64.deb`
+- `build-deb/floo_0.3.0-1_amd64.deb`
+- `build-deb/floo_0.3.0-1_arm64.deb`
 
 **Test locally:**
 ```bash
-sudo dpkg -i build-deb/floo_0.1.2-1_amd64.deb
+sudo dpkg -i build-deb/floo_0.3.0-1_amd64.deb
 flooc --version
 ```
 
 **Create APT repository:**
 ```bash
-./setup-apt-repo.sh apt-repo 0.1.2
+./setup-apt-repo.sh apt-repo 0.3.0
 ```
 
 This generates a complete APT repository structure in `apt-repo/`.
@@ -248,12 +248,12 @@ sudo snap install floo
 **Build locally:**
 ```bash
 cd packaging
-./build-snap.sh 0.1.2
+./build-snap.sh 0.3.0
 ```
 
 **Test locally:**
 ```bash
-sudo snap install ../snap/floo_0.1.2_amd64.snap --dangerous
+sudo snap install ../snap/floo_0.3.0_amd64.snap --dangerous
 floo.flooc --version
 floo.floos --version
 ```
@@ -262,7 +262,7 @@ floo.floos --version
 ```bash
 cd snap
 snapcraft login
-snapcraft upload floo_0.1.2_amd64.snap --release=stable
+snapcraft upload floo_0.3.0_amd64.snap --release=stable
 ```
 
 #### Architecture Support
@@ -291,9 +291,9 @@ Create `.spec` file for RPM packaging:
 When releasing a new version:
 
 - [ ] Update version in `build.zig.zon`
-- [ ] Create git tag: `git tag v0.1.2 && git push --tags`
+- [ ] Create git tag: `git tag v0.3.0 && git push --tags`
 - [ ] Wait for GitHub Actions to build release artifacts
-- [ ] Calculate SHA256 checksums: `./packaging/calculate-checksums.sh v0.1.2`
+- [ ] Calculate SHA256 checksums: `./packaging/calculate-checksums.sh v0.3.0`
 - [ ] Update Homebrew formula with new version and checksums
 - [ ] Update AUR PKGBUILD with new version and checksums
 - [ ] Push to homebrew-floo tap
@@ -307,7 +307,7 @@ When releasing a new version:
 Use the included helper script:
 
 ```bash
-./packaging/calculate-checksums.sh v0.1.2
+./packaging/calculate-checksums.sh v0.3.0
 ```
 
 Or manually:

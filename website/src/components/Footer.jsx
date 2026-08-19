@@ -25,7 +25,7 @@ export default function Footer() {
             <div className="footer-column">
               <h4 className="footer-title">Documentation</h4>
               <a href="https://github.com/YUX/floo#readme" target="_blank" rel="noopener noreferrer">README</a>
-              <a href="https://github.com/YUX/floo#configuration" target="_blank" rel="noopener noreferrer">Configuration</a>
+              <a href="https://github.com/YUX/floo#quick-start" target="_blank" rel="noopener noreferrer">Configuration</a>
               <a href="https://github.com/YUX/floo#troubleshooting" target="_blank" rel="noopener noreferrer">Troubleshooting</a>
             </div>
 
@@ -39,7 +39,7 @@ export default function Footer() {
         </div>
 
         <div className="footer-bottom">
-          <p>&copy; {new Date().getFullYear()} Floo. Licensed under MIT License.</p>
+          <p>&copy; {new Date().getFullYear()} Floo. Licensed under Apache-2.0.</p>
           <p className="footer-built">Built with ❤️ in Zig</p>
         </div>
       </div>

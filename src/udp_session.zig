@@ -128,6 +128,7 @@ pub const UdpSessionManager = struct {
         const session = UdpSession.init(stream_id, source_addr);
 
         try self.sessions.put(key, session);
+        errdefer _ = self.sessions.remove(key);
         try self.reverse_map.put(stream_id, key);
 
         return session;

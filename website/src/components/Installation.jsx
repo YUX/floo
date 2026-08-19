@@ -85,13 +85,13 @@ chmod +x flooc floos
           </div>
 
           <div className="docs-links">
-            <a href="https://github.com/YUX/floo#configuration" target="_blank" rel="noopener noreferrer" className="doc-link">
+            <a href="https://github.com/YUX/floo#quick-start" target="_blank" rel="noopener noreferrer" className="doc-link">
               <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
                 <path fillRule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clipRule="evenodd"/>
               </svg>
               Configuration Guide
             </a>
-            <a href="https://github.com/YUX/floo#cli-reference" target="_blank" rel="noopener noreferrer" className="doc-link">
+            <a href="https://github.com/YUX/floo#quick-start" target="_blank" rel="noopener noreferrer" className="doc-link">
               <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
                 <path fillRule="evenodd" d="M2 5a2 2 0 012-2h12a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V5zm3.293 1.293a1 1 0 011.414 0l3 3a1 1 0 010 1.414l-3 3a1 1 0 01-1.414-1.414L7.586 10 5.293 7.707a1 1 0 010-1.414zM11 12a1 1 0 100 2h3a1 1 0 100-2h-3z" clipRule="evenodd"/>
               </svg>

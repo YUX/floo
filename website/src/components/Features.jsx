@@ -10,7 +10,7 @@ export default function Features() {
     {
       icon: '🔐',
       title: 'Noise Protocol',
-      description: 'Secure authentication with Noise XX + PSK. Choose from 5 AEAD ciphers including AEGIS-128L and AES-256-GCM.'
+      description: 'Secure authentication with Noise XX + PSK. Choose from 9 AEAD ciphers plus cipher=none (PSK still required).'
     },
     {
       icon: '🚀',
@@ -20,7 +20,7 @@ export default function Features() {
     {
       icon: '⚡',
       title: 'Parallel Tunnels',
-      description: 'Automatically matches your CPU cores and pins tunnel threads for maximum throughput.'
+      description: '1–64 parallel tunnels. Automatically matches your CPU cores and pins tunnel threads for maximum throughput.'
     },
     {
       icon: '📈',

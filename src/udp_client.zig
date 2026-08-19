@@ -82,12 +82,6 @@ pub const UdpForwarder = struct {
                 continue;
             };
 
-            std.debug.print("[UDP-CLIENT] Received {} bytes from local {f}, stream_id={}\n", .{
-                msg.data.len,
-                msg.from,
-                session.stream_id,
-            });
-
             // Encode UDP data message
             var encode_buf: [70016]u8 = undefined;
 
@@ -138,11 +132,6 @@ pub const UdpForwarder = struct {
         };
 
         try self.local_socket.send(self.io, &dest_addr, udp_msg.data);
-
-        std.debug.print("[UDP-CLIENT] Forwarded {} bytes to local {f}\n", .{
-            udp_msg.data.len,
-            dest_addr,
-        });
     }
 
     /// Cleanup expired sessions

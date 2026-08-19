@@ -1,6 +1,6 @@
 name: floo
 base: core22
-version: '0.1.2'
+version: '0.3.0'
 summary: Secure, high-performance tunneling in Zig
 description: |
   Floo is a high-throughput tunneling solution written in Zig with zero
@@ -8,7 +8,7 @@ description: |
   multiple AEAD ciphers.
 
   Features:
-  - 29.4 Gbps throughput with AEGIS-128L cipher
+  - Noise XX + PSK with 9 AEAD ciphers plus cipher=none
   - Zero runtime dependencies
   - Reverse and forward tunneling modes
   - SOCKS5 and HTTP CONNECT proxy support
@@ -83,7 +83,9 @@ parts:
 
       # Install example configs
       mkdir -p ${SNAPCRAFT_PART_INSTALL}/share/doc/floo/examples
-      cp /tmp/floo-extract/*.toml.example ${SNAPCRAFT_PART_INSTALL}/share/doc/floo/examples/
+      if [ -d /tmp/floo-extract/configs ]; then
+        cp /tmp/floo-extract/configs/*.toml ${SNAPCRAFT_PART_INSTALL}/share/doc/floo/examples/
+      fi
 
       # Cleanup
       rm -rf /tmp/floo.tar.gz /tmp/floo-extract

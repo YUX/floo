@@ -11,7 +11,7 @@ pub const ProxyType = enum {
     pub fn fromUrl(url: []const u8) !ProxyType {
         if (std.mem.startsWith(u8, url, "socks5://")) return .socks5;
         if (std.mem.startsWith(u8, url, "http://")) return .http;
-        if (std.mem.startsWith(u8, url, "https://")) return .http;
+        if (std.mem.startsWith(u8, url, "https://")) return error.HttpsProxyUnsupported;
         return error.InvalidProxyUrl;
     }
 };
@@ -43,8 +43,6 @@ pub const ProxyConfig = struct {
             remainder = url["socks5://".len..];
         } else if (std.mem.startsWith(u8, url, "http://")) {
             remainder = url["http://".len..];
-        } else if (std.mem.startsWith(u8, url, "https://")) {
-            remainder = url["https://".len..];
         }
 
         // Parse username:password@host:port or just host:port
@@ -79,28 +77,9 @@ pub const ProxyConfig = struct {
         // handling, lastIndexOfScalar(':') would land inside the IPv6
         // address itself for unbracketed forms — which we reject by
         // requiring brackets when the host contains multiple colons.
-        var host_text: []const u8 = undefined;
-        var port_str: []const u8 = undefined;
-        if (host_port.len > 0 and host_port[0] == '[') {
-            const close_idx = std.mem.indexOfScalar(u8, host_port, ']') orelse return error.InvalidProxyUrl;
-            host_text = host_port[1..close_idx];
-            // Expect `]:port` after the bracket.
-            if (host_port.len <= close_idx + 2 or host_port[close_idx + 1] != ':') {
-                return error.InvalidProxyUrl;
-            }
-            port_str = host_port[close_idx + 2 ..];
-        } else {
-            const colon_idx = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse return error.InvalidProxyUrl;
-            host_text = host_port[0..colon_idx];
-            port_str = host_port[colon_idx + 1 ..];
-            // An unbracketed bare IPv6 like `::1:8080` is ambiguous and
-            // unsafe to parse — require brackets for IPv6 literals.
-            if (std.mem.indexOfScalar(u8, host_text, ':') != null) {
-                return error.InvalidProxyUrl;
-            }
-        }
-        host_buf = try allocator.dupe(u8, host_text);
-        const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidProxyUrl;
+        const parsed = common.parseHostPort(host_port) catch return error.InvalidProxyUrl;
+        host_buf = try allocator.dupe(u8, parsed.host);
+        const port = parsed.port;
         const host = host_buf.?;
 
         return ProxyConfig{
@@ -136,6 +115,10 @@ const SOCKS5_ADDR_IPV6: u8 = 0x04;
 /// proxy that accepts the TCP connect but never replies would otherwise
 /// block the calling tunnel thread until the kernel TCP timeout (minutes).
 const PROXY_NEGOTIATION_TIMEOUT_SEC: u32 = 30;
+
+fn validateSocks5Auth(username: []const u8, password: []const u8) !void {
+    if (username.len > 255 or password.len > 255) return error.Socks5AuthTooLong;
+}
 
 /// Connect to target through SOCKS5 proxy. Returns a connected Stream
 /// that has finished its negotiation; caller wraps it in their own
@@ -199,6 +182,7 @@ pub fn connectViaSocks5(
     // Perform authentication if required
     if (chosen_method == SOCKS5_USERNAME_PASSWORD) {
         if (!has_auth) return error.Socks5AuthRequired;
+        try validateSocks5Auth(proxy_username, proxy_password);
 
         // Send username/password
         var auth_buf: [515]u8 = undefined; // Max: 1 + 1 + 255 + 1 + 255
@@ -597,4 +581,25 @@ test "reject malformed bracketed proxy url" {
         error.InvalidProxyUrl,
         ProxyConfig.parseUrl(allocator, "socks5://[::1]"),
     );
+}
+
+test "reject https proxy urls" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.HttpsProxyUnsupported,
+        ProxyConfig.parseUrl(allocator, "https://proxy.example.com:443"),
+    );
+    try std.testing.expectError(
+        error.HttpsProxyUnsupported,
+        ProxyType.fromUrl("https://127.0.0.1:8080"),
+    );
+}
+
+test "reject SOCKS5 username or password longer than 255" {
+    var long: [256]u8 = undefined;
+    @memset(&long, 'u');
+    try std.testing.expectError(error.Socks5AuthTooLong, validateSocks5Auth(&long, "pass"));
+    @memset(&long, 'p');
+    try std.testing.expectError(error.Socks5AuthTooLong, validateSocks5Auth("user", &long));
+    try validateSocks5Auth("user", "pass");
 }

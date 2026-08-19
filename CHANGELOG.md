@@ -2,7 +2,22 @@
 
 All notable changes to Floo will be documented in this file.
 
-## [Unreleased]
+## [0.3.0] - 2026-08-19
+
+Protocol v2 only. There is no 0.2.x wire interop — mismatched peers fail closed at decrypt or version exchange.
+
+### Protocol v2
+
+- Encrypted frames are `[u32be length][u64be seq][ciphertext || 16-byte tag]`. AEAD AAD is the 12-byte prefix `length || seq`.
+- `cipher = "none"` frames stay `[u32be length][plaintext]` (no seq) after the existing PSK nonce/HMAC exchange.
+- `ServiceId` is `u32` (was `u16`). Stream headers are 9 bytes (`type` + service + stream).
+- `generateServiceId` uses the first 4 Blake3 bytes, rejects `0`, and still fails closed on collision.
+- `MessageType.parse` / `ErrorCode.parse` return errors instead of `@enumFromInt`.
+- Channel encrypt is lock-free (`fetchAdd` on the send seq); only `writev` stays under the send mutex. Decrypt uses the frame seq.
+
+### Migration
+
+See [MIGRATION_NOTES.md](MIGRATION_NOTES.md) for the 0.2 → 0.3 cut. Both sides must be 0.3.0.
 
 ### Security (post-0.2.1 audit hardening)
 

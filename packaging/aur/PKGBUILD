@@ -1,11 +1,11 @@
 # Maintainer: Your Name <your.email@example.com>
 pkgname=floo
-pkgver=0.1.2
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Secure, high-performance tunneling in Zig. Expose your home services or access remote ones"
 arch=('x86_64' 'aarch64')
 url="https://github.com/YUX/floo"
-license=('MIT')
+license=('Apache-2.0')
 provides=('floo' 'flooc' 'floos')
 conflicts=('floo-git')
 source_x86_64=("${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/YUX/floo/releases/download/v${pkgver}/floo-x86_64-linux-gnu-haswell.tar.gz")
@@ -23,9 +23,11 @@ package() {
     # Install documentation
     install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
 
-    # Install example configs
-    install -Dm644 flooc.toml.example "${pkgdir}/usr/share/doc/${pkgname}/examples/flooc.toml.example"
-    install -Dm644 floos.toml.example "${pkgdir}/usr/share/doc/${pkgname}/examples/floos.toml.example"
+    # Install example configs from the release `configs/` tree
+    if [ -d configs ]; then
+        install -Dm644 configs/flooc.example.toml "${pkgdir}/usr/share/doc/${pkgname}/examples/flooc.example.toml"
+        install -Dm644 configs/floos.example.toml "${pkgdir}/usr/share/doc/${pkgname}/examples/floos.example.toml"
+    fi
 
     # Install license (if included in tarball)
     if [ -f LICENSE ]; then
